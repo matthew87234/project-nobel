@@ -1,0 +1,27 @@
+[0/1] Planning build
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--1AB21518FC5DEDBE.txt
+[3/7] Compiling macOS_Native FeynmanManagerView.swift
+/Users/matthewt/Projects/PhysicsStudyApp/macOS-Native/Sources/macOS-Native/FeynmanManagerView.swift:35:22: warning: 'onChange(of:perform:)' was deprecated in macOS 14.0: Use `onChange` with a two or zero parameter action closure instead. [#DeprecatedDeclaration]
+ 33 |                 TextField("Search concepts/explanations...", text: $searchQuery)
+ 34 |                     .textFieldStyle(.roundedBorder)
+ 35 |                     .onChange(of: searchQuery) { _ in
+    |                      `- warning: 'onChange(of:perform:)' was deprecated in macOS 14.0: Use `onChange` with a two or zero parameter action closure instead. [#DeprecatedDeclaration]
+ 36 |                         loadSessions()
+ 37 |                     }
+
+/Users/matthewt/Projects/PhysicsStudyApp/macOS-Native/Sources/macOS-Native/FeynmanManagerView.swift:46:18: warning: 'onChange(of:perform:)' was deprecated in macOS 14.0: Use `onChange` with a two or zero parameter action closure instead. [#DeprecatedDeclaration]
+ 44 |                 }
+ 45 |                 .frame(width: 200)
+ 46 |                 .onChange(of: selectedModuleIdFilter) { _ in
+    |                  `- warning: 'onChange(of:perform:)' was deprecated in macOS 14.0: Use `onChange` with a two or zero parameter action closure instead. [#DeprecatedDeclaration]
+ 47 |                     loadSessions()
+ 48 |                 }
+
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+[4/7] Emitting module macOS_Native
+[4/7] Write Objects.LinkFileList
+[5/7] Linking macOS-Native
+[6/7] Applying macOS-Native
+Build complete! (1.15s)
