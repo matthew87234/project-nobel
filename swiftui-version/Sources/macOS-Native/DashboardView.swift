@@ -637,18 +637,21 @@ struct DashboardView: View {
     }
     
     private func pollAIStatus() {
-        let allNotesRows = DatabaseManager.shared.query(sql: "SELECT file_path, ai_summary, difficulty, pre_lecture_primer FROM notes")
+        let allNotesRows = DatabaseManager.shared.query(sql: "SELECT id, file_path, ai_summary, pre_lecture_primer FROM notes")
         
         let fileManager = FileManager.default
         var total = 0
         var sumDone = 0
-        var diffDone = 0
         var primerDone = 0
         
         for row in allNotesRows {
+            let noteId = row["id"] as? Int ?? 0
+            if AIHelper.shared.isNoteFailed(noteId: noteId) {
+                continue
+            }
+            
             let filePath = row["file_path"] as? String ?? ""
-            // Skip notes where the physical file doesn't exist to avoid getting stuck below 100%
-            guard !filePath.isEmpty, fileManager.fileExists(atPath: filePath) else {
+            guard !filePath.isEmpty else {
                 continue
             }
             
@@ -656,9 +659,6 @@ struct DashboardView: View {
             
             if let sum = row["ai_summary"] as? String, !sum.isEmpty {
                 sumDone += 1
-            }
-            if let diff = row["difficulty"] as? String, !diff.isEmpty {
-                diffDone += 1
             }
             if let primer = row["pre_lecture_primer"] as? String, !primer.isEmpty {
                 primerDone += 1
@@ -670,8 +670,8 @@ struct DashboardView: View {
             self.completedTasks = 0
             self.totalTasks = 0
         } else {
-            self.totalTasks = total * 3
-            self.completedTasks = sumDone + diffDone + primerDone
+            self.totalTasks = total * 2
+            self.completedTasks = sumDone + primerDone
             self.completionPercentage = Int((Double(completedTasks) / Double(totalTasks)) * 100)
         }
         

@@ -7,8 +7,6 @@ struct StudyView: View {
     @State private var notes: [Note] = []
     @State private var selectedNote: Note?
     @State private var summaryText: String = ""
-    @State private var difficultyLevel: String = "Analyzing..."
-    @State private var difficultyReason: String = ""
     @State private var isAnalyzing: Bool = false
     
     let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
@@ -96,7 +94,7 @@ struct StudyView: View {
                             .cornerRadius(12)
                             
                             // Action Panel
-                            HStack(alignment: .top, spacing: 15) {
+                            HStack {
                                 // View PDF Button
                                 Button(action: {
                                     openFullscreenPDF(path: note.filePath)
@@ -109,30 +107,7 @@ struct StudyView: View {
                                 .buttonStyle(.borderedProminent)
                                 .tint(.blue)
                                 
-                                // Difficulty Card
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("DIFFICULTY RATING")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(.secondary)
-                                    
-                                    HStack {
-                                        Text(difficultyLevel)
-                                            .bold()
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 3)
-                                            .background(difficultyBadgeColor)
-                                            .foregroundColor(.white)
-                                            .cornerRadius(6)
-                                        
-                                        Text(difficultyReason)
-                                            .foregroundColor(.secondary)
-                                            .font(.subheadline)
-                                    }
-                                }
-                                .padding()
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(12)
+                                Spacer()
                             }
                         }
                         .padding(25)
@@ -143,7 +118,7 @@ struct StudyView: View {
                             .font(.system(size: 48))
                             .foregroundColor(.secondary)
                             .padding(.bottom, 10)
-                        Text("Select a note to view summary and difficulty")
+                        Text("Select a note to view summary")
                             .font(.headline)
                             .foregroundColor(.secondary)
                     }
@@ -182,21 +157,15 @@ struct StudyView: View {
     private func displayNoteDetails(_ note: Note?) {
         guard let note = note else {
             self.summaryText = ""
-            self.difficultyLevel = ""
-            self.difficultyReason = ""
             self.isAnalyzing = false
             return
         }
         
-        if let summary = note.aiSummary, !summary.isEmpty,
-           let diff = note.difficulty, !diff.isEmpty {
+        if let summary = note.aiSummary, !summary.isEmpty {
             self.summaryText = summary
-            parseDifficulty(diff)
             self.isAnalyzing = false
         } else {
             self.summaryText = ""
-            self.difficultyLevel = "Analyzing..."
-            self.difficultyReason = ""
             self.isAnalyzing = true
             
             // Trigger async analysis if Ollama is running and not already queued
@@ -219,10 +188,8 @@ struct StudyView: View {
         guard let note = selectedNote else { return }
         if isAnalyzing {
             if let updated = DatabaseManager.shared.getNote(id: note.id) {
-                if let summary = updated.aiSummary, !summary.isEmpty,
-                   let diff = updated.difficulty, !diff.isEmpty {
+                if let summary = updated.aiSummary, !summary.isEmpty {
                     self.summaryText = summary
-                    parseDifficulty(diff)
                     self.isAnalyzing = false
                     // refresh sidebar list cache
                     self.notes = DatabaseManager.shared.getNotes(forModuleId: self.activeModuleId ?? 0)
@@ -231,40 +198,21 @@ struct StudyView: View {
         }
     }
     
-    private func parseDifficulty(_ difficultyText: String) {
-        if difficultyText.contains("-") {
-            let parts = difficultyText.components(separatedBy: "-")
-            self.difficultyLevel = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
-            self.difficultyReason = parts[1...].joined(separator: "-").trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            self.difficultyLevel = difficultyText.trimmingCharacters(in: .whitespacesAndNewlines)
-            self.difficultyReason = ""
-        }
-    }
-    
     private func regenerateSummary() {
         guard let note = selectedNote else { return }
         // Clear database cache
-        _ = DatabaseManager.shared.updateNoteAI(noteId: note.id, summary: nil, difficulty: nil, primer: nil)
-        self.selectedNote = note // Trigger reload
+        _ = DatabaseManager.shared.updateNoteAI(noteId: note.id, summary: nil, primer: nil)
+        
+        // Fetch the fresh note from database (which now has nil summary) and reload
+        if let freshNote = DatabaseManager.shared.getNote(id: note.id) {
+            self.selectedNote = freshNote
+            displayNoteDetails(freshNote)
+        }
     }
     
     private func openFullscreenPDF(path: String) {
         guard FileManager.default.fileExists(atPath: path) else { return }
         let url = URL(fileURLWithPath: path)
         NSWorkspace.shared.open(url)
-    }
-    
-    private var difficultyBadgeColor: Color {
-        let level = difficultyLevel.lowercased()
-        if level.contains("easy") {
-            return .green
-        } else if level.contains("medium") {
-            return .orange
-        } else if level.contains("hard") {
-            return .red
-        } else {
-            return .secondary
-        }
     }
 }

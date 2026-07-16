@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import WebKit
 
 enum FlashcardMode {
     case review
@@ -17,10 +18,16 @@ struct FlipCardView: View {
             // Front Card
             VStack {
                 Spacer()
-                Text(front)
-                    .font(.system(size: 20, weight: .medium))
-                    .multilineTextAlignment(.center)
-                    .padding(30)
+                if isLaTeX(front) {
+                    LaTeXView(latex: front)
+                        .frame(height: 120)
+                        .padding(.horizontal, 20)
+                } else {
+                    Text(front)
+                        .font(.system(size: 20, weight: .medium))
+                        .multilineTextAlignment(.center)
+                        .padding(30)
+                }
                 Spacer()
                 Text("Click to Flip")
                     .font(.caption)
@@ -37,10 +44,16 @@ struct FlipCardView: View {
             // Back Card
             VStack {
                 Spacer()
-                Text(back)
-                    .font(.system(size: 20, weight: .medium))
-                    .multilineTextAlignment(.center)
-                    .padding(30)
+                if isLaTeX(back) {
+                    LaTeXView(latex: back)
+                        .frame(height: 120)
+                        .padding(.horizontal, 20)
+                } else {
+                    Text(back)
+                        .font(.system(size: 20, weight: .medium))
+                        .multilineTextAlignment(.center)
+                        .padding(30)
+                }
                 Spacer()
                 Text("Click to Flip")
                     .font(.caption)
@@ -63,6 +76,7 @@ struct FlashcardsView: View {
     let activeModuleId: Int?
     let mode: FlashcardMode
     let isExamMode: Bool
+    var isActive: Bool = true
     
     // Add Card State
     @State private var frontText: String = ""
@@ -73,6 +87,12 @@ struct FlashcardsView: View {
     @State private var latexImageBase64: String = ""
     @State private var latexClipboardImage: NSImage? = nil
     @State private var isTranslatingLaTeX: Bool = false
+    
+    enum FocusField: Hashable {
+        case front
+        case back
+    }
+    @FocusState private var focusedField: FocusField?
     
     // Review State
     @State private var dueCards: [Flashcard] = []
@@ -98,10 +118,28 @@ struct FlashcardsView: View {
             }
         }
         .onAppear {
-            loadInitialData()
+            if isActive {
+                loadInitialData()
+                if mode == .add {
+                    focusedField = .front
+                }
+            }
         }
-        .onChange(of: activeModuleId) { _ in
-            loadInitialData()
+        .onChange(of: activeModuleId) { oldValue, newValue in
+            if isActive {
+                loadInitialData()
+            }
+        }
+        .onChange(of: isActive) { oldValue, newValue in
+            if newValue {
+                loadInitialData()
+                if mode == .add {
+                    focusedField = .front
+                }
+            } else {
+                fcTimer?.invalidate()
+                logActiveSeconds()
+            }
         }
         .onDisappear {
             fcTimer?.invalidate()
@@ -339,23 +377,93 @@ struct FlashcardsView: View {
                         .foregroundColor(.red)
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Front Content (Question/Term):").bold()
-                        TextEditor(text: $frontText)
-                            .frame(height: 100)
-                            .border(Color.secondary.opacity(0.2))
+                        Text("Front Content:").bold()
+                        TextField("", text: $frontText, axis: .vertical)
+                            .focused($focusedField, equals: .front)
+                            .onKeyPress(.tab) {
+                                focusedField = .back
+                                return .handled
+                            }
+                            .lineLimit(4, reservesSpace: true)
+                            .textFieldStyle(.plain)
+                            .padding(6)
+                            .frame(height: 80, alignment: .topLeading)
+                            .background(Color(NSColor.controlBackgroundColor))
                             .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                            )
                         
-                        Text("Back Content (Definition/Formula/Equation):").bold()
-                        TextEditor(text: $backText)
-                            .frame(height: 100)
-                            .border(Color.secondary.opacity(0.2))
+                        Text("Back Content:").bold()
+                        TextField("", text: $backText, axis: .vertical)
+                            .focused($focusedField, equals: .back)
+                            .onKeyPress(.tab) {
+                                focusedField = .front
+                                return .handled
+                            }
+                            .lineLimit(4, reservesSpace: true)
+                            .textFieldStyle(.plain)
+                            .padding(6)
+                            .frame(height: 80, alignment: .topLeading)
+                            .background(Color(NSColor.controlBackgroundColor))
                             .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                            )
+                        
+                        // Live LaTeX Preview
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Live LaTeX Preview:").bold()
+                            VStack(alignment: .leading, spacing: 8) {
+                                if !frontText.isEmpty || !backText.isEmpty {
+                                    if !frontText.isEmpty {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Front:").font(.caption).foregroundColor(.secondary)
+                                            if isLaTeX(frontText) {
+                                                LaTeXView(latex: frontText)
+                                                    .frame(height: 60)
+                                            } else {
+                                                Text(frontText)
+                                                    .font(.body)
+                                                    .padding(.horizontal, 4)
+                                            }
+                                        }
+                                    }
+                                    if !backText.isEmpty {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Back:").font(.caption).foregroundColor(.secondary)
+                                            if isLaTeX(backText) {
+                                                LaTeXView(latex: backText)
+                                                    .frame(height: 60)
+                                            } else {
+                                                Text(backText)
+                                                    .font(.body)
+                                                    .padding(.horizontal, 4)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Text("Preview will appear here as you type.")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .padding(.vertical, 5)
+                                }
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(NSColor.windowBackgroundColor))
+                            .cornerRadius(6)
+                            .border(Color.secondary.opacity(0.15), width: 1)
+                        }
+                        .padding(.vertical, 5)
                         
                         HStack {
                             Button(action: {
                                 showLatexHelper = true
                             }) {
-                                Label("AI LaTeX Helper", systemImage: "sparkles")
+                                 Label("LaTeX Helper", systemImage: "textformat.math")
                             }
                             .buttonStyle(.bordered)
                             
@@ -387,6 +495,7 @@ struct FlashcardsView: View {
         if success {
             frontText = ""
             backText = ""
+            focusedField = .front
             // Trigger feedback
             let notification = NSUserNotification()
             notification.title = "Flashcard Added"
@@ -399,87 +508,105 @@ struct FlashcardsView: View {
     
     private var latexHelperSheet: some View {
         VStack(alignment: .leading, spacing: 15) {
-            Text("✨ AI LaTeX Equation Translator")
-                .font(.title2)
-                .bold()
-            
-            Text("Describe an equation in plain text or paste an image from your clipboard, and local AI (Qwen) will convert it into raw LaTeX code.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-            
-            HStack(spacing: 15) {
-                // Left Column: Plain text input
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Equation Description:")
-                        .bold()
-                    TextField("e.g. integral from 0 to infinity of e to the minus x squared", text: $latexInput)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit {
-                            translateTextToLatex()
-                        }
-                    
-                    Button("Translate Text") {
-                        translateTextToLatex()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(latexInput.isEmpty || isTranslatingLaTeX)
-                }
-                
-                Divider()
-                
-                // Right Column: Clipboard image input
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Clipboard Image Preview:")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 15) {
+                    Text("LaTeX Equation Translator")
+                        .font(.title2)
                         .bold()
                     
-                    if let img = latexClipboardImage {
-                        Image(nsImage: img)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(height: 60)
-                            .border(Color.secondary.opacity(0.3))
-                    } else {
-                        VStack {
-                            Text("No Image Pasted")
-                                .foregroundColor(.secondary)
-                                .font(.caption)
+                    Text("Describe an equation in plain text or paste an image from your clipboard, and local AI (Qwen) will convert it into raw LaTeX code.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    
+                    HStack(spacing: 15) {
+                        // Left Column: Plain text input
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Equation Description:")
+                                .bold()
+                            TextField("e.g. integral from 0 to infinity of e to the minus x squared", text: $latexInput)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit {
+                                    translateTextToLatex()
+                                }
+                            
+                            Button("Translate Text") {
+                                translateTextToLatex()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(latexInput.isEmpty || isTranslatingLaTeX)
                         }
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 60)
-                        .background(Color.secondary.opacity(0.1))
-                        .cornerRadius(6)
+                        
+                        Divider()
+                        
+                        // Right Column: Clipboard image input
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Clipboard Image Preview:")
+                                .bold()
+                            
+                            if let img = latexClipboardImage {
+                                Image(nsImage: img)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(height: 60)
+                                    .border(Color.secondary.opacity(0.3))
+                            } else {
+                                VStack {
+                                    Text("No Image Pasted")
+                                        .foregroundColor(.secondary)
+                                        .font(.caption)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 60)
+                                .background(Color.secondary.opacity(0.1))
+                                .cornerRadius(6)
+                            }
+                            
+                            Button("📋 Paste Image from Clipboard") {
+                                pasteClipboardImage()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isTranslatingLaTeX)
+                        }
+                    }
+                    .padding(.vertical, 10)
+                    
+                    Divider()
+                    
+                    // Result Output Box
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Result LaTeX Code:")
+                            .bold()
+                        
+                        if isTranslatingLaTeX {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("Translating via local Qwen model...")
+                                    .foregroundColor(.secondary)
+                            }
+                        } else {
+                            TextEditor(text: $latexResult)
+                                .font(.system(.body, design: .monospaced))
+                                .frame(height: 60)
+                                .border(Color.secondary.opacity(0.2))
+                                .cornerRadius(4)
+                        }
                     }
                     
-                    Button("📋 Paste Image from Clipboard") {
-                        pasteClipboardImage()
+                    // Result Preview
+                    if !latexResult.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Equation Preview:").bold()
+                            LaTeXView(latex: latexResult)
+                                .frame(height: 70)
+                                .background(Color(NSColor.windowBackgroundColor))
+                                .cornerRadius(6)
+                                .border(Color.secondary.opacity(0.15), width: 1)
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(isTranslatingLaTeX)
                 }
             }
-            .padding(.vertical, 10)
             
             Divider()
-            
-            // Result Output Box
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Result LaTeX Code:")
-                    .bold()
-                
-                if isTranslatingLaTeX {
-                    HStack {
-                        ProgressView().controlSize(.small)
-                        Text("Translating via local Qwen model...")
-                            .foregroundColor(.secondary)
-                    }
-                } else {
-                    TextEditor(text: $latexResult)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(height: 60)
-                        .border(Color.secondary.opacity(0.2))
-                        .cornerRadius(4)
-                }
-            }
             
             HStack {
                 Button("Close") {
@@ -490,16 +617,24 @@ struct FlashcardsView: View {
                 
                 Spacer()
                 
-                Button("Insert to Front") {
-                    frontText += latexResult
+                Button("Copy to Clipboard") {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString("$\(latexResult)$", forType: .string)
+                }
+                .buttonStyle(.bordered)
+                .disabled(latexResult.isEmpty)
+                
+                Button("Paste to Front Content") {
+                    frontText += "$\(latexResult)$"
                     showLatexHelper = false
                     resetLatexHelper()
                 }
                 .buttonStyle(.bordered)
                 .disabled(latexResult.isEmpty)
                 
-                Button("Insert to Back") {
-                    backText += latexResult
+                Button("Paste to Back Content") {
+                    backText += "$\(latexResult)$"
                     showLatexHelper = false
                     resetLatexHelper()
                 }
@@ -508,7 +643,7 @@ struct FlashcardsView: View {
             }
         }
         .padding(20)
-        .frame(width: 580, height: 420)
+        .frame(width: 580, height: 500)
     }
     
     private func pasteClipboardImage() {
@@ -532,6 +667,9 @@ struct FlashcardsView: View {
                 self.isTranslatingLaTeX = false
                 if let latex = res {
                     self.latexResult = latex
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString("$\(latex)$", forType: .string)
                 }
             }
         }
@@ -548,6 +686,9 @@ struct FlashcardsView: View {
                         self.latexResult = "No local vision model found. Please pull qwen2.5vl."
                     } else {
                         self.latexResult = latex
+                        let pasteboard = NSPasteboard.general
+                        pasteboard.clearContents()
+                        pasteboard.setString("$\(latex)$", forType: .string)
                     }
                 }
             }
@@ -668,5 +809,95 @@ struct FlashcardsView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: date)
+    }
+}
+
+// MARK: - LaTeX Rendering Components
+
+func isLaTeX(_ text: String) -> Bool {
+    let lower = text.lowercased()
+    if text.contains("$") { return true }
+    if text.contains("\\") { return true }
+    if text.contains("{") && text.contains("}") { return true }
+    if text.contains("_") || text.contains("^") { return true }
+    if lower.contains("begin{") && lower.contains("end{") { return true }
+    return false
+}
+
+struct LaTeXView: NSViewRepresentable {
+    let latex: String
+    
+    func makeNSView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.setValue(false, forKey: "drawsBackground") // Transparent background
+        return webView
+    }
+    
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        let escapedLatex = latex
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "`", with: "\\`")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        
+        let html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+            <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"></script>
+            <style>
+                body {
+                    margin: 0;
+                    padding: 0px 4px;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    background-color: transparent;
+                    color: currentColor;
+                    box-sizing: border-box;
+                    text-align: left;
+                }
+                @media (prefers-color-scheme: dark) {
+                    body { color: #FFFFFF; }
+                }
+                @media (prefers-color-scheme: light) {
+                    body { color: #000000; }
+                }
+                .math-content {
+                    font-size: 14px;
+                    line-height: 1.35;
+                    max-width: 100%;
+                    word-wrap: break-word;
+                    white-space: pre-wrap;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="math-content" id="math-render"></div>
+            <script>
+                try {
+                    let rawText = `\(escapedLatex)`.trim();
+                    let container = document.getElementById("math-render");
+                    container.textContent = rawText;
+                    renderMathInElement(container, {
+                        delimiters: [
+                            {left: "$$", right: "$$", display: true},
+                            {left: "$", right: "$", display: false},
+                            {left: "\\\\(", right: "\\\\)", display: false},
+                            {left: "\\\\[", right: "\\\\]", display: true}
+                        ],
+                        throwOnError: false
+                    });
+                } catch (e) {
+                    document.getElementById("math-render").innerText = e.message;
+                }
+            </script>
+        </body>
+        </html>
+        """
+        nsView.loadHTMLString(html, baseURL: nil)
     }
 }

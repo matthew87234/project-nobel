@@ -1,11 +1,11 @@
 # Project Nobel - Physics Study App
 
-A native macOS SwiftUI application designed for organizing physics lecture notes, generating AI-based summaries and difficulties, reviewing flashcards and practice problems, and testing knowledge using the Feynman Technique. It includes dynamic global module filtering and full split-screen support.
+A native macOS SwiftUI application designed for organizing physics lecture notes, generating AI-based summaries, reviewing flashcards and practice problems, and testing knowledge using the Feynman Technique. It includes dynamic global module filtering and full split-screen support.
 
 ## Features
 - **Responsive Dashboard**: Track flashcard and problem stats, study times, and daily learning activity heatmaps.
-- **Background AI Processing**: Automatically generates concise lecture overviews, key concepts/equations, difficulty ratings, and pre-lecture primers using local Ollama models.
-- **Study Mode**: Read lecture notes side-by-side with AI summaries and difficulty analysis.
+- **Background AI Processing**: Automatically generates concise lecture overviews, key concepts/equations, and pre-lecture primers using local Ollama models.
+- **Study Mode**: Read lecture notes side-by-side with AI summaries.
 - **Flashcards & Problems**: Interactive tools to review flashcards, solve practice problems, and translate handwritten equations/images to raw LaTeX.
 - **Feynman Technique Sandbox**: Write down physical concepts in your own words and let the local AI evaluate your understanding and chat with you like a physics professor.
 - **Ollama Integration**: Seamlessly starts the local Ollama CLI server in the background on app start and terminates it cleanly on app close.

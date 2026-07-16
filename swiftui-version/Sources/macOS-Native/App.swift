@@ -15,6 +15,7 @@ struct PhysicsStudyApp: App {
     @State private var sidebarSelection: String? = "Dashboard"
     @State private var isExamMode: Bool = false
     @State private var modules: [Module] = []
+    @ObservedObject private var aiHelper = AIHelper.shared
     
     // Auxiliary Window Toggles
     @State private var showModuleManager: Bool = false
@@ -32,31 +33,60 @@ struct PhysicsStudyApp: App {
     static var ollamaProcess: Process?
     
     init() {
-        // Launch Ollama serve CLI in the background
-        let process = Process()
-        let paths = [
-            "/opt/homebrew/bin/ollama",
-            "/usr/local/bin/ollama",
-            "/Applications/Ollama.app/Contents/Resources/ollama"
-        ]
-        var execPath = "ollama"
-        for p in paths {
-            if FileManager.default.fileExists(atPath: p) {
-                execPath = p
-                break
+        // One-time migration: fix stale UserDefaults from older app versions
+        let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+        if provider == "hermes" {
+            let baseUrl = UserDefaults.standard.string(forKey: "cloud_api_base_url") ?? ""
+            let modelName = UserDefaults.standard.string(forKey: "cloud_model_name") ?? ""
+            if baseUrl == "http://localhost:1234/v1" || baseUrl.isEmpty {
+                UserDefaults.standard.set("http://ollama1:11434/v1", forKey: "cloud_api_base_url")
+            }
+            if modelName == "glm" || modelName.isEmpty {
+                UserDefaults.standard.set("glm-5.2:cloud", forKey: "cloud_model_name")
             }
         }
-        process.executableURL = URL(fileURLWithPath: execPath)
-        process.arguments = ["serve"]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
         
-        do {
-            try process.run()
-            PhysicsStudyApp.ollamaProcess = process
-            print("[PhysicsStudyApp] Spawned background Ollama CLI server: \(execPath)")
-        } catch {
-            print("[PhysicsStudyApp] Error spawning background Ollama CLI: \(error)")
+        // Ensure local model defaults are persisted (@AppStorage only writes when the Settings view is rendered)
+        if UserDefaults.standard.string(forKey: "local_model_vision") == nil {
+            UserDefaults.standard.set("qwen2.5vl:7b", forKey: "local_model_vision")
+        }
+        if UserDefaults.standard.string(forKey: "local_model_general") == nil {
+            UserDefaults.standard.set("qwen2.5-coder:7b", forKey: "local_model_general")
+        }
+        
+        let currentProvider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+        
+        // Only launch Ollama serve if using local provider.
+        // For cloud providers (e.g. GLM 5.2), Ollama is started lazily only when
+        // a vision request needs to fall back to a local vision model.
+        if currentProvider == "local" {
+            let process = Process()
+            let paths = [
+                "/opt/homebrew/bin/ollama",
+                "/usr/local/bin/ollama",
+                "/Applications/Ollama.app/Contents/Resources/ollama"
+            ]
+            var execPath = "ollama"
+            for p in paths {
+                if FileManager.default.fileExists(atPath: p) {
+                    execPath = p
+                    break
+                }
+            }
+            process.executableURL = URL(fileURLWithPath: execPath)
+            process.arguments = ["serve"]
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            
+            do {
+                try process.run()
+                PhysicsStudyApp.ollamaProcess = process
+                print("[PhysicsStudyApp] Spawned background Ollama CLI server: \(execPath)")
+            } catch {
+                print("[PhysicsStudyApp] Error spawning background Ollama CLI: \(error)")
+            }
+        } else {
+            print("[PhysicsStudyApp] Cloud provider '\(currentProvider)' selected — skipping local Ollama startup.")
         }
         
         // Start AI Background Processor sequentially
@@ -110,6 +140,36 @@ struct PhysicsStudyApp: App {
                     }
                     .listStyle(.sidebar)
                     .id(isExamMode)
+                    
+                    if aiHelper.isClassifyingProblems {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Image(systemName: "cpu")
+                                    .foregroundColor(.green)
+                                Text(aiHelper.queueStatusText)
+                                    .font(.headline)
+                            }
+                            
+                            ProgressView(
+                                value: Double(aiHelper.classificationCompletedCount),
+                                total: Double(aiHelper.classificationQueueCount)
+                            )
+                            .progressViewStyle(.linear)
+                            
+                            Text("\(aiHelper.classificationCompletedCount) of \(aiHelper.classificationQueueCount) completed")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding()
+                        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                        )
+                        .padding(.horizontal)
+                        .padding(.bottom, 15)
+                    }
                 }
                 .frame(minWidth: 200)
             } detail: {
@@ -175,12 +235,15 @@ struct PhysicsStudyApp: App {
             }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                 // Cleanly stop the background Ollama server when application exits
+                // (only if we started it — i.e. local provider mode)
                 PhysicsStudyApp.ollamaProcess?.terminate()
                 
-                let killProcess = Process()
-                killProcess.launchPath = "/usr/bin/killall"
-                killProcess.arguments = ["ollama"]
-                try? killProcess.run()
+                if PhysicsStudyApp.ollamaProcess != nil {
+                    let killProcess = Process()
+                    killProcess.launchPath = "/usr/bin/killall"
+                    killProcess.arguments = ["ollama"]
+                    try? killProcess.run()
+                }
             }
         }
         .commands {
@@ -285,33 +348,52 @@ struct PhysicsStudyApp: App {
                 .keyboardShortcut("p", modifiers: [.command, .shift])
             }
         }
+        
+        Settings {
+            SettingsView()
+        }
     }
     
     // MARK: - Views routing
     
     @ViewBuilder
     private var detailView: some View {
-        switch sidebarSelection {
-        case "Dashboard":
+        ZStack {
             DashboardView(activeYear: activeYear)
-        case "Study":
+                .opacity(sidebarSelection == "Dashboard" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Dashboard")
+            
             StudyView(activeModuleId: activeModuleId)
-        case "Flashcards":
-            FlashcardsView(activeModuleId: activeModuleId, mode: .review, isExamMode: isExamMode)
-        case "Problems":
-            ProblemsView(activeModuleId: activeModuleId, mode: .review, isExamMode: isExamMode)
-        case "Pre-Lecture":
+                .opacity(sidebarSelection == "Study" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Study")
+            
+            FlashcardsView(activeModuleId: activeModuleId, mode: .review, isExamMode: isExamMode, isActive: sidebarSelection == "Flashcards")
+                .opacity(sidebarSelection == "Flashcards" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Flashcards")
+            
+            ProblemsView(activeModuleId: activeModuleId, mode: .review, isExamMode: isExamMode, isActive: sidebarSelection == "Problems")
+                .opacity(sidebarSelection == "Problems" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Problems")
+            
             PreLectureView(activeModuleId: activeModuleId)
-        case "Post-Lecture":
+                .opacity(sidebarSelection == "Pre-Lecture" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Pre-Lecture")
+            
             PostLectureView(activeModuleId: activeModuleId)
-        case "Notes & Topics":
+                .opacity(sidebarSelection == "Post-Lecture" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Post-Lecture")
+            
             ModulesView(activeModuleId: activeModuleId)
-        case "Add Flashcard":
-            FlashcardsView(activeModuleId: activeModuleId, mode: .add, isExamMode: isExamMode)
-        case "Add Problem":
-            ProblemsView(activeModuleId: activeModuleId, mode: .add, isExamMode: isExamMode)
-        default:
-            DashboardView(activeYear: activeYear)
+                .opacity(sidebarSelection == "Notes & Topics" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Notes & Topics")
+            
+            FlashcardsView(activeModuleId: activeModuleId, mode: .add, isExamMode: isExamMode, isActive: sidebarSelection == "Add Flashcard")
+                .opacity(sidebarSelection == "Add Flashcard" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Add Flashcard")
+            
+            ProblemsView(activeModuleId: activeModuleId, mode: .add, isExamMode: isExamMode, isActive: sidebarSelection == "Add Problem")
+                .opacity(sidebarSelection == "Add Problem" ? 1.0 : 0.0)
+                .disabled(sidebarSelection != "Add Problem")
         }
     }
     

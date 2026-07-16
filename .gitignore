@@ -11,6 +11,8 @@ Packages/
 DerivedData/
 *.xcodeproj/
 *.xcworkspace/
+*.app/
+*.app
 
 # Python
 __pycache__/
@@ -49,3 +51,7 @@ venv.bak/
 *.db-shm
 *.db-wal
 .physics_study_app/
+
+# Local logs and test dirs
+batch_importer_run.log
+Test/

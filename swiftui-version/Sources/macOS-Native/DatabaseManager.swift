@@ -24,7 +24,6 @@ struct Note: Identifiable, Hashable {
     var filePath: String
     var title: String
     var aiSummary: String?
-    var difficulty: String?
     var preLecturePrimer: String?
 }
 
@@ -47,6 +46,8 @@ struct Problem: Identifiable, Hashable {
     var solutionHint: String
     var createdDate: String
     var solvedCount: Int
+    var solution: String
+    var steps: String
 }
 
 struct FeynmanSession: Identifiable, Hashable {
@@ -118,13 +119,11 @@ struct FeynmanChat: Identifiable, Hashable {
                 file_path TEXT,
                 title TEXT,
                 ai_summary TEXT,
-                difficulty TEXT,
                 pre_lecture_primer TEXT,
                 FOREIGN KEY (topic_id) REFERENCES topics(id)
             );
         """)
         alterTableAddColumn(table: "notes", column: "ai_summary", type: "TEXT")
-        alterTableAddColumn(table: "notes", column: "difficulty", type: "TEXT")
         alterTableAddColumn(table: "notes", column: "pre_lecture_primer", type: "TEXT")
         
         execute(sql: """
@@ -151,11 +150,15 @@ struct FeynmanChat: Identifiable, Hashable {
                 solution_hint TEXT,
                 created_date TEXT,
                 solved_count INTEGER DEFAULT 0,
+                solution TEXT,
+                steps TEXT,
                 FOREIGN KEY (topic_id) REFERENCES topics(id)
             );
         """)
         alterTableAddColumn(table: "problems", column: "created_date", type: "TEXT")
         alterTableAddColumn(table: "problems", column: "solved_count", type: "INTEGER DEFAULT 0")
+        alterTableAddColumn(table: "problems", column: "solution", type: "TEXT")
+        alterTableAddColumn(table: "problems", column: "steps", type: "TEXT")
         
         execute(sql: """
             CREATE TABLE IF NOT EXISTS feynman_sessions (
@@ -430,7 +433,7 @@ struct FeynmanChat: Identifiable, Hashable {
     
     func getNotes(forModuleId moduleId: Int) -> [Note] {
         let sql = """
-            SELECT n.id, n.topic_id, n.file_path, n.title, n.ai_summary, n.difficulty, n.pre_lecture_primer
+            SELECT n.id, n.topic_id, n.file_path, n.title, n.ai_summary, n.pre_lecture_primer
             FROM notes n
             JOIN topics t ON n.topic_id = t.id
             WHERE t.module_id = ?
@@ -444,7 +447,6 @@ struct FeynmanChat: Identifiable, Hashable {
                 filePath: row["file_path"] as? String ?? "",
                 title: row["title"] as? String ?? "",
                 aiSummary: row["ai_summary"] as? String,
-                difficulty: row["difficulty"] as? String,
                 preLecturePrimer: row["pre_lecture_primer"] as? String
             )
         }
@@ -505,6 +507,25 @@ struct FeynmanChat: Identifiable, Hashable {
         return Int(lastInsertRowId)
     }
     
+    func getOrCreateTopic(moduleId: Int, week: Int, name: String) -> Int? {
+        let results = query(
+            sql: "SELECT id FROM topics WHERE module_id = ? AND week = ? LIMIT 1",
+            params: [moduleId, week]
+        )
+        if let first = results.first, let id = first["id"] as? Int {
+            return id
+        }
+        
+        let success = execute(
+            sql: "INSERT INTO topics (module_id, week, name) VALUES (?, ?, ?)",
+            params: [moduleId, week, name]
+        )
+        if success {
+            return Int(lastInsertRowId)
+        }
+        return nil
+    }
+    
     func updateNoteTitle(topicId: Int, noteId: Int, newTitle: String) -> Bool {
         let tSuccess = execute(sql: "UPDATE topics SET name = ? WHERE id = ?", params: [newTitle, topicId])
         let nSuccess = execute(sql: "UPDATE notes SET title = ? WHERE id = ?", params: [newTitle, noteId])
@@ -518,15 +539,15 @@ struct FeynmanChat: Identifiable, Hashable {
         return nSuccess && tSuccess
     }
     
-    func updateNoteAI(noteId: Int, summary: String?, difficulty: String?, primer: String?) -> Bool {
+    func updateNoteAI(noteId: Int, summary: String?, primer: String?) -> Bool {
         return execute(
-            sql: "UPDATE notes SET ai_summary = ?, difficulty = ?, pre_lecture_primer = ? WHERE id = ?",
-            params: [summary as Any, difficulty as Any, primer as Any, noteId]
+            sql: "UPDATE notes SET ai_summary = ?, pre_lecture_primer = ? WHERE id = ?",
+            params: [summary as Any, primer as Any, noteId]
         )
     }
     
     func getNote(id: Int) -> Note? {
-        let rows = query(sql: "SELECT id, topic_id, file_path, title, ai_summary, difficulty, pre_lecture_primer FROM notes WHERE id = ?", params: [id])
+        let rows = query(sql: "SELECT id, topic_id, file_path, title, ai_summary, pre_lecture_primer FROM notes WHERE id = ?", params: [id])
         guard let row = rows.first else { return nil }
         return Note(
             id: row["id"] as? Int ?? 0,
@@ -534,7 +555,6 @@ struct FeynmanChat: Identifiable, Hashable {
             filePath: row["file_path"] as? String ?? "",
             title: row["title"] as? String ?? "",
             aiSummary: row["ai_summary"] as? String,
-            difficulty: row["difficulty"] as? String,
             preLecturePrimer: row["pre_lecture_primer"] as? String
         )
     }
@@ -627,14 +647,14 @@ struct FeynmanChat: Identifiable, Hashable {
         let params: [Any]
         if let moduleId = moduleId {
             sql = """
-                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count 
+                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps
                 FROM problems p
                 JOIN topics t ON p.topic_id = t.id
                 WHERE t.module_id = ?
             """
             params = [moduleId]
         } else {
-            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count FROM problems"
+            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps FROM problems"
             params = []
         }
         let rows = query(sql: sql, params: params)
@@ -645,24 +665,32 @@ struct FeynmanChat: Identifiable, Hashable {
                 content: row["content"] as? String ?? "",
                 solutionHint: row["solution_hint"] as? String ?? "",
                 createdDate: row["created_date"] as? String ?? "",
-                solvedCount: row["solved_count"] as? Int ?? 0
+                solvedCount: row["solved_count"] as? Int ?? 0,
+                solution: row["solution"] as? String ?? "",
+                steps: row["steps"] as? String ?? ""
             )
         }
     }
     
-    func addProblem(topicId: Int, content: String, hint: String) -> Bool {
+    func addProblem(topicId: Int, content: String, hint: String, solution: String = "", steps: String = "") -> Bool {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         let today = formatter.string(from: Date())
         
         return execute(
-            sql: "INSERT INTO problems (topic_id, content, solution_hint, created_date) VALUES (?, ?, ?, ?)",
-            params: [topicId, content, hint, today]
+            sql: "INSERT INTO problems (topic_id, content, solution_hint, created_date, solution, steps) VALUES (?, ?, ?, ?, ?, ?)",
+            params: [topicId, content, hint, today, solution, steps]
         )
     }
     
     func incrementProblemSolvedCount(id: Int) -> Bool {
         return execute(sql: "UPDATE problems SET solved_count = solved_count + 1 WHERE id = ?", params: [id])
+    }
+    func updateProblem(id: Int, topicId: Int, content: String, hint: String, solution: String, steps: String) -> Bool {
+        return execute(
+            sql: "UPDATE problems SET topic_id = ?, content = ?, solution_hint = ?, solution = ?, steps = ? WHERE id = ?",
+            params: [topicId, content, hint, solution, steps, id]
+        )
     }
     
     func deleteProblem(id: Int) -> Bool {
