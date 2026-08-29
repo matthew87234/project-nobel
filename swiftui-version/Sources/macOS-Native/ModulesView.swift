@@ -5,7 +5,13 @@ struct ModulesView: View {
     let activeModuleId: Int?
     
     @State private var notes: [Note] = []
+    @State private var draftNotes: [Note] = []
     @State private var editableTitles: [Int: String] = [:] // Map noteId -> title
+    @State private var redoingNoteIds: Set<Int> = []
+    
+    private var isOrderChanged: Bool {
+        return draftNotes.map(\.id) != notes.map(\.id)
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -22,6 +28,7 @@ struct ModulesView: View {
                         .font(.headline)
                 }
                 .buttonStyle(.borderedProminent)
+                .pointingHandCursor()
                 .disabled(activeModuleId == nil)
                 
                 Button(action: {
@@ -31,7 +38,29 @@ struct ModulesView: View {
                         .font(.headline)
                 }
                 .buttonStyle(.bordered)
+                .pointingHandCursor()
                 .disabled(activeModuleId == nil)
+                
+                if isOrderChanged {
+                    Button(action: {
+                        commitNewOrder()
+                    }) {
+                        Label("Save Order & Update Recaps", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.headline)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .pointingHandCursor()
+                    
+                    Button(action: {
+                        self.draftNotes = self.notes
+                    }) {
+                        Text("Reset Order")
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.bordered)
+                    .pointingHandCursor()
+                }
                 
                 Spacer()
             }
@@ -40,7 +69,7 @@ struct ModulesView: View {
             // Scrollable List of Linked Notes
             ScrollView {
                 VStack(spacing: 12) {
-                    if notes.isEmpty {
+                    if draftNotes.isEmpty {
                         VStack(spacing: 10) {
                             Spacer().frame(height: 50)
                             Image(systemName: "tray")
@@ -53,7 +82,7 @@ struct ModulesView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .center)
                     } else {
-                        ForEach(notes) { note in
+                        ForEach(draftNotes) { note in
                             noteItemRow(note)
                         }
                     }
@@ -61,7 +90,7 @@ struct ModulesView: View {
                 .padding(.horizontal)
             }
         }
-        .onChange(of: activeModuleId) { _ in
+        .onChange(of: activeModuleId) { _, _ in
             loadNotes()
         }
         .onAppear {
@@ -73,33 +102,87 @@ struct ModulesView: View {
         let filename = URL(fileURLWithPath: note.filePath).lastPathComponent
         let titleBinding = Binding(
             get: { self.editableTitles[note.id] ?? note.title },
-            set: { self.editableTitles[note.id] = $0 }
+            set: { newValue in
+                self.editableTitles[note.id] = newValue
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    _ = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: trimmed)
+                }
+            }
         )
+        let idx = draftNotes.firstIndex(where: { $0.id == note.id }) ?? 0
+        let isFirst = idx == 0
+        let isLast = idx == draftNotes.count - 1
+        let isRedoing = redoingNoteIds.contains(note.id)
         
-        return HStack(spacing: 15) {
+        return HStack(spacing: 10) {
+            // Reorder Up / Down Controls
+            VStack(spacing: 2) {
+                Button(action: { moveNoteUp(note) }) {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .disabled(isFirst)
+                .opacity(isFirst ? 0.3 : 1.0)
+                
+                Button(action: { moveNoteDown(note) }) {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .disabled(isLast)
+                .opacity(isLast ? 0.3 : 1.0)
+            }
+            .frame(width: 14)
+            
+            // Lecture Index Badge
+            Text("\(idx + 1)")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.blue.opacity(0.15))
+                .foregroundColor(.blue)
+                .cornerRadius(5)
+            
             // File Info
             Text(filename)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundColor(.secondary)
-                .frame(width: 150, alignment: .leading)
+                .frame(width: 130, alignment: .leading)
                 .lineLimit(1)
+                .truncationMode(.middle)
             
             // Title Editor Entry
             TextField("Lecture Title", text: titleBinding)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: .infinity)
             
-            // Save Title Button
-            Button("Save Title") {
-                saveTitle(note: note)
+            // Redo AI Title Icon Button
+            Button(action: {
+                redoTitle(note: note)
+            }) {
+                if isRedoing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                }
             }
             .buttonStyle(.bordered)
+            .pointingHandCursor()
+            .disabled(isRedoing)
+            .help("Redo AI Title")
             
             // Open PDF Button
             Button("Open PDF") {
                 openPDF(path: note.filePath)
             }
             .buttonStyle(.bordered)
+            .pointingHandCursor()
             
             // Delete Button
             Button(role: .destructive, action: {
@@ -109,6 +192,7 @@ struct ModulesView: View {
                     .foregroundColor(.red)
             }
             .buttonStyle(.plain)
+            .pointingHandCursor()
             .padding(.trailing, 5)
         }
         .padding(10)
@@ -121,10 +205,12 @@ struct ModulesView: View {
     private func loadNotes() {
         guard let modId = activeModuleId else {
             self.notes = []
+            self.draftNotes = []
             self.editableTitles.removeAll()
             return
         }
         self.notes = DatabaseManager.shared.getNotes(forModuleId: modId)
+        self.draftNotes = self.notes
         for note in notes {
             self.editableTitles[note.id] = note.title
         }
@@ -223,6 +309,65 @@ struct ModulesView: View {
         let success = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: newTitle)
         if success {
             loadNotes()
+        }
+    }
+    
+    private func redoTitle(note: Note) {
+        redoingNoteIds.insert(note.id)
+        Task {
+            await AIHelper.shared.generateDescriptiveTitle(noteId: note.id)
+            self.editableTitles.removeValue(forKey: note.id)
+            loadNotes()
+            redoingNoteIds.remove(note.id)
+        }
+    }
+    
+    private func moveNoteUp(_ note: Note) {
+        guard let idx = draftNotes.firstIndex(where: { $0.id == note.id }), idx > 0 else { return }
+        draftNotes.swapAt(idx, idx - 1)
+    }
+    
+    private func moveNoteDown(_ note: Note) {
+        guard let idx = draftNotes.firstIndex(where: { $0.id == note.id }), idx < draftNotes.count - 1 else { return }
+        draftNotes.swapAt(idx, idx + 1)
+    }
+    
+    private func commitNewOrder() {
+        var affectedNoteIds = Set<Int>()
+        
+        for (draftIdx, note) in draftNotes.enumerated() {
+            let prevDraftId = draftIdx > 0 ? draftNotes[draftIdx - 1].id : nil
+            
+            // Find note's original previous note ID
+            let origIdx = notes.firstIndex(where: { $0.id == note.id })
+            let prevOrigId: Int?
+            if let oIdx = origIdx, oIdx > 0 {
+                prevOrigId = notes[oIdx - 1].id
+            } else {
+                prevOrigId = nil
+            }
+            
+            // If preceding note changed OR position changed
+            if prevDraftId != prevOrigId || origIdx != draftIdx {
+                affectedNoteIds.insert(note.id)
+            }
+        }
+        
+        // Clear pre-lecture primers for affected notes so AI regenerates "Last Lecture Recap"
+        for noteId in affectedNoteIds {
+            _ = DatabaseManager.shared.clearPreLecturePrimer(noteId: noteId)
+        }
+        
+        // Save new order to SQLite
+        if DatabaseManager.shared.updateNoteOrder(notesInOrder: draftNotes) {
+            let updatedDraft = draftNotes
+            self.notes = updatedDraft
+            
+            // Regenerate pre-lecture primers for affected notes in background
+            Task {
+                await AIHelper.shared.regeneratePreLecturePrimersForReorderedNotes(notesInOrder: updatedDraft, affectedNoteIds: affectedNoteIds)
+                loadNotes()
+            }
         }
     }
     

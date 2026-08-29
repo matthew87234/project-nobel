@@ -13,6 +13,8 @@ DerivedData/
 *.xcworkspace/
 *.app/
 *.app
+*.dmg
+.build_dmg_staging/
 
 # Python
 __pycache__/

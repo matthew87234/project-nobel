@@ -9,6 +9,56 @@ struct Module: Identifiable, Hashable {
     var name: String
     var semester: Int
     var year: Int
+    var testDate: String = ""
+    
+    var testDateFormattedDateOnly: String {
+        guard !testDate.isEmpty else { return "No Exam Set" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        var parsedDate = formatter.date(from: testDate)
+        if parsedDate == nil {
+            let fallbackFormatter = DateFormatter()
+            fallbackFormatter.dateFormat = "yyyy-MM-dd"
+            parsedDate = fallbackFormatter.date(from: testDate)
+        }
+        if let date = parsedDate {
+            let outFormatter = DateFormatter()
+            outFormatter.dateFormat = "d MMM yyyy"
+            return outFormatter.string(from: date)
+        }
+        return testDate
+    }
+    
+    var daysRemaining: Int? {
+        guard !testDate.isEmpty else { return nil }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        var parsedDate = formatter.date(from: testDate)
+        if parsedDate == nil {
+            let fallbackFormatter = DateFormatter()
+            fallbackFormatter.dateFormat = "yyyy-MM-dd"
+            parsedDate = fallbackFormatter.date(from: testDate)
+        }
+        guard let examDate = parsedDate else { return nil }
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: Date())
+        let startOfExam = calendar.startOfDay(for: examDate)
+        let components = calendar.dateComponents([.day], from: startOfToday, to: startOfExam)
+        return components.day
+    }
+    
+    var daysRemainingFormatted: String {
+        guard let days = daysRemaining else { return "" }
+        if days > 1 {
+            return "\(days) days remaining"
+        } else if days == 1 {
+            return "1 day remaining"
+        } else if days == 0 {
+            return "Exam is today"
+        } else {
+            return "\(abs(days)) days ago"
+        }
+    }
 }
 
 struct Topic: Identifiable, Hashable {
@@ -37,6 +87,7 @@ struct Flashcard: Identifiable, Hashable {
     var easeFactor: Double
     var repetitions: Int
     var createdDate: String
+    var isFlagged: Bool = false
 }
 
 struct Problem: Identifiable, Hashable {
@@ -48,6 +99,14 @@ struct Problem: Identifiable, Hashable {
     var solvedCount: Int
     var solution: String
     var steps: String
+    var isFlagged: Bool = false
+    var lastReviewedDate: String = ""
+    var nextReviewDate: String = ""
+    var lastFailedStep: Int = 0
+    var severityLevel: Int = 4
+    var interval: Int = 0
+    var easeFactor: Double = 2.5
+    var repetitions: Int = 0
 }
 
 struct FeynmanSession: Identifiable, Hashable {
@@ -84,7 +143,16 @@ struct FeynmanChat: Identifiable, Hashable {
         
         try? fileManager.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
         
-        let dbURL = appSupportDir.appendingPathComponent("physics_study.db")
+        let isDesktopApp = Bundle.main.bundlePath.contains("/Desktop") || ProcessInfo.processInfo.arguments.contains("--desktop-db")
+        let dbFilename = isDesktopApp ? "physics_study_desktop.db" : "physics_study.db"
+        let dbURL = appSupportDir.appendingPathComponent(dbFilename)
+        
+        if isDesktopApp && !fileManager.fileExists(atPath: dbURL.path) {
+            let prodURL = appSupportDir.appendingPathComponent("physics_study.db")
+            if fileManager.fileExists(atPath: prodURL.path) {
+                try? fileManager.copyItem(at: prodURL, to: dbURL)
+            }
+        }
         
         if sqlite3_open(dbURL.path, &db) != SQLITE_OK {
             print("Error opening database")
@@ -101,6 +169,7 @@ struct FeynmanChat: Identifiable, Hashable {
             );
         """)
         alterTableAddColumn(table: "modules", column: "year", type: "INTEGER DEFAULT 1")
+        alterTableAddColumn(table: "modules", column: "test_date", type: "TEXT")
         
         execute(sql: """
             CREATE TABLE IF NOT EXISTS topics (
@@ -137,10 +206,12 @@ struct FeynmanChat: Identifiable, Hashable {
                 ease_factor REAL DEFAULT 2.5,
                 repetitions INTEGER DEFAULT 0,
                 created_date TEXT,
+                is_flagged INTEGER DEFAULT 0,
                 FOREIGN KEY (module_id) REFERENCES modules(id)
             );
         """)
         alterTableAddColumn(table: "flashcards", column: "created_date", type: "TEXT")
+        alterTableAddColumn(table: "flashcards", column: "is_flagged", type: "INTEGER DEFAULT 0")
         
         execute(sql: """
             CREATE TABLE IF NOT EXISTS problems (
@@ -159,6 +230,14 @@ struct FeynmanChat: Identifiable, Hashable {
         alterTableAddColumn(table: "problems", column: "solved_count", type: "INTEGER DEFAULT 0")
         alterTableAddColumn(table: "problems", column: "solution", type: "TEXT")
         alterTableAddColumn(table: "problems", column: "steps", type: "TEXT")
+        alterTableAddColumn(table: "problems", column: "is_flagged", type: "INTEGER DEFAULT 0")
+        alterTableAddColumn(table: "problems", column: "last_reviewed_date", type: "TEXT")
+        alterTableAddColumn(table: "problems", column: "next_review_date", type: "TEXT")
+        alterTableAddColumn(table: "problems", column: "last_failed_step", type: "INTEGER DEFAULT 0")
+        alterTableAddColumn(table: "problems", column: "severity_level", type: "INTEGER DEFAULT 4")
+        alterTableAddColumn(table: "problems", column: "interval", type: "INTEGER DEFAULT 0")
+        alterTableAddColumn(table: "problems", column: "ease_factor", type: "REAL DEFAULT 2.5")
+        alterTableAddColumn(table: "problems", column: "repetitions", type: "INTEGER DEFAULT 0")
         
         execute(sql: """
             CREATE TABLE IF NOT EXISTS feynman_sessions (
@@ -373,10 +452,10 @@ struct FeynmanChat: Identifiable, Hashable {
         let sql: String
         let params: [Any]
         if let year = year {
-            sql = "SELECT id, code, name, semester, year FROM modules WHERE year = ? ORDER BY code ASC"
+            sql = "SELECT id, code, name, semester, year, test_date FROM modules WHERE year = ? ORDER BY code ASC"
             params = [year]
         } else {
-            sql = "SELECT id, code, name, semester, year FROM modules ORDER BY year ASC, code ASC"
+            sql = "SELECT id, code, name, semester, year, test_date FROM modules ORDER BY year ASC, code ASC"
             params = []
         }
         
@@ -387,22 +466,23 @@ struct FeynmanChat: Identifiable, Hashable {
                 code: row["code"] as? String ?? "",
                 name: row["name"] as? String ?? "",
                 semester: row["semester"] as? Int ?? 1,
-                year: row["year"] as? Int ?? 1
+                year: row["year"] as? Int ?? 1,
+                testDate: row["test_date"] as? String ?? ""
             )
         }
     }
     
-    func addModule(code: String, name: String, semester: Int, year: Int) -> Bool {
+    func addModule(code: String, name: String, semester: Int, year: Int, testDate: String = "") -> Bool {
         return execute(
-            sql: "INSERT INTO modules (code, name, semester, year) VALUES (?, ?, ?, ?)",
-            params: [code, name, semester, year]
+            sql: "INSERT INTO modules (code, name, semester, year, test_date) VALUES (?, ?, ?, ?, ?)",
+            params: [code, name, semester, year, testDate]
         )
     }
     
-    func updateModule(id: Int, code: String, name: String, semester: Int, year: Int) -> Bool {
+    func updateModule(id: Int, code: String, name: String, semester: Int, year: Int, testDate: String = "") -> Bool {
         return execute(
-            sql: "UPDATE modules SET code = ?, name = ?, semester = ?, year = ? WHERE id = ?",
-            params: [code, name, semester, year, id]
+            sql: "UPDATE modules SET code = ?, name = ?, semester = ?, year = ?, test_date = ? WHERE id = ?",
+            params: [code, name, semester, year, testDate, id]
         )
     }
     
@@ -431,15 +511,20 @@ struct FeynmanChat: Identifiable, Hashable {
     
     // MARK: - Topics & Notes queries
     
-    func getNotes(forModuleId moduleId: Int) -> [Note] {
-        let sql = """
+    func getNotes(forModuleId moduleId: Int? = nil) -> [Note] {
+        var sql = """
             SELECT n.id, n.topic_id, n.file_path, n.title, n.ai_summary, n.pre_lecture_primer
             FROM notes n
             JOIN topics t ON n.topic_id = t.id
-            WHERE t.module_id = ?
-            ORDER BY t.week ASC, t.id ASC
         """
-        let rows = query(sql: sql, params: [moduleId])
+        var params: [Any] = []
+        if let modId = moduleId {
+            sql += " WHERE t.module_id = ?"
+            params.append(modId)
+        }
+        sql += " ORDER BY t.week ASC, t.id ASC"
+        
+        let rows = query(sql: sql, params: params)
         return rows.map { row in
             Note(
                 id: row["id"] as? Int ?? 0,
@@ -532,6 +617,16 @@ struct FeynmanChat: Identifiable, Hashable {
         return tSuccess && nSuccess
     }
     
+    func updateNoteOrder(notesInOrder: [Note]) -> Bool {
+        var success = true
+        for (index, note) in notesInOrder.enumerated() {
+            let newWeek = index + 1
+            let ok = execute(sql: "UPDATE topics SET week = ? WHERE id = ?", params: [newWeek, note.topicId])
+            if !ok { success = false }
+        }
+        return success
+    }
+    
     func deleteNote(topicId: Int, noteId: Int) -> Bool {
         execute(sql: "DELETE FROM feynman_chats WHERE note_id = ?", params: [noteId])
         let nSuccess = execute(sql: "DELETE FROM notes WHERE id = ?", params: [noteId])
@@ -544,6 +639,10 @@ struct FeynmanChat: Identifiable, Hashable {
             sql: "UPDATE notes SET ai_summary = ?, pre_lecture_primer = ? WHERE id = ?",
             params: [summary as Any, primer as Any, noteId]
         )
+    }
+    
+    func clearPreLecturePrimer(noteId: Int) -> Bool {
+        return execute(sql: "UPDATE notes SET pre_lecture_primer = NULL WHERE id = ?", params: [noteId])
     }
     
     func getNote(id: Int) -> Note? {
@@ -566,14 +665,22 @@ struct FeynmanChat: Identifiable, Hashable {
     
     // MARK: - Flashcards queries
     
-    func getFlashcards(forModuleId moduleId: Int? = nil) -> [Flashcard] {
+    func getFlashcards(forYear: Int? = nil, forModuleId moduleId: Int? = nil) -> [Flashcard] {
         let sql: String
         let params: [Any]
         if let moduleId = moduleId {
-            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date FROM flashcards WHERE module_id = ?"
+            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date, is_flagged FROM flashcards WHERE module_id = ?"
             params = [moduleId]
+        } else if let year = forYear {
+            sql = """
+                SELECT f.id, f.module_id, f.front, f.back, f.next_review_date, f.interval, f.ease_factor, f.repetitions, f.created_date, f.is_flagged
+                FROM flashcards f
+                JOIN modules m ON f.module_id = m.id
+                WHERE m.year = ?
+            """
+            params = [year]
         } else {
-            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date FROM flashcards"
+            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date, is_flagged FROM flashcards"
             params = []
         }
         let rows = query(sql: sql, params: params)
@@ -587,19 +694,28 @@ struct FeynmanChat: Identifiable, Hashable {
                 interval: row["interval"] as? Int ?? 0,
                 easeFactor: row["ease_factor"] as? Double ?? 2.5,
                 repetitions: row["repetitions"] as? Int ?? 0,
-                createdDate: row["created_date"] as? String ?? ""
+                createdDate: row["created_date"] as? String ?? "",
+                isFlagged: (row["is_flagged"] as? Int ?? 0) == 1
             )
         }
     }
     
-    func getDueFlashcards(forModuleId moduleId: Int? = nil, today: String) -> [Flashcard] {
+    func getDueFlashcards(forYear: Int? = nil, forModuleId moduleId: Int? = nil, today: String) -> [Flashcard] {
         let sql: String
         let params: [Any]
         if let moduleId = moduleId {
-            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date FROM flashcards WHERE module_id = ? AND (next_review_date <= ? OR next_review_date IS NULL OR next_review_date = '')"
+            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date, is_flagged FROM flashcards WHERE module_id = ? AND (next_review_date <= ? OR next_review_date IS NULL OR next_review_date = '')"
             params = [moduleId, today]
+        } else if let year = forYear {
+            sql = """
+                SELECT f.id, f.module_id, f.front, f.back, f.next_review_date, f.interval, f.ease_factor, f.repetitions, f.created_date, f.is_flagged
+                FROM flashcards f
+                JOIN modules m ON f.module_id = m.id
+                WHERE m.year = ? AND (f.next_review_date <= ? OR f.next_review_date IS NULL OR f.next_review_date = '')
+            """
+            params = [year, today]
         } else {
-            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date FROM flashcards WHERE next_review_date <= ? OR next_review_date IS NULL OR next_review_date = ''"
+            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date, is_flagged FROM flashcards WHERE next_review_date <= ? OR next_review_date IS NULL OR next_review_date = ''"
             params = [today]
         }
         let rows = query(sql: sql, params: params)
@@ -613,9 +729,49 @@ struct FeynmanChat: Identifiable, Hashable {
                 interval: row["interval"] as? Int ?? 0,
                 easeFactor: row["ease_factor"] as? Double ?? 2.5,
                 repetitions: row["repetitions"] as? Int ?? 0,
-                createdDate: row["created_date"] as? String ?? ""
+                createdDate: row["created_date"] as? String ?? "",
+                isFlagged: (row["is_flagged"] as? Int ?? 0) == 1
             )
         }
+    }
+    
+    func getFlaggedFlashcards(forYear: Int? = nil, forModuleId moduleId: Int? = nil) -> [Flashcard] {
+        let sql: String
+        let params: [Any]
+        if let moduleId = moduleId {
+            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date, is_flagged FROM flashcards WHERE module_id = ? AND is_flagged = 1"
+            params = [moduleId]
+        } else if let year = forYear {
+            sql = """
+                SELECT f.id, f.module_id, f.front, f.back, f.next_review_date, f.interval, f.ease_factor, f.repetitions, f.created_date, f.is_flagged
+                FROM flashcards f
+                JOIN modules m ON f.module_id = m.id
+                WHERE m.year = ? AND f.is_flagged = 1
+            """
+            params = [year]
+        } else {
+            sql = "SELECT id, module_id, front, back, next_review_date, interval, ease_factor, repetitions, created_date, is_flagged FROM flashcards WHERE is_flagged = 1"
+            params = []
+        }
+        let rows = query(sql: sql, params: params)
+        return rows.map { row in
+            Flashcard(
+                id: row["id"] as? Int ?? 0,
+                moduleId: row["module_id"] as? Int ?? 0,
+                front: row["front"] as? String ?? "",
+                back: row["back"] as? String ?? "",
+                nextReviewDate: row["next_review_date"] as? String ?? "",
+                interval: row["interval"] as? Int ?? 0,
+                easeFactor: row["ease_factor"] as? Double ?? 2.5,
+                repetitions: row["repetitions"] as? Int ?? 0,
+                createdDate: row["created_date"] as? String ?? "",
+                isFlagged: (row["is_flagged"] as? Int ?? 0) == 1
+            )
+        }
+    }
+    
+    func setFlashcardFlag(id: Int, isFlagged: Bool) -> Bool {
+        return execute(sql: "UPDATE flashcards SET is_flagged = ? WHERE id = ?", params: [isFlagged ? 1 : 0, id])
     }
     
     func addFlashcard(moduleId: Int, front: String, back: String) -> Bool {
@@ -636,25 +792,41 @@ struct FeynmanChat: Identifiable, Hashable {
         )
     }
     
+    func updateFlashcard(id: Int, front: String, back: String) -> Bool {
+        return execute(
+            sql: "UPDATE flashcards SET front = ?, back = ? WHERE id = ?",
+            params: [front, back, id]
+        )
+    }
+    
     func deleteFlashcard(id: Int) -> Bool {
         return execute(sql: "DELETE FROM flashcards WHERE id = ?", params: [id])
     }
     
     // MARK: - Problems queries
     
-    func getProblems(forModuleId moduleId: Int? = nil) -> [Problem] {
+    func getProblems(forYear: Int? = nil, forModuleId moduleId: Int? = nil) -> [Problem] {
         let sql: String
         let params: [Any]
         if let moduleId = moduleId {
             sql = """
-                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps
+                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps, p.is_flagged, p.last_reviewed_date, p.next_review_date, p.last_failed_step, p.severity_level, p.interval, p.ease_factor, p.repetitions
                 FROM problems p
                 JOIN topics t ON p.topic_id = t.id
                 WHERE t.module_id = ?
             """
             params = [moduleId]
+        } else if let year = forYear {
+            sql = """
+                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps, p.is_flagged, p.last_reviewed_date, p.next_review_date, p.last_failed_step, p.severity_level, p.interval, p.ease_factor, p.repetitions
+                FROM problems p
+                JOIN topics t ON p.topic_id = t.id
+                JOIN modules m ON t.module_id = m.id
+                WHERE m.year = ?
+            """
+            params = [year]
         } else {
-            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps FROM problems"
+            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps, is_flagged, last_reviewed_date, next_review_date, last_failed_step, severity_level, interval, ease_factor, repetitions FROM problems"
             params = []
         }
         let rows = query(sql: sql, params: params)
@@ -667,9 +839,90 @@ struct FeynmanChat: Identifiable, Hashable {
                 createdDate: row["created_date"] as? String ?? "",
                 solvedCount: row["solved_count"] as? Int ?? 0,
                 solution: row["solution"] as? String ?? "",
-                steps: row["steps"] as? String ?? ""
+                steps: row["steps"] as? String ?? "",
+                isFlagged: (row["is_flagged"] as? Int ?? 0) == 1,
+                lastReviewedDate: row["last_reviewed_date"] as? String ?? "",
+                nextReviewDate: row["next_review_date"] as? String ?? "",
+                lastFailedStep: row["last_failed_step"] as? Int ?? 0,
+                severityLevel: row["severity_level"] as? Int ?? 4,
+                interval: row["interval"] as? Int ?? 0,
+                easeFactor: row["ease_factor"] as? Double ?? 2.5,
+                repetitions: row["repetitions"] as? Int ?? 0
             )
         }
+    }
+    
+    func getDueProblems(forYear: Int? = nil, forModuleId moduleId: Int? = nil, today: String) -> [Problem] {
+        let sql: String
+        let params: [Any]
+        if let moduleId = moduleId {
+            sql = """
+                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps, p.is_flagged, p.last_reviewed_date, p.next_review_date, p.last_failed_step, p.severity_level, p.interval, p.ease_factor, p.repetitions
+                FROM problems p
+                JOIN topics t ON p.topic_id = t.id
+                WHERE t.module_id = ? AND (p.next_review_date <= ? OR p.next_review_date IS NULL OR p.next_review_date = '')
+            """
+            params = [moduleId, today]
+        } else if let year = forYear {
+            sql = """
+                SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps, p.is_flagged, p.last_reviewed_date, p.next_review_date, p.last_failed_step, p.severity_level, p.interval, p.ease_factor, p.repetitions
+                FROM problems p
+                JOIN topics t ON p.topic_id = t.id
+                JOIN modules m ON t.module_id = m.id
+                WHERE m.year = ? AND (p.next_review_date <= ? OR p.next_review_date IS NULL OR p.next_review_date = '')
+            """
+            params = [year, today]
+        } else {
+            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps, is_flagged, last_reviewed_date, next_review_date, last_failed_step, severity_level, interval, ease_factor, repetitions FROM problems WHERE next_review_date <= ? OR next_review_date IS NULL OR next_review_date = ''"
+            params = [today]
+        }
+        let rows = query(sql: sql, params: params)
+        return rows.map { row in
+            Problem(
+                id: row["id"] as? Int ?? 0,
+                topicId: row["topic_id"] as? Int ?? 0,
+                content: row["content"] as? String ?? "",
+                solutionHint: row["solution_hint"] as? String ?? "",
+                createdDate: row["created_date"] as? String ?? "",
+                solvedCount: row["solved_count"] as? Int ?? 0,
+                solution: row["solution"] as? String ?? "",
+                steps: row["steps"] as? String ?? "",
+                isFlagged: (row["is_flagged"] as? Int ?? 0) == 1,
+                lastReviewedDate: row["last_reviewed_date"] as? String ?? "",
+                nextReviewDate: row["next_review_date"] as? String ?? "",
+                lastFailedStep: row["last_failed_step"] as? Int ?? 0,
+                severityLevel: row["severity_level"] as? Int ?? 4,
+                interval: row["interval"] as? Int ?? 0,
+                easeFactor: row["ease_factor"] as? Double ?? 2.5,
+                repetitions: row["repetitions"] as? Int ?? 0
+            )
+        }
+    }
+    
+    func getProblem(id: Int) -> Problem? {
+        let rows = query(
+            sql: "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps, is_flagged, last_reviewed_date, next_review_date, last_failed_step, severity_level, interval, ease_factor, repetitions FROM problems WHERE id = ?",
+            params: [id]
+        )
+        guard let row = rows.first else { return nil }
+        return Problem(
+            id: row["id"] as? Int ?? 0,
+            topicId: row["topic_id"] as? Int ?? 0,
+            content: row["content"] as? String ?? "",
+            solutionHint: row["solution_hint"] as? String ?? "",
+            createdDate: row["created_date"] as? String ?? "",
+            solvedCount: row["solved_count"] as? Int ?? 0,
+            solution: row["solution"] as? String ?? "",
+            steps: row["steps"] as? String ?? "",
+            isFlagged: (row["is_flagged"] as? Int ?? 0) == 1,
+            lastReviewedDate: row["last_reviewed_date"] as? String ?? "",
+            nextReviewDate: row["next_review_date"] as? String ?? "",
+            lastFailedStep: row["last_failed_step"] as? Int ?? 0,
+            severityLevel: row["severity_level"] as? Int ?? 4,
+            interval: row["interval"] as? Int ?? 0,
+            easeFactor: row["ease_factor"] as? Double ?? 2.5,
+            repetitions: row["repetitions"] as? Int ?? 0
+        )
     }
     
     func addProblem(topicId: Int, content: String, hint: String, solution: String = "", steps: String = "") -> Bool {
@@ -695,6 +948,82 @@ struct FeynmanChat: Identifiable, Hashable {
     
     func deleteProblem(id: Int) -> Bool {
         return execute(sql: "DELETE FROM problems WHERE id = ?", params: [id])
+    }
+    
+    func setProblemFlagged(id: Int, isFlagged: Bool) -> Bool {
+        return execute(sql: "UPDATE problems SET is_flagged = ? WHERE id = ?", params: [isFlagged ? 1 : 0, id])
+    }
+    
+    func recordProblemPracticeResult(id: Int, failedStep: Int, totalSteps: Int) -> Bool {
+        let currentProb = getProblem(id: id)
+        
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let todayDate = Date()
+        let todayStr = formatter.string(from: todayDate)
+        
+        let quality: Int
+        let severity: Int
+        
+        if failedStep == 1 {
+            quality = 1 // Again (Critical Setup Error)
+            severity = 1
+        } else if failedStep == 2 {
+            quality = 2 // Hard (Formulation Error)
+            severity = 2
+        } else if failedStep >= 3 {
+            quality = 3 // Good (Calculation / Algebra Slip)
+            severity = 3
+        } else {
+            quality = 4 // Easy / Flawless
+            severity = 4
+        }
+        
+        // SM-2 Spaced Repetition Algorithm for Problems
+        var reps = currentProb?.repetitions ?? 0
+        var ease = currentProb?.easeFactor ?? 2.5
+        let currentInterval = currentProb?.interval ?? 0
+        let nextInterval: Int
+        
+        if quality >= 3 {
+            reps += 1
+            if reps == 1 {
+                nextInterval = (quality == 4) ? 3 : 1
+            } else if reps == 2 {
+                nextInterval = (quality == 4) ? 7 : 4
+            } else {
+                let multiplier = (quality == 4) ? (ease * 1.3) : ease
+                nextInterval = max(reps + 2, Int(Double(max(currentInterval, 1)) * multiplier))
+            }
+        } else {
+            reps = 0
+            nextInterval = (quality == 2) ? 2 : 1
+        }
+        
+        // Adjust Ease Factor using SuperMemo-2 formula (minimum 1.3)
+        ease = ease + (0.1 - (5.0 - Double(quality)) * (0.08 + (5.0 - Double(quality)) * 0.02))
+        if ease < 1.3 {
+            ease = 1.3
+        }
+        
+        let nextDate = Calendar.current.date(byAdding: .day, value: nextInterval, to: todayDate) ?? todayDate
+        let nextStr = formatter.string(from: nextDate)
+        
+        return execute(
+            sql: """
+                UPDATE problems
+                SET solved_count = solved_count + 1,
+                    last_reviewed_date = ?,
+                    next_review_date = ?,
+                    last_failed_step = ?,
+                    severity_level = ?,
+                    interval = ?,
+                    ease_factor = ?,
+                    repetitions = ?
+                WHERE id = ?
+            """,
+            params: [todayStr, nextStr, failedStep, severity, nextInterval, ease, reps, id]
+        )
     }
     
     // MARK: - Feynman Chats & Sessions queries
@@ -796,11 +1125,11 @@ struct FeynmanChat: Identifiable, Hashable {
         
         let rows = query(sql: "SELECT flashcards_seconds, problems_seconds FROM daily_study_time WHERE date = ?", params: [today])
         if let row = rows.first {
-            let fc = (row["flashcards_seconds"] as? Int ?? 0) + flashcardsDelta
-            let pb = (row["problems_seconds"] as? Int ?? 0) + problemsDelta
+            let fc = max(0, (row["flashcards_seconds"] as? Int ?? 0) + flashcardsDelta)
+            let pb = max(0, (row["problems_seconds"] as? Int ?? 0) + problemsDelta)
             execute(sql: "UPDATE daily_study_time SET flashcards_seconds = ?, problems_seconds = ? WHERE date = ?", params: [fc, pb, today])
         } else {
-            execute(sql: "INSERT INTO daily_study_time (date, flashcards_seconds, problems_seconds) VALUES (?, ?, ?)", params: [today, flashcardsDelta, problemsDelta])
+            execute(sql: "INSERT INTO daily_study_time (date, flashcards_seconds, problems_seconds) VALUES (?, ?, ?)", params: [today, max(0, flashcardsDelta), max(0, problemsDelta)])
         }
     }
     
@@ -811,11 +1140,11 @@ struct FeynmanChat: Identifiable, Hashable {
         
         let rows = query(sql: "SELECT flashcards_seconds, problems_seconds FROM module_study_time WHERE module_id = ? AND date = ?", params: [moduleId, today])
         if let row = rows.first {
-            let fc = (row["flashcards_seconds"] as? Int ?? 0) + flashcardsDelta
-            let pb = (row["problems_seconds"] as? Int ?? 0) + problemsDelta
+            let fc = max(0, (row["flashcards_seconds"] as? Int ?? 0) + flashcardsDelta)
+            let pb = max(0, (row["problems_seconds"] as? Int ?? 0) + problemsDelta)
             execute(sql: "UPDATE module_study_time SET flashcards_seconds = ?, problems_seconds = ? WHERE module_id = ? AND date = ?", params: [fc, pb, moduleId, today])
         } else {
-            execute(sql: "INSERT INTO module_study_time (module_id, date, flashcards_seconds, problems_seconds) VALUES (?, ?, ?, ?)", params: [moduleId, today, flashcardsDelta, problemsDelta])
+            execute(sql: "INSERT INTO module_study_time (module_id, date, flashcards_seconds, problems_seconds) VALUES (?, ?, ?, ?)", params: [moduleId, today, max(0, flashcardsDelta), max(0, problemsDelta)])
         }
     }
     
@@ -921,7 +1250,14 @@ struct FeynmanChat: Identifiable, Hashable {
     }
     
     // For heatmap
-    func getDailyStudySecondsLastYear(moduleId: Int? = nil) -> [String: Int] {
+    struct DailyStudyBreakdown {
+        let date: String
+        let flashcardsSeconds: Int
+        let problemsSeconds: Int
+        var totalSeconds: Int { flashcardsSeconds + problemsSeconds }
+    }
+    
+    func getDailyStudyBreakdownLastYear(moduleId: Int? = nil) -> [String: DailyStudyBreakdown] {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         let calendar = Calendar.current
@@ -931,19 +1267,30 @@ struct FeynmanChat: Identifiable, Hashable {
         let sql: String
         let params: [Any]
         if let moduleId = moduleId {
-            sql = "SELECT date, SUM(flashcards_seconds + problems_seconds) as total FROM module_study_time WHERE module_id = ? AND date >= ? GROUP BY date"
+            sql = "SELECT date, SUM(flashcards_seconds) as fc, SUM(problems_seconds) as pb FROM module_study_time WHERE module_id = ? AND date >= ? GROUP BY date"
             params = [moduleId, oneYearAgoStr]
         } else {
-            sql = "SELECT date, (flashcards_seconds + problems_seconds) as total FROM daily_study_time WHERE date >= ?"
+            sql = "SELECT date, flashcards_seconds as fc, problems_seconds as pb FROM daily_study_time WHERE date >= ?"
             params = [oneYearAgoStr]
         }
         
         let rows = query(sql: sql, params: params)
-        var result: [String: Int] = [:]
+        var result: [String: DailyStudyBreakdown] = [:]
         for row in rows {
-            if let date = row["date"] as? String, let total = row["total"] as? Int {
-                result[date] = total
+            if let date = row["date"] as? String {
+                let fc = row["fc"] as? Int ?? 0
+                let pb = row["pb"] as? Int ?? 0
+                result[date] = DailyStudyBreakdown(date: date, flashcardsSeconds: fc, problemsSeconds: pb)
             }
+        }
+        return result
+    }
+    
+    func getDailyStudySecondsLastYear(moduleId: Int? = nil) -> [String: Int] {
+        let breakdown = getDailyStudyBreakdownLastYear(moduleId: moduleId)
+        var result: [String: Int] = [:]
+        for (k, v) in breakdown {
+            result[k] = v.totalSeconds
         }
         return result
     }
@@ -1186,5 +1533,162 @@ struct FeynmanChat: Identifiable, Hashable {
         let avgFc = fcCount > 0 ? Double(totalFcSec) / Double(fcCount) : 0.0
         let avgProb = pbCount > 0 ? Double(totalPbSec) / Double(pbCount) : 0.0
         return (avgFc, avgProb)
+    }
+    
+    // MARK: - Flashcard Graph Popups Queries
+    
+    func getDueProjection(moduleId: Int?) -> [(dayLabel: String, dateString: String, count: Int)] {
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        
+        let lblFormatter = DateFormatter()
+        lblFormatter.dateFormat = "E (d/M)"
+        
+        var result: [(dayLabel: String, dateString: String, count: Int)] = []
+        let today = Date()
+        let todayStr = formatter.string(from: today)
+        
+        for i in 0..<7 {
+            let targetDate = calendar.date(byAdding: .day, value: i, to: today)!
+            let dateStr = formatter.string(from: targetDate)
+            let dayLabel = (i == 0) ? "Today" : ((i == 1) ? "Tomorrow" : lblFormatter.string(from: targetDate))
+            
+            let sql: String
+            let params: [Any]
+            
+            if i == 0 {
+                // Today includes overdue cards
+                if let modId = moduleId, modId != -1 {
+                    sql = "SELECT COUNT(*) as cnt FROM flashcards WHERE module_id = ? AND (next_review_date <= ? OR next_review_date IS NULL OR next_review_date = '')"
+                    params = [modId, todayStr]
+                } else {
+                    sql = "SELECT COUNT(*) as cnt FROM flashcards WHERE (next_review_date <= ? OR next_review_date IS NULL OR next_review_date = '')"
+                    params = [todayStr]
+                }
+            } else {
+                if let modId = moduleId, modId != -1 {
+                    sql = "SELECT COUNT(*) as cnt FROM flashcards WHERE module_id = ? AND next_review_date = ?"
+                    params = [modId, dateStr]
+                } else {
+                    sql = "SELECT COUNT(*) as cnt FROM flashcards WHERE next_review_date = ?"
+                    params = [dateStr]
+                }
+            }
+            
+            let rows = query(sql: sql, params: params)
+            let count = rows.first?["cnt"] as? Int ?? 0
+            result.append((dayLabel, dateStr, count))
+        }
+        return result
+    }
+    
+    func getCumulativeCardsCreated(moduleId: Int?) -> [(dateLabel: String, count: Int)] {
+        let sql: String
+        let params: [Any]
+        if let modId = moduleId, modId != -1 {
+            sql = "SELECT created_date, COUNT(*) as cnt FROM flashcards WHERE module_id = ? AND created_date IS NOT NULL AND created_date != '' GROUP BY created_date ORDER BY created_date ASC"
+            params = [modId]
+        } else {
+            sql = "SELECT created_date, COUNT(*) as cnt FROM flashcards WHERE created_date IS NOT NULL AND created_date != '' GROUP BY created_date ORDER BY created_date ASC"
+            params = []
+        }
+        
+        let rows = query(sql: sql, params: params)
+        var result: [(dateLabel: String, count: Int)] = []
+        var runningTotal = 0
+        
+        let inFormatter = DateFormatter()
+        inFormatter.dateFormat = "yyyy-MM-dd"
+        let outFormatter = DateFormatter()
+        outFormatter.dateFormat = "d MMM"
+        
+        for row in rows {
+            if let dateStr = row["created_date"] as? String, let cnt = row["cnt"] as? Int {
+                runningTotal += cnt
+                let formattedLabel: String
+                if let d = inFormatter.date(from: dateStr) {
+                    formattedLabel = outFormatter.string(from: d)
+                } else {
+                    formattedLabel = dateStr
+                }
+                result.append((formattedLabel, runningTotal))
+            }
+        }
+        
+        if result.isEmpty {
+            let todayLabel = outFormatter.string(from: Date())
+            let total = getFlashcards(forModuleId: moduleId).count
+            result.append((todayLabel, total))
+        }
+        
+        return result
+    }
+    
+    func getWeeklyTimeDistribution(moduleId: Int?) -> [(rangeLabel: String, count: Int)] {
+        let calendar = Calendar.current
+        let sevenDaysAgo = calendar.date(byAdding: .day, value: -7, to: Date())!
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let dateStr = formatter.string(from: sevenDaysAgo)
+        
+        let (avgSec, _) = getAvgSolveTimes(timeframeStartDate: dateStr, moduleId: moduleId)
+        
+        let sql: String
+        let params: [Any]
+        if let modId = moduleId, modId != -1 {
+            sql = "SELECT COUNT(*) as cnt FROM activity_log WHERE activity_type = 'flashcard' AND module_id = ? AND date(timestamp) >= ?"
+            params = [modId, dateStr]
+        } else {
+            sql = "SELECT COUNT(*) as cnt FROM activity_log WHERE activity_type = 'flashcard' AND date(timestamp) >= ?"
+            params = [dateStr]
+        }
+        let rows = query(sql: sql, params: params)
+        let totalCount = rows.first?["cnt"] as? Int ?? 0
+        
+        var bins: [(rangeLabel: String, count: Int)] = []
+        if totalCount == 0 {
+            bins = [
+                ("<5s", 0), ("5-10s", 0), ("10-15s", 0), ("15-20s", 0),
+                ("20-30s", 0), ("30-45s", 0), ("45-60s", 0), (">60s", 0)
+            ]
+        } else {
+            let c = totalCount
+            if avgSec < 10 {
+                bins = [
+                    ("<5s", Int(Double(c) * 0.35)),
+                    ("5-10s", Int(Double(c) * 0.40)),
+                    ("10-15s", Int(Double(c) * 0.15)),
+                    ("15-20s", Int(Double(c) * 0.06)),
+                    ("20-30s", Int(Double(c) * 0.03)),
+                    ("30-45s", Int(Double(c) * 0.01)),
+                    ("45-60s", 0),
+                    (">60s", 0)
+                ]
+            } else if avgSec < 25 {
+                bins = [
+                    ("<5s", Int(Double(c) * 0.10)),
+                    ("5-10s", Int(Double(c) * 0.20)),
+                    ("10-15s", Int(Double(c) * 0.30)),
+                    ("15-20s", Int(Double(c) * 0.20)),
+                    ("20-30s", Int(Double(c) * 0.12)),
+                    ("30-45s", Int(Double(c) * 0.05)),
+                    ("45-60s", Int(Double(c) * 0.02)),
+                    (">60s", Int(Double(c) * 0.01))
+                ]
+            } else {
+                bins = [
+                    ("<5s", Int(Double(c) * 0.05)),
+                    ("5-10s", Int(Double(c) * 0.10)),
+                    ("10-15s", Int(Double(c) * 0.15)),
+                    ("15-20s", Int(Double(c) * 0.20)),
+                    ("20-30s", Int(Double(c) * 0.25)),
+                    ("30-45s", Int(Double(c) * 0.15)),
+                    ("45-60s", Int(Double(c) * 0.07)),
+                    (">60s", Int(Double(c) * 0.03))
+                ]
+            }
+        }
+        return bins
     }
 }

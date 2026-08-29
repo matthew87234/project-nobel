@@ -11,6 +11,12 @@ struct SettingsView: View {
                 }
                 .tag("AI Settings")
             
+            AnkiSyncSettingsView()
+                .tabItem {
+                    Label("Anki Sync", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .tag("Anki Sync")
+            
             GeneralSettingsView()
                 .tabItem {
                     Label("General", systemImage: "gearshape")
@@ -29,12 +35,14 @@ struct AISettingsView: View {
     // Local routing overrides
     @AppStorage("latex_always_local") private var latexAlwaysLocal: Bool = true
     @AppStorage("feynman_always_local") private var feynmanAlwaysLocal: Bool = true
+    @AppStorage("background_ai_enabled") private var backgroundAIEnabled: Bool = false
+    @AppStorage("auto_power_saver_enabled") private var autoPowerSaverEnabled: Bool = true
     
     // Text model settings
     @AppStorage("ai_provider") private var aiProvider: String = "local"
-    @AppStorage("local_model_general") private var localModelGeneral: String = "qwen2.5-coder:7b"
+    @AppStorage("local_model_general") private var localModelGeneral: String = "qwen2.5-coder:14b"
     @AppStorage("tailscale_host") private var tailscaleHost: String = "http://100.100.100.100:11434"
-    @AppStorage("tailscale_model_general") private var tailscaleModelGeneral: String = "qwen2.5-coder:7b"
+    @AppStorage("tailscale_model_general") private var tailscaleModelGeneral: String = "qwen2.5-coder:14b"
     @AppStorage("cloud_api_key") private var cloudApiKey: String = ""
     @AppStorage("cloud_model_name") private var cloudModelName: String = ""
     @AppStorage("cloud_api_base_url") private var cloudApiBaseUrl: String = ""
@@ -308,6 +316,23 @@ struct AISettingsView: View {
                             .toggleStyle(.switch)
                     }
                     .padding(.bottom, 8)
+                    
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Power & Performance Settings", systemImage: "bolt.batteryblock")
+                            .font(.headline)
+                        
+                        Text("Manage background CPU/GPU processing and energy efficiency.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        
+                        Toggle("Auto Power Saver (Suspend AI after 5 mins idle)", isOn: $autoPowerSaverEnabled)
+                            .toggleStyle(.switch)
+                        
+                        Toggle("Enable Background AI Summary Generation", isOn: $backgroundAIEnabled)
+                            .toggleStyle(.switch)
+                    }
+                    .padding(.bottom, 8)
                 }
             }
         }
@@ -409,67 +434,50 @@ struct AISettingsView: View {
     }
     
     private func fetchOllamaModels() async {
-        let generalHost = aiProvider == "tailscale" ? tailscaleHost : localHost
-        let visionHost = visionProvider == "tailscale" ? visionTailscaleHost : localHost
+        let candidateHosts = [
+            aiProvider == "tailscale" ? tailscaleHost : localHost,
+            tailscaleHost,
+            "http://localhost:11434",
+            "http://127.0.0.1:11434"
+        ]
         
-        // Fetch general models
-        let cleanGenHost = generalHost.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        if let generalURL = URL(string: "\(cleanGenHost)/api/tags") {
+        struct Resp: Codable { struct M: Codable { let name: String }; let models: [M] }
+        var fetchedNames: [String] = []
+        
+        for rawHost in candidateHosts {
+            let clean = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            guard !clean.isEmpty, let url = URL(string: "\(clean)/api/tags") else { continue }
+            
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 3.0
+            
             do {
-                let (data, _) = try await URLSession.shared.data(from: generalURL)
-                struct Resp: Codable { struct M: Codable { let name: String }; let models: [M] }
+                let (data, _) = try await URLSession.shared.data(for: req)
                 let res = try JSONDecoder().decode(Resp.self, from: data)
-                let names = res.models.map { $0.name }.sorted()
-                await MainActor.run {
-                    self.ollamaModels = names
-                    if !names.isEmpty {
-                        if aiProvider == "tailscale" {
-                            if tailscaleModelGeneral.isEmpty || !names.contains(tailscaleModelGeneral) {
-                                tailscaleModelGeneral = names.first(where: { $0.contains("coder") }) ?? names[0]
-                            }
-                        } else {
-                            if localModelGeneral.isEmpty || !names.contains(localModelGeneral) {
-                                localModelGeneral = names.first(where: { $0.contains("coder") }) ?? names[0]
-                            }
-                        }
-                    }
-                }
+                fetchedNames = res.models.map { $0.name }.sorted()
+                if !fetchedNames.isEmpty { break }
             } catch {
-                await MainActor.run { self.ollamaModels = [] }
+                continue
             }
-        } else {
-            await MainActor.run { self.ollamaModels = [] }
         }
         
-        // Fetch vision models
-        let cleanVisHost = visionHost.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        if let visionURL = URL(string: "\(cleanVisHost)/api/tags") {
-            do {
-                let (data, _) = try await URLSession.shared.data(from: visionURL)
-                struct Resp: Codable { struct M: Codable { let name: String }; let models: [M] }
-                let res = try JSONDecoder().decode(Resp.self, from: data)
-                let names = res.models.map { $0.name }.sorted()
-                await MainActor.run {
-                    self.ollamaVisionModels = names.filter { self.isVisionCapable($0) }
-                    if self.ollamaVisionModels.isEmpty { self.ollamaVisionModels = names }
-                    
-                    if !names.isEmpty {
-                        if visionProvider == "tailscale" {
-                            if visionTailscaleModel.isEmpty || !names.contains(visionTailscaleModel) {
-                                visionTailscaleModel = names.first(where: { self.isVisionCapable($0) }) ?? names[0]
-                            }
-                        } else {
-                            if localModelVision.isEmpty || !names.contains(localModelVision) {
-                                localModelVision = names.first(where: { self.isVisionCapable($0) }) ?? names[0]
-                            }
-                        }
+        let finalNames = fetchedNames
+        await MainActor.run {
+            self.ollamaModels = finalNames
+            self.ollamaVisionModels = finalNames.filter { self.isVisionCapable($0) }
+            if self.ollamaVisionModels.isEmpty { self.ollamaVisionModels = finalNames }
+            
+            if !finalNames.isEmpty {
+                if aiProvider == "tailscale" {
+                    if tailscaleModelGeneral.isEmpty || !finalNames.contains(tailscaleModelGeneral) {
+                        tailscaleModelGeneral = finalNames.first(where: { $0.contains("coder") || $0.contains("14b") }) ?? finalNames[0]
+                    }
+                } else {
+                    if localModelGeneral.isEmpty || !finalNames.contains(localModelGeneral) {
+                        localModelGeneral = finalNames.first(where: { $0.contains("coder") || $0.contains("14b") }) ?? finalNames[0]
                     }
                 }
-            } catch {
-                await MainActor.run { self.ollamaVisionModels = [] }
             }
-        } else {
-            await MainActor.run { self.ollamaVisionModels = [] }
         }
     }
     
@@ -516,6 +524,83 @@ struct AISettingsView: View {
         } catch {
             await MainActor.run { self.visionHermesModels = [] }
         }
+    }
+}
+
+// MARK: - Anki Sync Settings Tab
+struct AnkiSyncSettingsView: View {
+    @ObservedObject private var ankiEngine = AnkiSyncEngine.shared
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Label("AnkiConnect & AnkiWeb Cloud Sync", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.title2)
+                    .bold()
+                Spacer()
+            }
+            
+            Text("Bi-directional synchronization between Project Nobel and your AnkiWeb account. All flashcards are automatically organized into Year 1–4 decks.")
+                .font(.body)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "circle.fill")
+                        .font(.caption)
+                        .foregroundColor(ankiEngine.isSyncing ? .orange : .green)
+                    Text(ankiEngine.isSyncing ? "Syncing in progress..." : "AnkiConnect Bridge Ready (http://127.0.0.1:8765)")
+                        .bold()
+                }
+                
+                if let lastDate = ankiEngine.lastSyncDate {
+                    Text("Last successful sync: \(lastDate.formatted(date: .numeric, time: .standard))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                
+                if !ankiEngine.lastSyncStatus.isEmpty {
+                    Text(ankiEngine.lastSyncStatus)
+                        .font(.caption)
+                        .foregroundColor(ankiEngine.lastSyncStatus.contains("missing") || ankiEngine.lastSyncStatus.contains("not running") ? .red : .primary)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+                }
+            }
+            .padding(14)
+            .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+            .cornerRadius(10)
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+            )
+            
+            HStack {
+                Button(action: {
+                    ankiEngine.syncWithAnki()
+                }) {
+                    HStack(spacing: 6) {
+                        if ankiEngine.isSyncing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                        }
+                        Text(ankiEngine.isSyncing ? "Syncing..." : "Sync with Anki Now")
+                    }
+                    .padding(.horizontal, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(ankiEngine.isSyncing)
+            }
+            .padding(.top, 5)
+            
+            Spacer()
+        }
+        .padding(20)
     }
 }
 

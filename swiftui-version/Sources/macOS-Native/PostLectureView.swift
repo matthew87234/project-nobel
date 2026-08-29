@@ -32,7 +32,7 @@ struct PostLectureView: View {
                         Text("No lectures found").tag(nil as Note?)
                     } else {
                         ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
-                            Text("Wk \(index + 1) - \(note.title)").tag(note as Note?)
+                            Text("Lecture \(index + 1) - \(note.title)").tag(note as Note?)
                         }
                     }
                 }
@@ -73,12 +73,17 @@ struct PostLectureView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .onChange(of: activeModuleId) { _ in
+        .onChange(of: activeModuleId) { _, _ in
             loadNotes()
         }
-        .onChange(of: selectedNote) { note in
+        .onChange(of: selectedNote) { _, note in
             resetSandbox()
             loadChats(for: note)
+        }
+        .onChange(of: AIHelper.shared.isAIBusy) { _, isBusy in
+            if !isBusy {
+                loadNotes()
+            }
         }
         .onAppear {
             loadNotes()
@@ -324,10 +329,10 @@ struct PostLectureView: View {
                     }
                     .padding()
                 }
-                .onChange(of: chatMessages) { _ in
+                .onChange(of: chatMessages) { _, _ in
                     scrollToBottom(proxy: proxy)
                 }
-                .onChange(of: isGeneratingChatResponse) { _ in
+                .onChange(of: isGeneratingChatResponse) { _, _ in
                     scrollToBottom(proxy: proxy)
                 }
             }

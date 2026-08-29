@@ -24,7 +24,7 @@ struct PreLectureView: View {
                         Text("No notes found").tag(nil as Note?)
                     } else {
                         ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
-                            Text("Week \(index + 1): \(note.title)").tag(note as Note?)
+                            Text("Lecture \(index + 1): \(note.title)").tag(note as Note?)
                         }
                     }
                 }
@@ -111,11 +111,16 @@ struct PreLectureView: View {
                 }
             }
         }
-        .onChange(of: activeModuleId) { _ in
+        .onChange(of: activeModuleId) { _, _ in
             loadNotes()
         }
-        .onChange(of: selectedNote) { note in
+        .onChange(of: selectedNote) { _, note in
             loadPrimer(for: note)
+        }
+        .onChange(of: AIHelper.shared.isAIBusy) { _, isBusy in
+            if !isBusy {
+                loadNotes()
+            }
         }
         .onAppear {
             loadNotes()

@@ -1,8 +1,131 @@
 import SwiftUI
 import Charts
 
+struct DayStudyDetailPopover: View {
+    let date: Date
+    let breakdown: DatabaseManager.DailyStudyBreakdown?
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "calendar")
+                    .foregroundColor(.blue)
+                    .font(.headline)
+                Text(formatFullDate(date))
+                    .font(.headline)
+                    .bold()
+                Spacer()
+            }
+            
+            Divider()
+            
+            let fcSecs = breakdown?.flashcardsSeconds ?? 0
+            let pbSecs = breakdown?.problemsSeconds ?? 0
+            let totalSecs = fcSecs + pbSecs
+            
+            if totalSecs > 0 {
+                VStack(spacing: 10) {
+                    HStack {
+                        Text("Total Time Studied:")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text(formatDuration(totalSecs))
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                            .foregroundColor(.primary)
+                    }
+                    
+                    // Flashcards Row
+                    HStack(spacing: 8) {
+                        Circle().fill(Color.blue).frame(width: 8, height: 8)
+                        Text("Flashcards")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(formatDuration(fcSecs))
+                            .font(.subheadline)
+                            .bold()
+                            .foregroundColor(.blue)
+                        let pct = Int((Double(fcSecs) / Double(totalSecs)) * 100)
+                        Text("(\(pct)%)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    // Problems Row
+                    HStack(spacing: 8) {
+                        Circle().fill(Color.green).frame(width: 8, height: 8)
+                        Text("Problems")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(formatDuration(pbSecs))
+                            .font(.subheadline)
+                            .bold()
+                            .foregroundColor(.green)
+                        let pct = Int((Double(pbSecs) / Double(totalSecs)) * 100)
+                        Text("(\(pct)%)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    // Mini Ratio Progress Bar
+                    GeometryReader { geo in
+                        let fcRatio = CGFloat(fcSecs) / CGFloat(totalSecs)
+                        HStack(spacing: 2) {
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(Color.blue)
+                                .frame(width: max(4, (geo.size.width - 2) * fcRatio))
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(Color.green)
+                                .frame(width: max(4, (geo.size.width - 2) * (1.0 - fcRatio)))
+                        }
+                    }
+                    .frame(height: 6)
+                    .padding(.top, 4)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "moon.zzz.fill")
+                        .foregroundColor(.secondary)
+                    Text("No study activity logged on this day.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+    
+    private func formatFullDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEEE, d MMMM yyyy"
+        return formatter.string(from: date)
+    }
+    
+    private func formatDuration(_ seconds: Int) -> String {
+        let h = seconds / 3600
+        let m = (seconds % 3600) / 60
+        let s = seconds % 60
+        if h > 0 {
+            return "\(h)h \(m)m"
+        } else if m > 0 {
+            return "\(m)m \(s)s"
+        } else if s > 0 {
+            return "\(s)s"
+        }
+        return "0m"
+    }
+}
+
 struct HeatmapView: View {
-    let secondsData: [String: Int]
+    let secondsData: [String: DatabaseManager.DailyStudyBreakdown]
+    @State private var selectedDate: Date? = nil
+    @State private var showPopover: Bool = false
+    private let weeksCount = 53
+    private let cellSpacing: CGFloat = 1.8
     
     private var dates: [[Date]] {
         let calendar = Calendar.current
@@ -11,10 +134,10 @@ struct HeatmapView: View {
         let weekday = calendar.component(.weekday, from: today)
         let daysToSubtract = (weekday - 2 + 7) % 7
         let nearestMonday = calendar.date(byAdding: .day, value: -daysToSubtract, to: today)!
-        let startDate = calendar.date(byAdding: .weekOfYear, value: -52, to: nearestMonday)!
+        let startDate = calendar.date(byAdding: .weekOfYear, value: -(weeksCount - 1), to: nearestMonday)!
         
         var grid: [[Date]] = Array(repeating: [], count: 7)
-        for week in 0..<53 {
+        for week in 0..<weeksCount {
             for day in 0..<7 {
                 if let date = calendar.date(byAdding: .day, value: week * 7 + day, to: startDate) {
                     grid[day].append(date)
@@ -28,10 +151,10 @@ struct HeatmapView: View {
         let calendar = Calendar.current
         var labels: [(index: Int, label: String)] = []
         let grid = dates
-        guard grid.count > 0, grid[0].count == 53 else { return [] }
+        guard grid.count > 0, grid[0].count == weeksCount else { return [] }
         
         var lastMonth = -1
-        for col in 0..<53 {
+        for col in 0..<weeksCount {
             let date = grid[0][col]
             let month = calendar.component(.month, from: date)
             if month != lastMonth {
@@ -45,54 +168,77 @@ struct HeatmapView: View {
     }
     
     var body: some View {
-        let grid = dates
-        VStack(alignment: .leading, spacing: 4) {
-            // Month labels row
-            HStack(spacing: 0) {
-                Spacer().frame(width: 25)
-                ZStack(alignment: .leading) {
-                    Color.clear.frame(height: 12)
-                    ForEach(monthLabels, id: \.index) { labelInfo in
-                        Text(labelInfo.label)
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                            .offset(x: CGFloat(labelInfo.index) * 11)
+        GeometryReader { geo in
+            let availWidth = max(260, geo.size.width - 25)
+            let colWidth = availWidth / CGFloat(weeksCount)
+            let cellSize = max(3.5, colWidth - cellSpacing)
+            let grid = dates
+            
+            VStack(alignment: .leading, spacing: 4) {
+                // Month labels row
+                HStack(spacing: 0) {
+                    Spacer().frame(width: 22)
+                    ZStack(alignment: .leading) {
+                        Color.clear.frame(height: 12)
+                        ForEach(monthLabels, id: \.index) { labelInfo in
+                            Text(labelInfo.label)
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .offset(x: CGFloat(labelInfo.index) * colWidth)
+                        }
                     }
                 }
-            }
-            .frame(height: 12)
-            
-            HStack(spacing: 6) {
-                // Day labels column
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Mon").font(.system(size: 8)).foregroundColor(.secondary)
-                    Spacer()
-                    Text("Wed").font(.system(size: 8)).foregroundColor(.secondary)
-                    Spacer()
-                    Text("Fri").font(.system(size: 8)).foregroundColor(.secondary)
-                }
-                .frame(height: 74)
+                .frame(height: 12)
                 
-                // Grid of cells
-                HStack(spacing: 3) {
-                    ForEach(0..<53, id: \.self) { col in
-                        VStack(spacing: 3) {
-                            ForEach(0..<7, id: \.self) { row in
-                                if col < grid[row].count {
-                                    let date = grid[row][col]
-                                    let dateStr = formatDate(date)
-                                    let seconds = secondsData[dateStr] ?? 0
-                                    cellColor(for: seconds)
-                                        .frame(width: 8, height: 8)
-                                        .cornerRadius(1)
-                                        .help("\(formatUKDate(date)): \(formatMinutes(seconds)) studied")
-                                } else {
-                                    Color.clear.frame(width: 8, height: 8)
+                HStack(spacing: 4) {
+                    // Day labels column
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Mon").font(.system(size: 8)).foregroundColor(.secondary)
+                        Spacer()
+                        Text("Wed").font(.system(size: 8)).foregroundColor(.secondary)
+                        Spacer()
+                        Text("Fri").font(.system(size: 8)).foregroundColor(.secondary)
+                    }
+                    .frame(height: (cellSize * 7) + (cellSpacing * 6))
+                    
+                    // Grid of cells
+                    HStack(spacing: cellSpacing) {
+                        ForEach(0..<weeksCount, id: \.self) { col in
+                            VStack(spacing: cellSpacing) {
+                                ForEach(0..<7, id: \.self) { row in
+                                    if col < grid[row].count {
+                                        let date = grid[row][col]
+                                        let dateStr = formatDate(date)
+                                        let breakdown = secondsData[dateStr]
+                                        let seconds = breakdown?.totalSeconds ?? 0
+                                        cellColor(for: seconds)
+                                            .frame(width: cellSize, height: cellSize)
+                                            .cornerRadius(1)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 1)
+                                                    .stroke(selectedDate == date && showPopover ? Color.blue : Color.clear, lineWidth: 1)
+                                            )
+                                            .contentShape(Rectangle())
+                                            .pointingHandCursor()
+                                            .onTapGesture {
+                                                selectedDate = date
+                                                showPopover = true
+                                            }
+                                            .help("\(formatUKDate(date)): \(formatMinutes(seconds)) studied (Click for details)")
+                                    } else {
+                                        Color.clear.frame(width: cellSize, height: cellSize)
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+        .frame(height: 90)
+        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+            if let date = selectedDate {
+                DayStudyDetailPopover(date: date, breakdown: secondsData[formatDate(date)])
             }
         }
     }
@@ -151,7 +297,7 @@ struct DashboardView: View {
     @State private var avgFlashcardSolveTime: Double = 0.0
     @State private var avgProblemSolveTime: Double = 0.0
     
-    @State private var heatmapData: [String: Int] = [:]
+    @State private var heatmapData: [String: DatabaseManager.DailyStudyBreakdown] = [:]
     @State private var modules: [Module] = []
     
     // AI Tracker
@@ -161,7 +307,7 @@ struct DashboardView: View {
     @State private var activeJob: String = "Idle"
     @State private var isProcessing: Bool = false
     
-    let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+    let timer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
     
     init(activeYear: Int) {
         self.activeYear = activeYear
@@ -289,7 +435,7 @@ struct DashboardView: View {
                         }
                     }
                 }
-                .padding(.horizontal)
+                .padding(.horizontal, 24)
                 .padding(.top, 20)
                 
                 // 1. Metrics Cards (Always 1 row)
@@ -299,31 +445,23 @@ struct DashboardView: View {
                     metricCard(title: "AVG FLASHCARD TIME", value: formatAverageTime(avgFlashcardSolveTime), subtitle: timeframe)
                     metricCard(title: "AVG PROBLEM TIME", value: formatAverageTime(avgProblemSolveTime), subtitle: timeframe)
                 }
-                .padding(.horizontal)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
                 
-                // 2. Twin Charts Row (Responsive Grid side by side)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: .infinity))], spacing: 20) {
+                // 2. Twin Charts Row (50/50 Equal Split Grid)
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 20), GridItem(.flexible(), spacing: 20)], spacing: 20) {
                     // Bar Chart
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Time Spent")
                             .font(.headline)
                         
-                        Chart {
-                            ForEach(studyTimeBarData, id: \.label) { item in
-                                BarMark(
-                                    x: .value("Interval", item.label),
-                                    y: .value("Minutes", item.flashcards)
-                                )
-                                .foregroundStyle(Color.blue)
-                                .position(by: .value("Type", "Flashcards"))
-                                
-                                BarMark(
-                                    x: .value("Interval", item.label),
-                                    y: .value("Minutes", item.problems)
-                                )
-                                .foregroundStyle(Color.green)
-                                .position(by: .value("Type", "Problems"))
-                            }
+                        Chart(flattenedBarData) { item in
+                            BarMark(
+                                x: .value("Interval", item.label),
+                                y: .value("Minutes", item.minutes)
+                            )
+                            .foregroundStyle(item.category == "Flashcards" ? Color.blue : Color.green)
+                            .position(by: .value("Type", item.category))
                         }
                         .frame(height: 200)
                         .chartForegroundStyleScale([
@@ -338,8 +476,14 @@ struct DashboardView: View {
                     
                     // Donut Chart
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Study Time Distribution")
-                            .font(.headline)
+                        HStack {
+                            Text("Study Time Distribution")
+                                .font(.headline)
+                            Spacer()
+                            Text(timeframe)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                         
                         if flashcardsStudySeconds == 0 && problemsStudySeconds == 0 {
                             VStack {
@@ -352,36 +496,53 @@ struct DashboardView: View {
                             .frame(maxWidth: .infinity)
                             .frame(height: 200)
                         } else {
-                            Chart {
-                                SectorMark(
-                                    angle: .value("Time", Double(flashcardsStudySeconds)),
-                                    innerRadius: .ratio(0.6),
-                                    angularInset: 1.5
-                                )
-                                .foregroundStyle(Color.blue)
-                                .annotation(position: .overlay) {
-                                    Text("\(roundedPercent(fcPercent))%")
-                                        .font(.caption)
-                                        .foregroundColor(.white)
+                            ZStack {
+                                Chart {
+                                    SectorMark(
+                                        angle: .value("Time", Double(flashcardsStudySeconds)),
+                                        innerRadius: .ratio(0.65),
+                                        angularInset: 2.0
+                                    )
+                                    .foregroundStyle(Color.blue)
+                                    .annotation(position: .overlay) {
+                                        if fcPercent > 12 {
+                                            Text("\(roundedPercent(fcPercent))%")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundColor(.white)
+                                        }
+                                    }
+                                    
+                                    SectorMark(
+                                        angle: .value("Time", Double(problemsStudySeconds)),
+                                        innerRadius: .ratio(0.65),
+                                        angularInset: 2.0
+                                    )
+                                    .foregroundStyle(Color.green)
+                                    .annotation(position: .overlay) {
+                                        if (100.0 - fcPercent) > 12 {
+                                            Text("\(roundedPercent(100.0 - fcPercent))%")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundColor(.white)
+                                        }
+                                    }
                                 }
+                                .frame(height: 200)
+                                .chartForegroundStyleScale([
+                                    "Flashcards": Color.blue,
+                                    "Problems": Color.green
+                                ])
                                 
-                                SectorMark(
-                                    angle: .value("Time", Double(problemsStudySeconds)),
-                                    innerRadius: .ratio(0.6),
-                                    angularInset: 1.5
-                                )
-                                .foregroundStyle(Color.green)
-                                .annotation(position: .overlay) {
-                                    Text("\(roundedPercent(100.0 - fcPercent))%")
-                                        .font(.caption)
-                                        .foregroundColor(.white)
+                                // Central Summary Badge
+                                VStack(spacing: 2) {
+                                    let totalSecs = flashcardsStudySeconds + problemsStudySeconds
+                                    Text(formatSeconds(totalSecs))
+                                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                                        .foregroundColor(.primary)
+                                    Text("Total Time")
+                                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                        .foregroundColor(.secondary)
                                 }
                             }
-                            .frame(height: 200)
-                            .chartForegroundStyleScale([
-                                "Flashcards": Color.blue,
-                                "Problems": Color.green
-                            ])
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -389,26 +550,31 @@ struct DashboardView: View {
                     .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
                     .cornerRadius(12)
                 }
-                .padding(.horizontal)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
                 
-                // 3. Heatmap Row
-                VStack(alignment: .leading, spacing: 15) {
-                    Text("Daily Study Activity Heatmap")
-                        .font(.headline)
-                    
-                    ScrollView(.horizontal, showsIndicators: false) {
+                // 3. Heatmap (Left) & Module Study Time Table (Right) (50/50 Equal Split Grid)
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 20), GridItem(.flexible(), spacing: 20)], spacing: 20) {
+                    // Left: Heatmap
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Daily Study Activity Heatmap")
+                                .font(.headline)
+                            Spacer()
+                            Text("Past Year")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
                         HeatmapView(secondsData: heatmapData)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 4)
                     }
-                }
-                .padding()
-                .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
-                .cornerRadius(12)
-                .padding(.horizontal)
-                
-                // 4. Module Study Time Table & AI Progress Tracker (Responsive Grid)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: .infinity))], spacing: 20) {
-                    // Module Study Time Table
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+                    .cornerRadius(12)
+                    
+                    // Right: Module Study Time Table
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Text("Module Study Time")
@@ -421,7 +587,7 @@ struct DashboardView: View {
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()
-                            .frame(width: 220)
+                            .frame(width: 200)
                             .onChange(of: selectedSemesterFilter) { oldValue, newValue in
                                 loadDashboard()
                             }
@@ -430,9 +596,9 @@ struct DashboardView: View {
                         VStack(spacing: 0) {
                             // Headers
                             HStack {
-                                Text("Module").bold().frame(width: 100, alignment: .leading)
+                                Text("Module").bold().frame(width: 90, alignment: .leading)
                                 Text("Name").bold().frame(maxWidth: .infinity, alignment: .leading)
-                                Text("Duration").bold().frame(width: 80, alignment: .trailing)
+                                Text("Duration").bold().frame(width: 75, alignment: .trailing)
                             }
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -448,86 +614,27 @@ struct DashboardView: View {
                                         HStack {
                                             Text(m.code)
                                                 .font(.system(.body, design: .monospaced))
-                                                .frame(width: 100, alignment: .leading)
+                                                .frame(width: 90, alignment: .leading)
                                             Text(m.name)
                                                 .lineLimit(1)
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                             Text(formatSeconds(totalSecs))
-                                                .frame(width: 80, alignment: .trailing)
+                                                .frame(width: 75, alignment: .trailing)
                                         }
                                         .padding(.vertical, 4)
                                         Divider()
                                     }
                                 }
                             }
-                            .frame(height: 150)
+                            .frame(height: 100)
                         }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
-                    .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
-                    .cornerRadius(12)
-                    
-                    // AI Background Task Progress Tracker
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Local AI Progress Tracker")
-                            .font(.headline)
-                        
-                        Spacer()
-                        
-                        HStack {
-                            Text("Completion Rate:")
-                                .font(.subheadline)
-                            Spacer()
-                            Text("\(completionPercentage)%")
-                                .font(.headline)
-                                .foregroundColor(completionPercentage == 100 ? .green : .orange)
-                        }
-                        
-                        ProgressView(value: Double(completionPercentage) / 100.0)
-                            .progressViewStyle(.linear)
-                            
-                        HStack {
-                            Text("Task Status:")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            if isProcessing {
-                                Text("ACTIVE")
-                                    .font(.caption)
-                                    .bold()
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.orange.opacity(0.2))
-                                    .foregroundColor(.orange)
-                                    .cornerRadius(4)
-                            } else {
-                                Text("IDLE")
-                                    .font(.caption)
-                                    .bold()
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.secondary.opacity(0.2))
-                                    .foregroundColor(.secondary)
-                                    .cornerRadius(4)
-                            }
-                        }
-                        
-                        if isProcessing {
-                            Text("Processing: \(activeJob)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .italic()
-                        }
-                        
-                        Spacer()
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
                     .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
                     .cornerRadius(12)
                 }
-                .padding(.horizontal)
+                .padding(.horizontal, 24)
                 .padding(.bottom, 30)
             }
         }
@@ -536,9 +643,6 @@ struct DashboardView: View {
         }
         .onChange(of: activeYear) { oldValue, newValue in
             loadDashboard()
-        }
-        .onReceive(timer) { _ in
-            pollAIStatus()
         }
     }
     
@@ -571,7 +675,7 @@ struct DashboardView: View {
     
     // MARK: - Calculations and queries
     
-    private func loadDashboard() {
+    @MainActor private func loadDashboard() {
         // Created counts
         let counts = DatabaseManager.shared.getCreatedCounts(timeframe: timeframe, moduleId: selectedHeatmapModuleId)
         self.flashcardsCreated = counts.flashcards
@@ -628,55 +732,20 @@ struct DashboardView: View {
         }
         
         loadHeatmap()
-        pollAIStatus()
     }
     
-    private func loadHeatmap() {
+    private var flattenedBarData: [BarChartItem] {
+        var items: [BarChartItem] = []
+        for item in studyTimeBarData {
+            items.append(BarChartItem(id: "\(item.label)-fc", label: item.label, category: "Flashcards", minutes: item.flashcards))
+            items.append(BarChartItem(id: "\(item.label)-prob", label: item.label, category: "Problems", minutes: item.problems))
+        }
+        return items
+    }
+    
+    @MainActor private func loadHeatmap() {
         let modId = selectedHeatmapModuleId == -1 ? nil : selectedHeatmapModuleId
-        self.heatmapData = DatabaseManager.shared.getDailyStudySecondsLastYear(moduleId: modId)
-    }
-    
-    private func pollAIStatus() {
-        let allNotesRows = DatabaseManager.shared.query(sql: "SELECT id, file_path, ai_summary, pre_lecture_primer FROM notes")
-        
-        let fileManager = FileManager.default
-        var total = 0
-        var sumDone = 0
-        var primerDone = 0
-        
-        for row in allNotesRows {
-            let noteId = row["id"] as? Int ?? 0
-            if AIHelper.shared.isNoteFailed(noteId: noteId) {
-                continue
-            }
-            
-            let filePath = row["file_path"] as? String ?? ""
-            guard !filePath.isEmpty else {
-                continue
-            }
-            
-            total += 1
-            
-            if let sum = row["ai_summary"] as? String, !sum.isEmpty {
-                sumDone += 1
-            }
-            if let primer = row["pre_lecture_primer"] as? String, !primer.isEmpty {
-                primerDone += 1
-            }
-        }
-        
-        if total == 0 {
-            self.completionPercentage = 100
-            self.completedTasks = 0
-            self.totalTasks = 0
-        } else {
-            self.totalTasks = total * 2
-            self.completedTasks = sumDone + primerDone
-            self.completionPercentage = Int((Double(completedTasks) / Double(totalTasks)) * 100)
-        }
-        
-        self.isProcessing = AIHelper.shared.isProcessing
-        self.activeJob = AIHelper.shared.activeJobDescription
+        self.heatmapData = DatabaseManager.shared.getDailyStudyBreakdownLastYear(moduleId: modId)
     }
     
     private func getStartDateStr() -> String {
@@ -734,4 +803,11 @@ struct DashboardView: View {
             return "\(s)s"
         }
     }
+}
+
+struct BarChartItem: Identifiable {
+    let id: String
+    let label: String
+    let category: String
+    let minutes: Int
 }

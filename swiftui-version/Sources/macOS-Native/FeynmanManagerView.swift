@@ -32,7 +32,7 @@ struct FeynmanManagerView: View {
             HStack(spacing: 15) {
                 TextField("Search concepts/explanations...", text: $searchQuery)
                     .textFieldStyle(.roundedBorder)
-                    .onChange(of: searchQuery) { _ in
+                    .onChange(of: searchQuery) { _, _ in
                         loadSessions()
                     }
                 
@@ -43,7 +43,7 @@ struct FeynmanManagerView: View {
                     }
                 }
                 .frame(width: 200)
-                .onChange(of: selectedModuleIdFilter) { _ in
+                .onChange(of: selectedModuleIdFilter) { _, _ in
                     loadSessions()
                 }
             }

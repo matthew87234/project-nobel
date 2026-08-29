@@ -15,6 +15,8 @@ struct ModuleManagerView: View {
     @State private var nameEntry: String = ""
     @State private var semesterEntry: Int = 1
     @State private var yearEntry: Int = 1
+    @State private var hasTestDate: Bool = false
+    @State private var testDateEntry: Date = Date()
     
     var body: some View {
         VStack(spacing: 0) {
@@ -34,7 +36,7 @@ struct ModuleManagerView: View {
                     Text("Year 4").tag("Year 4")
                 }
                 .frame(width: 200)
-                .onChange(of: yearFilter) { _ in
+                .onChange(of: yearFilter) { _, _ in
                     loadModules()
                 }
             }
@@ -49,18 +51,29 @@ struct ModuleManagerView: View {
                     Text(m.code)
                         .font(.system(.body, design: .monospaced))
                         .bold()
-                        .frame(width: 100, alignment: .leading)
+                        .frame(width: 90, alignment: .leading)
                     
                     Text(m.name)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     
-                    Text("Semester \(m.semester)")
+                    Text("Sem \(m.semester)")
                         .foregroundColor(.secondary)
-                        .frame(width: 100, alignment: .leading)
+                        .frame(width: 60, alignment: .leading)
                     
-                    Text("Year \(m.year)")
+                    Text("Yr \(m.year)")
                         .foregroundColor(.secondary)
-                        .frame(width: 80, alignment: .trailing)
+                        .frame(width: 50, alignment: .leading)
+                    
+                    HStack(spacing: 4) {
+                        Image(systemName: "calendar")
+                            .font(.caption)
+                            .foregroundColor(m.testDate.isEmpty ? .secondary.opacity(0.6) : .orange)
+                        Text(m.testDateFormattedDateOnly)
+                            .font(.caption)
+                            .foregroundColor(m.testDate.isEmpty ? .secondary : .primary)
+                    }
+                    .frame(width: 120, alignment: .trailing)
+                    .help(m.testDate.isEmpty ? "No Exam Set" : "\(m.testDateFormattedDateOnly) (\(m.daysRemainingFormatted))")
                 }
                 .tag(m)
             }
@@ -112,7 +125,7 @@ struct ModuleManagerView: View {
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
         }
-        .frame(width: 650, height: 420)
+        .frame(width: 680, height: 460)
         .onAppear {
             loadModules()
         }
@@ -143,6 +156,12 @@ struct ModuleManagerView: View {
                     Text("Year 3").tag(3)
                     Text("Year 4").tag(4)
                 }
+                
+                Toggle("Set Exam Date & Time", isOn: $hasTestDate)
+                
+                if hasTestDate {
+                    DatePicker("Exam Date & Time:", selection: $testDateEntry, displayedComponents: [.date, .hourAndMinute])
+                }
             }
             .padding(.vertical, 10)
             
@@ -163,7 +182,7 @@ struct ModuleManagerView: View {
             }
         }
         .padding(20)
-        .frame(width: 380, height: 260)
+        .frame(width: 420, height: hasTestDate ? 320 : 280)
     }
     
     // MARK: - Logic functions
@@ -184,6 +203,8 @@ struct ModuleManagerView: View {
         codeEntry = ""
         nameEntry = ""
         semesterEntry = 1
+        hasTestDate = false
+        testDateEntry = Date()
         
         if yearFilter != "All Years", let year = Int(yearFilter.components(separatedBy: " ")[1]) {
             yearEntry = year
@@ -200,6 +221,22 @@ struct ModuleManagerView: View {
         nameEntry = m.name
         semesterEntry = m.semester
         yearEntry = m.year
+        
+        if !m.testDate.isEmpty {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm"
+            if let date = formatter.date(from: m.testDate) {
+                testDateEntry = date
+                hasTestDate = true
+            } else {
+                testDateEntry = Date()
+                hasTestDate = false
+            }
+        } else {
+            testDateEntry = Date()
+            hasTestDate = false
+        }
+        
         showEditSheet = true
     }
     
@@ -208,11 +245,20 @@ struct ModuleManagerView: View {
         let name = nameEntry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !code.isEmpty && !name.isEmpty else { return }
         
+        let testDateStr: String
+        if hasTestDate {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm"
+            testDateStr = formatter.string(from: testDateEntry)
+        } else {
+            testDateStr = ""
+        }
+        
         let success: Bool
         if let editing = editingModule {
-            success = DatabaseManager.shared.updateModule(id: editing.id, code: code, name: name, semester: semesterEntry, year: yearEntry)
+            success = DatabaseManager.shared.updateModule(id: editing.id, code: code, name: name, semester: semesterEntry, year: yearEntry, testDate: testDateStr)
         } else {
-            success = DatabaseManager.shared.addModule(code: code, name: name, semester: semesterEntry, year: yearEntry)
+            success = DatabaseManager.shared.addModule(code: code, name: name, semester: semesterEntry, year: yearEntry, testDate: testDateStr)
         }
         
         if success {

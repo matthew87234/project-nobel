@@ -1,24 +1,30 @@
 #!/bin/zsh
 set -e
 
-# Define directories
-SRC_DIR="/Users/matthewt/Projects/PhysicsStudyApp/swiftui-version"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+SRC_DIR="${REPO_ROOT}/swiftui-version"
 BUILD_DIR="${SRC_DIR}/.build/release"
-DESKTOP_BUILD_DIR="/Users/matthewt/Desktop/MacApp-Build"
+DMG_STAGING="${REPO_ROOT}/.build_dmg_staging"
 APP_NAME="Project Nobel"
-APP_BUNDLE="${DESKTOP_BUILD_DIR}/${APP_NAME}.app"
-DESKTOP_APP="/Users/matthewt/Desktop/${APP_NAME}.app"
+DMG_OUTPUT_NAME="Project-Nobel-Installer.dmg"
+FINAL_DMG="${REPO_ROOT}/${DMG_OUTPUT_NAME}"
 
-echo "Building Swift Package Manager target in release mode..."
+echo "=================================================="
+echo " Building ${APP_NAME} Release Binary"
+echo "=================================================="
+
 cd "${SRC_DIR}"
 swift build -c release
 
-echo "Creating the .app bundle directory structure..."
-rm -rf "${APP_BUNDLE}"
+echo "=================================================="
+echo " Creating Application Bundle (.app)"
+echo "=================================================="
+
+APP_BUNDLE="${DMG_STAGING}/${APP_NAME}.app"
+rm -rf "${DMG_STAGING}"
 mkdir -p "${APP_BUNDLE}/Contents/MacOS"
 mkdir -p "${APP_BUNDLE}/Contents/Resources"
 
-echo "Writing Info.plist..."
 cat <<EOF > "${APP_BUNDLE}/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -33,7 +39,7 @@ cat <<EOF > "${APP_BUNDLE}/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.0.0</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleVersion</key>
@@ -55,7 +61,6 @@ cat <<EOF > "${APP_BUNDLE}/Contents/Info.plist"
 </plist>
 EOF
 
-echo "Copying binary target and icons to .app bundle..."
 cp "${BUILD_DIR}/macOS-Native" "${APP_BUNDLE}/Contents/MacOS/macOS-Native"
 if [ -f "${SRC_DIR}/Resources/AppIcon.icns" ]; then
     cp "${SRC_DIR}/Resources/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
@@ -64,21 +69,34 @@ if [ -f "${SRC_DIR}/Resources/MenuBarIcon.png" ]; then
     cp "${SRC_DIR}/Resources/MenuBarIcon.png" "${APP_BUNDLE}/Contents/Resources/MenuBarIcon.png"
 fi
 
-echo "Updating Desktop app bundle..."
-rm -rf "${DESKTOP_APP}"
-cp -R "${APP_BUNDLE}" "${DESKTOP_APP}"
-xattr -cr "${DESKTOP_APP}"
-touch "${DESKTOP_APP}"
-rm -rf "${DESKTOP_BUILD_DIR}"
+# Clear quarantine on binary
+xattr -cr "${APP_BUNDLE}"
 
-# One-way sync: Sync production database to desktop testing database if production exists
-PROD_DB="$HOME/.physics_study_app/physics_study.db"
-DESKTOP_DB="$HOME/.physics_study_app/physics_study_desktop.db"
-if [ -f "${PROD_DB}" ]; then
-    echo "Performing one-way sync from production database to desktop database..."
-    cp "${PROD_DB}" "${DESKTOP_DB}"
-fi
+echo "=================================================="
+echo " Preparing Disk Image Layout & /Applications Link"
+echo "=================================================="
 
-echo "Build and bundle creation complete: ${DESKTOP_APP}"
+# Create Applications shortcut inside DMG
+ln -s /Applications "${DMG_STAGING}/Applications"
 
+echo "=================================================="
+echo " Generating Compressed .dmg File"
+echo "=================================================="
 
+rm -f "${FINAL_DMG}"
+
+hdiutil create \
+    -volname "Project Nobel" \
+    -srcfolder "${DMG_STAGING}" \
+    -ov \
+    -format UDZO \
+    "${FINAL_DMG}"
+
+# Cleanup staging directory
+rm -rf "${DMG_STAGING}"
+
+echo "=================================================="
+echo " DMG Successfully Created!"
+echo " Path: ${FINAL_DMG}"
+echo " File Size: $(du -sh "${FINAL_DMG}" | awk '{print $1}')"
+echo "=================================================="

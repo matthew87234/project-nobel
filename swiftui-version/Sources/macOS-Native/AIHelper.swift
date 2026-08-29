@@ -42,6 +42,10 @@ struct PendingExtractionItem: Identifiable, Equatable {
     let isAnswerSource: Bool
     let originalPdfPath: String?
     
+    var displayName: String {
+        URL(fileURLWithPath: pathOrName).lastPathComponent
+    }
+    
     init(type: ItemType, pathOrName: String, imageBase64: String? = nil, isAnswerSource: Bool = false, originalPdfPath: String? = nil) {
         self.id = UUID()
         self.type = type
@@ -89,11 +93,135 @@ struct ExtractionGroup: Identifiable, Equatable {
         return UserDefaults.standard.bool(forKey: "feynman_always_local")
     }
     
-    private let session = URLSession.shared
+    var isBackgroundAIEnabled: Bool {
+        return UserDefaults.standard.bool(forKey: "background_ai_enabled")
+    }
+    
+    var isAutoPowerSaverEnabled: Bool {
+        if UserDefaults.standard.object(forKey: "auto_power_saver_enabled") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "auto_power_saver_enabled")
+    }
+    
+    @Published var isPowerSavingMode: Bool = false
+    @Published var aiCuratedCardsVersion: Int = 0
+    private(set) var lastAIAccessTimestamp: Date = Date()
+    
+    func touchAIAccess() {
+        self.lastAIAccessTimestamp = Date()
+        if self.isPowerSavingMode {
+            self.isPowerSavingMode = false
+            print("[AI Helper] User activity detected — exiting Power Saving Mode.")
+            PhysicsStudyApp.startOllamaServer()
+        }
+    }
+    
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 600.0
+        config.timeoutIntervalForResource = 1200.0
+        config.waitsForConnectivity = true
+        return URLSession(configuration: config)
+    }()
     private var baseURL: URL {
         let host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
         let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         return URL(string: cleanHost) ?? URL(string: "http://localhost:11434")!
+    }
+    
+    // Global AI Activity Indicator State
+    @Published var isAIBusy: Bool = false
+    @Published var currentAITaskDescription: String = ""
+    @Published var isCurrentAILocal: Bool = true
+    @Published var currentAIProviderName: String = "Local AI"
+    @Published var activeProgressCurrent: Int = 0
+    @Published var activeProgressTotal: Int = 0
+    @Published var activeProcessingNoteIds: Set<Int> = []
+    
+    // Disconnection & Error State
+    @Published var isAIDisconnected: Bool = false
+    @Published var disconnectionMessage: String = ""
+    
+    func isProcessingNote(id: Int) -> Bool {
+        return activeProcessingNoteIds.contains(id)
+    }
+    
+    func retryConnectionAndQueue() {
+        Task { @MainActor in
+            self.isAIDisconnected = false
+            self.disconnectionMessage = ""
+            self.isAIBusy = true
+            self.startAITask(description: "Retrying AI connection...")
+        }
+        Task {
+            let isOnline = await self.isOllamaRunning()
+            await MainActor.run {
+                if isOnline {
+                    self.isAIDisconnected = false
+                    self.disconnectionMessage = ""
+                    self.finishAITask()
+                } else {
+                    let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+                    self.isAIDisconnected = true
+                    self.disconnectionMessage = provider == "tailscale" ? "Tailscale Disconnected" : "AI Server Disconnected"
+                    self.isAIBusy = false
+                    self.activeProcessingNoteIds.removeAll()
+                }
+            }
+        }
+    }
+    
+    var activeAIModel: String {
+        let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+        if provider == "cloud" {
+            return UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud"
+        } else {
+            return UserDefaults.standard.string(forKey: "local_model_general") ?? "qwen2.5-coder:14b"
+        }
+    }
+    
+    var activeAIProvider: (isLocal: Bool, name: String) {
+        let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+        if provider == "tailscale" {
+            return (false, "Tailscale AI")
+        } else if provider == "cloud" {
+            return (false, "Cloud AI")
+        } else {
+            let host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
+            let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            let url = URL(string: cleanHost)
+            let hostName = url?.host?.lowercased() ?? "localhost"
+            let isLocalHost = hostName == "localhost" || hostName == "127.0.0.1" || hostName == "::1" || hostName == "0.0.0.0"
+            return (isLocalHost, isLocalHost ? "Local AI" : "Remote AI")
+        }
+    }
+    
+    func startAITask(description: String, current: Int = 0, total: Int = 0) {
+        Task { @MainActor in
+            let (isLocal, name) = self.activeAIProvider
+            self.isAIBusy = true
+            self.currentAITaskDescription = description
+            self.isCurrentAILocal = isLocal
+            self.currentAIProviderName = name
+            if total > 0 {
+                self.activeProgressTotal = max(self.activeProgressTotal, total)
+            }
+            if current > 0 {
+                self.activeProgressCurrent = current
+            }
+        }
+    }
+    
+    func finishAITask(force: Bool = false) {
+        Task { @MainActor in
+            if force || self.activeProcessingNoteIds.isEmpty {
+                self.isAIBusy = false
+                self.currentAITaskDescription = ""
+                self.activeProgressCurrent = 0
+                self.activeProgressTotal = 0
+            }
+        }
     }
     
     // Track processing thread states
@@ -311,20 +439,29 @@ struct ExtractionGroup: Identifiable, Equatable {
         
         for q in questions {
             var matchedAnswers = [PendingExtractionItem]()
-            let qSheetNum = extractSheetNumber(q.pathOrName)
             
-            for a in answers {
-                let aSheetNum = extractSheetNumber(a.pathOrName)
-                if let qNum = qSheetNum, let aNum = aSheetNum {
-                    if qNum == aNum {
-                        matchedAnswers.append(a)
+            if answers.isEmpty {
+                // Self-referential: scan the same document for both questions and answers!
+                matchedAnswers.append(q)
+            } else {
+                let qSheetNum = extractSheetNumber(q.pathOrName)
+                for a in answers {
+                    let aSheetNum = extractSheetNumber(a.pathOrName)
+                    if let qNum = qSheetNum, let aNum = aSheetNum {
+                        if qNum == aNum {
+                            matchedAnswers.append(a)
+                        }
+                    } else {
+                        let qNorm = normalizeFilename(q.pathOrName)
+                        let aNorm = normalizeFilename(a.pathOrName)
+                        if aNorm == qNorm || aNorm.contains(qNorm) || qNorm.contains(aNorm) {
+                            matchedAnswers.append(a)
+                        }
                     }
-                } else {
-                    let qNorm = normalizeFilename(q.pathOrName)
-                    let aNorm = normalizeFilename(a.pathOrName)
-                    if aNorm == qNorm || aNorm.contains(qNorm) || qNorm.contains(aNorm) {
-                        matchedAnswers.append(a)
-                    }
+                }
+                if matchedAnswers.isEmpty {
+                    // Fallback: also scan the question document itself for embedded answers!
+                    matchedAnswers.append(q)
                 }
             }
             groups.append(ExtractionGroup(questionItem: q, answerItems: matchedAnswers))
@@ -343,12 +480,18 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
         
         self.queueStatusText = "Extracting Problems..."
-        var totalTasks = 0
+        
+        // Count exact unique document items to display accurate 1 of N progress!
+        var uniqueItems = 0
         for g in groups {
-            totalTasks += 1
-            totalTasks += g.answerItems.count
+            uniqueItems += 1
+            for a in g.answerItems {
+                if a.pathOrName != g.questionItem.pathOrName {
+                    uniqueItems += 1
+                }
+            }
         }
-        self.classificationQueueCount += totalTasks
+        self.classificationQueueCount += uniqueItems
         
         self.logToFile("[AI Batch Importer LOG] Queued \(groups.count) extraction groups. Clear session state completed.")
         for g in groups {
@@ -357,9 +500,12 @@ struct ExtractionGroup: Identifiable, Equatable {
             
             var aItems = [ExtractionQueueItem]()
             for ans in g.answerItems {
-                let aType: ExtractionQueueItem.ItemType = (ans.type == .pdf) ? .pdf : .image
-                let aItem = ExtractionQueueItem(type: aType, pathOrName: ans.pathOrName, imageBase64: ans.imageBase64, isAnswerSource: true, originalPdfPath: ans.originalPdfPath)
-                aItems.append(aItem)
+                // Only queue separate answer files (skip duplicate pass on the question document itself)
+                if ans.pathOrName != g.questionItem.pathOrName {
+                    let aType: ExtractionQueueItem.ItemType = (ans.type == .pdf) ? .pdf : .image
+                    let aItem = ExtractionQueueItem(type: aType, pathOrName: ans.pathOrName, imageBase64: ans.imageBase64, isAnswerSource: true, originalPdfPath: ans.originalPdfPath)
+                    aItems.append(aItem)
+                }
             }
             
             let groupItem = ExtractionQueueGroupItem(questionItem: qItem, answerItems: aItems)
@@ -553,7 +699,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             
             Do NOT include any introduction, explanations, or conversational filler. Output only the structured list.
             """
-            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 120.0)
+            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 300.0)
         }
     }
     
@@ -900,7 +1046,10 @@ struct ExtractionGroup: Identifiable, Equatable {
             let lines = block.components(separatedBy: .newlines)
             var questionText = ""
             var hintText = ""
+            var solutionText = ""
+            var stepsList = [String]()
             var currentSection = ""
+            var currentStepText = ""
             
             for line in lines {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -909,16 +1058,46 @@ struct ExtractionGroup: Identifiable, Equatable {
                 let lower = trimmed.lowercased()
                 
                 if lower.contains("question:") {
+                    if !currentStepText.isEmpty {
+                        stepsList.append(currentStepText.trimmingCharacters(in: .whitespacesAndNewlines))
+                        currentStepText = ""
+                    }
                     currentSection = "question"
                     if let colonRange = trimmed.range(of: ":") {
                         let val = trimmed[colonRange.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "*_~ \t"))
                         questionText = val
                     }
                 } else if lower.contains("hint:") {
+                    if !currentStepText.isEmpty {
+                        stepsList.append(currentStepText.trimmingCharacters(in: .whitespacesAndNewlines))
+                        currentStepText = ""
+                    }
                     currentSection = "hint"
                     if let colonRange = trimmed.range(of: ":") {
                         let val = trimmed[colonRange.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "*_~ \t"))
                         hintText = val
+                    }
+                } else if lower.contains("solution:") {
+                    if !currentStepText.isEmpty {
+                        stepsList.append(currentStepText.trimmingCharacters(in: .whitespacesAndNewlines))
+                        currentStepText = ""
+                    }
+                    currentSection = "solution"
+                    if let colonRange = trimmed.range(of: ":") {
+                        let val = trimmed[colonRange.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "*_~ \t"))
+                        solutionText = val
+                    }
+                } else if lower.starts(with: "step") || (lower.contains("step ") && lower.contains(":")) {
+                    if !currentStepText.isEmpty {
+                        stepsList.append(currentStepText.trimmingCharacters(in: .whitespacesAndNewlines))
+                        currentStepText = ""
+                    }
+                    currentSection = "step"
+                    if let colonRange = trimmed.range(of: ":") {
+                        let val = trimmed[colonRange.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "*_~ \t"))
+                        currentStepText = val
+                    } else {
+                        currentStepText = trimmed
                     }
                 } else {
                     if currentSection == "question" {
@@ -927,20 +1106,39 @@ struct ExtractionGroup: Identifiable, Equatable {
                     } else if currentSection == "hint" {
                         if !hintText.isEmpty { hintText += "\n" }
                         hintText += line
+                    } else if currentSection == "solution" {
+                        if !solutionText.isEmpty { solutionText += "\n" }
+                        solutionText += line
+                    } else if currentSection == "step" {
+                        if !currentStepText.isEmpty { currentStepText += "\n" }
+                        currentStepText += line
                     }
                 }
             }
             
+            if !currentStepText.isEmpty {
+                stepsList.append(currentStepText.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            
             let q = questionText.trimmingCharacters(in: .whitespacesAndNewlines)
             let h = hintText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let sol = solutionText.trimmingCharacters(in: .whitespacesAndNewlines)
+            
             if !q.isEmpty {
-                let combined: String
+                let contentStr: String
                 if !h.isEmpty {
-                    combined = q + "\n\nHint:\n" + h
+                    contentStr = q + "\n\nHint:\n" + h
                 } else {
-                    combined = q
+                    contentStr = q
                 }
-                problems.append(ExtractedProblem(content: combined, solutionHint: ""))
+                
+                var finalSteps = stepsList
+                if finalSteps.isEmpty && !sol.isEmpty {
+                    let parts = sol.components(separatedBy: "\n\n")
+                    finalSteps = parts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+                }
+                
+                problems.append(ExtractedProblem(content: contentStr, solutionHint: h, solution: sol, steps: finalSteps))
             }
         }
         return problems
@@ -971,6 +1169,7 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     private func withUserPriority<T>(_ block: () async -> T) async -> T {
         await MainActor.run {
+            self.touchAIAccess()
             self.activeUserRequestsCount += 1
             if let task = self.currentBackgroundTask {
                 task.cancel()
@@ -995,6 +1194,31 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     // MARK: - API communication helpers
     
+    func fetchAvailableOllamaModels(host: String? = nil) async -> [String] {
+        let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+        let targetHost: String
+        if let h = host, !h.isEmpty {
+            targetHost = h
+        } else {
+            targetHost = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.100.100.100:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
+        }
+        
+        let cleanHost = targetHost.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        guard let baseURL = URL(string: cleanHost) else { return [] }
+        let url = baseURL.appendingPathComponent("api/tags")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3.0
+        
+        do {
+            let (data, _) = try await session.data(for: request)
+            let tags = try JSONDecoder().decode(TagsResponse.self, from: data)
+            return tags.models.map { $0.name }.sorted()
+        } catch {
+            print("[AI Helper] Could not fetch available models from \(cleanHost): \(error)")
+            return []
+        }
+    }
+
     func getOllamaModel(forceLocal: Bool = false) async -> String {
         // If using a cloud provider, return the configured cloud model name
         let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
@@ -1002,65 +1226,30 @@ struct ExtractionGroup: Identifiable, Equatable {
             let cloudModel = UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud"
             return cloudModel
         }
-        if provider == "tailscale" {
-            if let preferred = UserDefaults.standard.string(forKey: "tailscale_model_general"), !preferred.isEmpty {
-                return preferred
-            }
-        } else {
-            if let preferred = UserDefaults.standard.string(forKey: "local_model_general"), !preferred.isEmpty {
-                return preferred
-            }
-        }
-        let defaultModel = "qwen2.5-coder:7b"
-        let host = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.100.100.100:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
-        let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        guard let baseURL = URL(string: cleanHost) else { return defaultModel }
-        let url = baseURL.appendingPathComponent("api/tags")
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 2.0
         
-        do {
-            let (data, _) = try await session.data(for: request)
-            let tags = try JSONDecoder().decode(TagsResponse.self, from: data)
-            
-            // 1. Try to find qwen2.5-coder:7b or general qwen2.5-coder
-            for m in tags.models {
-                if m.name.lowercased().contains("qwen2.5-coder:7b") {
-                    return m.name
-                }
+        let preferredKey = provider == "tailscale" ? "tailscale_model_general" : "local_model_general"
+        let preferred = UserDefaults.standard.string(forKey: preferredKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        
+        // Dynamically fetch installed models from Ollama server
+        let installed = await fetchAvailableOllamaModels()
+        if !installed.isEmpty {
+            // 1. If preferred model is in installed models list, return it
+            if !preferred.isEmpty && installed.contains(preferred) {
+                return preferred
             }
-            for m in tags.models {
-                if m.name.lowercased().contains("qwen2.5-coder") {
-                    return m.name
-                }
+            // 2. If preferred substring matches an installed model (e.g. qwen2.5-coder:14b or deepseek-r1)
+            if !preferred.isEmpty, let match = installed.first(where: { $0.lowercased().contains(preferred.lowercased()) }) {
+                return match
             }
-            
-            // 2. Try to find qwen2.5:7b or standard text qwen2.5 (excluding vision)
-            for m in tags.models {
-                if (m.name.lowercased().contains("qwen2.5:7b") || m.name.lowercased().contains("qwen2.5")) && !m.name.lowercased().contains("vl") {
-                    return m.name
-                }
+            // 3. Prefer qwen2.5-coder:14b or deepseek-r1:14b if present
+            if let target14b = installed.first(where: { $0.lowercased().contains("14b") && !$0.lowercased().contains("vl") }) {
+                return target14b
             }
-            
-            // 3. Fallback to qwen2.5vl:7b
-            for m in tags.models {
-                if m.name.lowercased().contains("qwen2.5vl:7b") || m.name.lowercased().contains("qwen2.5-vl:7b") {
-                    return m.name
-                }
-            }
-            for m in tags.models {
-                if m.name.lowercased().contains("qwen2.5vl") || m.name.lowercased().contains("qwen2.5-vl") {
-                    return m.name
-                }
-            }
-            
-            if let first = tags.models.first {
-                return first.name
-            }
-        } catch {
-            print("[AI Helper] Warning: Could not connect to Ollama to list models (\(error)). Defaulting to \(defaultModel).")
+            // 4. Fallback to first available installed model
+            return installed.first!
         }
-        return defaultModel
+        
+        return preferred.isEmpty ? "qwen2.5-coder:14b" : preferred
     }
     
     func getOllamaVisionModel(forceLocal: Bool = false) async -> String? {
@@ -1127,9 +1316,19 @@ struct ExtractionGroup: Identifiable, Equatable {
         return regex.firstMatch(in: text, options: [], range: range) != nil
     }
     
-    func callOllama(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval = 180.0, forceLocal: Bool = false) async -> String? {
+    func callOllama(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval = 300.0, forceLocal: Bool = false) async -> String? {
+        let isWasBusy = self.isAIBusy
+        if !isWasBusy {
+            startAITask(description: "Processing AI Request...")
+        }
+        defer {
+            if !isWasBusy {
+                finishAITask(force: false)
+            }
+        }
+        
         let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
-        let maxRetries = 2
+        let maxRetries = 3
         
         let targetModel: String
         let effectiveProvider: String
@@ -1209,7 +1408,24 @@ struct ExtractionGroup: Identifiable, Equatable {
                 let responseObj = try JSONDecoder().decode(GenerateResponse.self, from: data)
                 return responseObj.response.trimmingCharacters(in: .whitespacesAndNewlines)
             } catch {
-                self.logToFile("[AI Helper LOG] Error communicating with local Ollama: \(error)")
+                self.logToFile("[AI Helper LOG] Error communicating with \(provider) Ollama: \(error)")
+                let urlError = error as? URLError
+                let isTemporaryTimeout = (urlError?.code == .timedOut || urlError?.code == .cancelled || urlError?.code == .networkConnectionLost)
+                
+                if !isTemporaryTimeout {
+                    await MainActor.run {
+                        self.isAIDisconnected = true
+                        if provider == "tailscale" {
+                            self.disconnectionMessage = "Tailscale Disconnected"
+                        } else {
+                            self.disconnectionMessage = "Ollama Server Offline"
+                        }
+                        self.isAIBusy = false
+                        self.activeProcessingNoteIds.removeAll()
+                    }
+                } else {
+                    self.logToFile("[AI Helper LOG] Request timed out or network blip (\(error.localizedDescription)). Server remains active for retries.")
+                }
                 return nil
             }
         } else {
@@ -1501,12 +1717,133 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     // MARK: - Summarization & Difficulty rating
     
+    func isDefaultTitle(_ title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        let lower = trimmed.lowercased()
+        
+        // 1. Starts with digit prefix e.g. "9. Basic Algebra", "10. Logarithms", "0curvilinear", "1 - Vector Calculus"
+        if lower.range(of: "^[0-9]+[._ -]", options: .regularExpression) != nil { return true }
+        
+        // 2. Contains underscores like "Lecture_1", "Live_week0_intro", "0fourier_series_Curt"
+        if lower.contains("_") { return true }
+        
+        // 3. Generic lecture/chapter prefixes
+        let genericPrefixes = ["lecture", "chapter", "notes", "wk", "week", "doc", "file", "lec", "unit", "part", "sec", "section", "live"]
+        for prefix in genericPrefixes {
+            if lower.hasPrefix(prefix) { return true }
+        }
+        
+        // 4. File extensions or unformatted filenames
+        if lower.hasSuffix(".pdf") || lower.hasSuffix(".txt") || lower.hasSuffix(".md") {
+            return true
+        }
+        
+        return false
+    }
+    
+    private func cleanFilenameTitle(_ raw: String) -> String {
+        var text = raw.replacingOccurrences(of: "_", with: " ")
+        text = text.replacingOccurrences(of: "-", with: " ")
+        text = text.replacingOccurrences(of: "^[0-9]+[.\\s]*", with: "", options: .regularExpression)
+        
+        let wordsToRemove = ["live", "week", "lecture", "chapter", "notes", "curt", "curtis"]
+        var components = text.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+        components.removeAll { comp in
+            let lower = comp.lowercased()
+            return wordsToRemove.contains(where: { lower.hasPrefix($0) })
+        }
+        let cleaned = components.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.capitalized.isEmpty ? raw : cleaned.capitalized
+    }
+    
+    func generateDescriptiveTitle(noteId: Int) async {
+        guard let note = DatabaseManager.shared.getNote(id: noteId) else { return }
+        
+        let pdfText = extractTextFromPDF(path: note.filePath)
+        let rawFileName = URL(fileURLWithPath: note.filePath).deletingPathExtension().lastPathComponent
+        
+        startAITask(description: "Renaming Title...")
+        defer { finishAITask() }
+        
+        if pdfText.isEmpty {
+            let fallbackTitle = cleanFilenameTitle(rawFileName)
+            if !fallbackTitle.isEmpty {
+                _ = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: fallbackTitle)
+                print("[AI Helper] Applied filename fallback title for Note ID \(noteId): '\(fallbackTitle)'")
+            }
+            return
+        }
+        
+        var truncatedText = pdfText
+        if pdfText.count > 3500 {
+            truncatedText = String(pdfText.prefix(3500))
+        }
+        
+        let model = await getOllamaModel()
+        let prompt = """
+        You are an expert physics academic assistant. Create a VERY SHORT descriptive topic title for these lecture notes (original file: '\(rawFileName)').
+        
+        CRITICAL FORMAT RULES:
+        1. Length MUST be 1 to 4 words maximum (ideally 2 to 3 words). Examples: "Classical Mechanics", "Newton's Laws", "Quantum Operators", "Special Relativity", "Thermodynamics", "Fourier Series", "Vector Calculus", "Coulomb's Law".
+        2. Do NOT include words like 'Lecture', 'Notes', 'Chapter', 'Week', 'Live', or numbers like '1', '2', 'Lecture 1', 'Week 0'.
+        3. Output ONLY the raw short topic title. Do NOT use quotes, bullet points, markdown formatting, or introductory filler.
+        
+        Lecture Text:
+        \(truncatedText)
+        """
+        
+        if let res = await callOllama(prompt: prompt, model: model) {
+            var cleaned = res.trimmingCharacters(in: .whitespacesAndNewlines)
+            cleaned = cleaned.replacingOccurrences(of: "\"", with: "")
+            cleaned = cleaned.replacingOccurrences(of: "'", with: "'")
+            if cleaned.lowercased().hasPrefix("title:") {
+                cleaned = String(cleaned.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if cleaned.hasPrefix("- ") || cleaned.hasPrefix("• ") {
+                cleaned = String(cleaned.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if !cleaned.isEmpty && cleaned.count <= 50 {
+                _ = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: cleaned)
+                print("[AI Helper] Renamed Note ID \(noteId) title to: '\(cleaned)'")
+            }
+        }
+    }
+    
+    func renameAllNotesWithAI(moduleId: Int? = nil) async {
+        let notes = DatabaseManager.shared.getNotes(forModuleId: moduleId)
+        print("[AI Helper] Manually triggered AI renaming for \(notes.count) notes...")
+        for (idx, note) in notes.enumerated() {
+            startAITask(description: "Renaming Lecture Titles...", current: idx + 1, total: notes.count)
+            await generateDescriptiveTitle(noteId: note.id)
+        }
+        finishAITask()
+    }
+    
     func processNoteSync(noteId: Int) async {
         print("[AI Helper] Beginning background analysis for Note ID: \(noteId)")
-        
         guard let note = DatabaseManager.shared.getNote(id: noteId) else {
             print("[AI Helper] Note ID \(noteId) not found in database.")
             return
+        }
+        
+        _ = await MainActor.run {
+            self.activeProcessingNoteIds.insert(noteId)
+        }
+        startAITask(description: "Generating AI Summary (\(note.title))")
+        
+        defer {
+            Task { @MainActor in
+                self.activeProcessingNoteIds.remove(noteId)
+                if self.activeProcessingNoteIds.isEmpty {
+                    self.finishAITask(force: true)
+                }
+            }
+        }
+        
+        // Auto-generate short descriptive title if generic
+        if isDefaultTitle(note.title) {
+            await generateDescriptiveTitle(noteId: noteId)
         }
         
         // Extract text
@@ -1532,35 +1869,41 @@ struct ExtractionGroup: Identifiable, Equatable {
         
         let model = await getOllamaModel()
         
-        // Generate summary
+        // Generate condensed formula-first study notes with centered equations
         let summaryPrompt = """
-        You are a helpful physics academic assistant. Summarize the following physics lecture notes. \
-        Start directly with the overview paragraph. Do NOT include any introductory or concluding conversational filler (e.g., 'Here is the summary:', 'Sure!', or 'Let me know if you need more help'). \
-        Your output MUST follow this exact structure:
+        Summarize the following physics lecture into a minimal, formula-first study guide.
 
-        [Overview Paragraph]
-        A single short paragraph (2-3 sentences) summarizing the core topic of the lecture, the fundamental physical concepts introduced, and how it connects to the broader subject.
+        CRITICAL FORMAT RULES:
+        1. Start directly with 1 short sentence introducing the core physical topic intuition.
+        2. Provide 3 to 4 key concept sections following this exact structure:
+           ### [Concept Name]
+           $$ [Centred Key LaTeX Equation] $$
+           1 short sentence explaining what the equation expresses physically and what the symbols represent.
+        3. AIRINESS & FIT: Keep text strictly to 1 short sentence per section so notes fit on a single screen without clutter.
+        4. LATEX ACCURACY: Wrap all centered display equations in $$ equation $$ and all inline math variables in $ symbol $ (e.g. $SO(n)$, $aH = \\{ah | h \\in H\\}$). Ensure all curly braces {{ }} are balanced.
+        5. NO ASTERISKS: Do NOT use double asterisks ** or single asterisks * anywhere in your output. Use plain text for headers and descriptions.
+        6. NO FILLER: Do NOT include any filler text, intros, outros, 'Applications in Physics', 'Problem-Solving Skills', or concluding summaries. End directly after the last equation.
 
-        [Key Concepts & Equations]
-        A list of 3-5 bullet points using the dash '-' symbol, listing key concepts and equations using the format '- [Concept Name]: [Formula/Details]'.
+        Example format:
+        Electrostatics describes forces between stationary charges in space.
 
-        Here is an example of the exact format required:
-        This lecture introduces the principles of electrostatics, focusing on Coulomb's law and the concept of electric field strength. It explains how charge distributions produce force fields in space and defines the mathematical foundation for calculating electric field vectors. This forms the basis for understanding more advanced electromagnetic phenomena.
+        ### Coulomb's Law
+        $$ F = \\frac{1}{4\\pi\\varepsilon_0} \\frac{q_1 q_2}{r^2} $$
+        Electrostatic force F drops off with the square of separation distance r between charges q1 and q2.
 
-        - Coulomb's Law: F = k * (q1 * q2) / r^2
-        - Electric Field Strength: E = F / q
-        - Superposition Principle for multiple charges
-        - Electric Field Lines and their properties
+        ### Electric Field Strength
+        $$ \\mathbf{E} = \\frac{\\mathbf{F}}{q_0} $$
+        Electric field E represents force per unit positive test charge q0.
 
-        Now, summarize the following lecture notes using the exact format shown above:
+        Now, synthesize the following lecture notes using the exact format above:
 
         Lecture notes:
         \(truncatedText)
         """
         let summaryRes = await callOllama(prompt: summaryPrompt, model: model)
         if let res = summaryRes {
-            var cleanedSummary = res
-            var lines = res.components(separatedBy: .newlines)
+            var cleanedSummary = res.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+            var lines = cleanedSummary.components(separatedBy: .newlines)
             if let firstLine = lines.first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
                 let introPrefixes = ["here is", "here's", "sure", "based on", "the following", "this is", "the summary"]
                 if firstLine.hasSuffix(":") && introPrefixes.contains(where: { firstLine.hasPrefix($0) }) {
@@ -1646,7 +1989,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             Return ONLY the raw LaTeX code itself. Do NOT include any conversational text, explanations, intro, or outro.
             """
             
-            let res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 90.0, forceLocal: useLocal)
+            let res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 300.0, forceLocal: useLocal)
             return cleanLaTeXOutput(res)
         }
     }
@@ -1672,15 +2015,17 @@ struct ExtractionGroup: Identifiable, Equatable {
             4. ALWAYS wrap all math equations, math formulas, variables, and math symbols in standard single dollar signs (e.g. $x_i$, $\theta$) for inline math, and double dollar signs (e.g. $$E = mc^2$$) on separate lines for block equations. Never leave LaTeX raw or naked without delimiters.
             5. Do NOT include any exam mark totals, question points, score designations, or grade weight indicators (e.g. do NOT write '[5 marks]', '(10 marks)', '[Total: 4 points]', etc.). Strip all such mark references completely from the question content.
             
-            Then, provide a concise but helpful solution hint for the problem. If the problem is extremely basic or trivial, you may omit the hint (leave the Hint field empty). Otherwise, always generate a hint to guide the student. ALWAYS wrap all LaTeX math in standard dollar sign delimiters inside the hint as well.
+            Then, provide a concise solution hint, the full solution/answer, and break down the complete step-by-step solution into clear numbered steps (Step 1, Step 2, Step 3...). ALWAYS wrap all LaTeX math formulas in standard single or double dollar signs.
 
             Format the output strictly as follows:
             [PROBLEM]
-            Question: <clear question/instruction text, spread across multiple lines, with equations on separate lines>
-            Hint: <concise solution hint with LaTeX wrapped in delimiters, or leave blank if not needed>
+            Question: <clear question/instruction text, spread across multiple lines>
+            Hint: <concise solution hint with LaTeX wrapped in dollar signs>
+            Solution: <complete final answer text with final numbers or equations>
+            Step 1: <first solution step>
+            Step 2: <second solution step>
+            Step 3: <third solution step>
             [PROBLEM]
-            Question: <clear question/instruction text, spread across multiple lines, with equations on separate lines>
-            Hint: <concise solution hint with LaTeX wrapped in delimiters, or leave blank if not needed>
 
             Do NOT include any introduction, explanations, or conversational filler. Output only the structured list.
             Do NOT wrap the 'Question:' or 'Hint:' labels in any markdown formatting like bold asterisks (e.g. do NOT write '**Question:**' or '- Question:'). Simply start the line with 'Question:' or 'Hint:'.
@@ -1710,21 +2055,23 @@ struct ExtractionGroup: Identifiable, Equatable {
             4. ALWAYS wrap all math equations, math formulas, variables, and math symbols in standard single dollar signs (e.g. $x_i$, $\theta$) for inline math, and double dollar signs (e.g. $$E = mc^2$$) on separate lines for block equations. Never leave LaTeX raw or naked without delimiters.
             5. Do NOT include any exam mark totals, question points, score designations, or grade weight indicators (e.g. do NOT write '[5 marks]', '(10 marks)', '[Total: 4 points]', etc.). Strip all such mark references completely from the question content.
             
-            Then, provide a concise but helpful solution hint for the problem. If the problem is extremely basic or trivial, you may omit the hint (leave the Hint field empty). Otherwise, always generate a hint to guide the student. ALWAYS wrap all LaTeX math in standard dollar sign delimiters inside the hint as well.
+            Then, provide a concise solution hint, the full solution/answer, and break down the complete step-by-step solution into clear numbered steps (Step 1, Step 2, Step 3...). ALWAYS wrap all LaTeX math formulas in standard single or double dollar signs.
 
             Format the output strictly as follows:
             [PROBLEM]
-            Question: <clear question/instruction text, spread across multiple lines, with equations on separate lines>
-            Hint: <concise solution hint with LaTeX wrapped in delimiters, or leave blank if not needed>
+            Question: <clear question/instruction text, spread across multiple lines>
+            Hint: <concise solution hint with LaTeX wrapped in dollar signs>
+            Solution: <complete final answer text with final numbers or equations>
+            Step 1: <first solution step>
+            Step 2: <second solution step>
+            Step 3: <third solution step>
             [PROBLEM]
-            Question: <clear question/instruction text, spread across multiple lines, with equations on separate lines>
-            Hint: <concise solution hint with LaTeX wrapped in delimiters, or leave blank if not needed>
 
             Do NOT include any introduction, explanations, or conversational filler. Output only the structured list.
             Do NOT wrap the 'Question:' or 'Hint:' labels in any markdown formatting like bold asterisks (e.g. do NOT write '**Question:**' or '- Question:'). Simply start the line with 'Question:' or 'Hint:'.
             """
             
-            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 120.0)
+            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 300.0)
         }
     }
     
@@ -1843,9 +2190,33 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
         
         let primerRes = await callOllama(prompt: prompt, model: model)
-        let finalPrimer = primerRes ?? "Unable to generate pre-lecture primer. Please verify Ollama is running and has the model qwen2.5vl:7b installed."
-        _ = DatabaseManager.shared.updateNoteAI(noteId: currentNoteId, summary: currNote.aiSummary, primer: finalPrimer)
-        return finalPrimer
+        if let res = primerRes {
+            _ = DatabaseManager.shared.updateNoteAI(noteId: currentNoteId, summary: currNote.aiSummary, primer: res)
+            return res
+        } else {
+            self.failedNoteTimes[currentNoteId] = Date()
+            let finalPrimer = "Unable to generate pre-lecture primer. Please verify Ollama is running and has the model qwen2.5vl:7b installed."
+            _ = DatabaseManager.shared.updateNoteAI(noteId: currentNoteId, summary: currNote.aiSummary, primer: finalPrimer)
+            return finalPrimer
+        }
+    }
+    
+    func regeneratePreLecturePrimersForReorderedNotes(notesInOrder: [Note], affectedNoteIds: Set<Int>) async {
+        let total = affectedNoteIds.count
+        guard total > 0 else { return }
+        
+        startAITask(description: "Updating Pre-Lecture Recaps...", current: 0, total: total)
+        var count = 0
+        
+        for (idx, note) in notesInOrder.enumerated() {
+            if affectedNoteIds.contains(note.id) {
+                count += 1
+                startAITask(description: "Updating Pre-Lecture Recap (\(note.title)...)", current: count, total: total)
+                let prevNoteId = idx > 0 ? notesInOrder[idx - 1].id : nil
+                _ = await generatePreLecturePrimer(currentNoteId: note.id, prevNoteId: prevNoteId)
+            }
+        }
+        finishAITask()
     }
     
     // MARK: - Feynman sandbox & dialogues
@@ -1900,7 +2271,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             You want to learn this topic from the user using the Feynman technique. Ask probing, conceptual questions \
             or point out potential logical gaps in their explanations. Be friendly, polite, but analytically rigorous (like a good student trying to really learn it). \
             Keep your responses relatively brief (1-3 sentences) so it feels like a natural conversation. \
-            Do NOT use sparkles emoji ('✨') anywhere in your response.
+            Do NOT use any emojis anywhere in your response.
 
             Conversation History:
             \(historyStr)
@@ -1924,7 +2295,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             Ask the user one specific, conceptual question to test their understanding of this topic. \
             Do NOT ask them to explain the entire topic or summarize it. Instead, ask about a specific mechanism, \
             implication, equation, or physical scenario related to the topic. \
-            Keep your question brief and sound like a student speaking (1-2 sentences). Do NOT use sparkles emoji ('✨').
+            Keep your question brief and sound like a student speaking (1-2 sentences). Do NOT use any emojis.
 
             Student Question:
             """
@@ -2032,24 +2403,51 @@ struct ExtractionGroup: Identifiable, Equatable {
             print("[AI Helper] Background processor manager started.")
             while true {
                 do {
+                    // Check for 5 minutes (300 seconds) inactivity
+                    await MainActor.run {
+                        if self.isAutoPowerSaverEnabled {
+                            let idleTime = Date().timeIntervalSince(self.lastAIAccessTimestamp)
+                            if idleTime > 300 && !self.isPowerSavingMode {
+                                self.isPowerSavingMode = true
+                                self.activeJobDescription = "Power Saving Mode"
+                                print("[AI Helper] 5 minutes of AI inactivity reached — entering Power Saving Mode.")
+                                PhysicsStudyApp.stopOllamaServer()
+                            }
+                        }
+                    }
+                    
+                    let powerSaving = await MainActor.run { self.isPowerSavingMode }
+                    let bgEnabled = await MainActor.run { self.isBackgroundAIEnabled }
+                    
+                    // If power saving is active or background AI generation is disabled, sleep longer
+                    if powerSaving || !bgEnabled {
+                        await MainActor.run {
+                            if powerSaving {
+                                self.activeJobDescription = "Power Saving Mode"
+                            } else if !bgEnabled {
+                                self.activeJobDescription = "Background AI Disabled"
+                            }
+                        }
+                        try await Task.sleep(nanoseconds: 15_000_000_000) // Sleep 15s when inactive/disabled
+                        continue
+                    }
+                    
                     // Check if any user request is active. If so, wait.
                     let isUserBusy = await MainActor.run { self.activeUserRequestsCount > 0 }
                     if isUserBusy {
-                        try await Task.sleep(nanoseconds: 1_000_000_000) // Sleep 1s and check again
+                        try await Task.sleep(nanoseconds: 2_000_000_000) // Sleep 2s
                         continue
                     }
                     
                     let online = await self.isOllamaRunning()
                     
-                    // Recheck user request count after checking Ollama state
                     let isUserBusyAfterCheck = await MainActor.run { self.activeUserRequestsCount > 0 }
                     if isUserBusyAfterCheck {
-                        try await Task.sleep(nanoseconds: 1_000_000_000)
+                        try await Task.sleep(nanoseconds: 2_000_000_000)
                         continue
                     }
                     
                     if online, let job = await self.getNextPendingJob() {
-                        // Prevent system sleep while jobs are processing
                         if self.awakeActivityToken == nil {
                             self.awakeActivityToken = ProcessInfo.processInfo.beginActivity(
                                 options: [.background, .idleSystemSleepDisabled],
@@ -2061,7 +2459,6 @@ struct ExtractionGroup: Identifiable, Equatable {
                         self.isProcessing = true
                         self.activeJobDescription = job.description
                         
-                        // Run background job as a cancellable Task
                         let task = Task {
                             await job.task()
                         }
@@ -2077,9 +2474,8 @@ struct ExtractionGroup: Identifiable, Equatable {
                         
                         self.isProcessing = false
                         self.activeJobDescription = "Idle"
-                        try await Task.sleep(nanoseconds: 3_000_000_000) // Sleep 3s cooldown
+                        try await Task.sleep(nanoseconds: 5_000_000_000) // 5s cooldown
                     } else {
-                        // Re-enable system sleep when idle
                         if let token = self.awakeActivityToken {
                             ProcessInfo.processInfo.endActivity(token)
                             self.awakeActivityToken = nil
@@ -2087,11 +2483,11 @@ struct ExtractionGroup: Identifiable, Equatable {
                         }
                         
                         self.activeJobDescription = online ? "Idle" : "Waiting for Ollama..."
-                        try await Task.sleep(nanoseconds: online ? 5_000_000_000 : 1_000_000_000)
+                        try await Task.sleep(nanoseconds: 10_000_000_000) // 10s idle sleep
                     }
                 } catch {
                     print("[AI Helper] Error in background processor: \(error)")
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
                 }
             }
         }
@@ -2112,6 +2508,13 @@ struct ExtractionGroup: Identifiable, Equatable {
                 // Skip processing if note file path is empty
                 guard !note.filePath.isEmpty else {
                     continue
+                }
+                
+                // If title is generic (e.g. Lecture_1), queue AI title generation
+                if self.isDefaultTitle(note.title) && !self.isNoteFailed(noteId: note.id) {
+                    return PendingJob(description: "Rename Title (Note ID \(note.id))") {
+                        await self.generateDescriptiveTitle(noteId: note.id)
+                    }
                 }
                 
                 // If summary is missing or has error text
@@ -2178,6 +2581,140 @@ struct ExtractionGroup: Identifiable, Equatable {
             let steps = self.parseStepsFromLLMResponse(res)
             self.logToFile("[AI Helper LOG] Returning \(steps.count) steps.")
             return steps
+        }
+    }
+    
+    func curatePreExamFlashcards(moduleId: Int, moduleCode: String) async {
+        await withUserPriority {
+            self.isAIBusy = true
+            self.currentAITaskDescription = "Curating Phase 1 Cards for \(moduleCode)..."
+            self.logToFile("[AI Helper LOG] curatePreExamFlashcards started for module ID \(moduleId) (\(moduleCode)).")
+            
+            let allCards = DatabaseManager.shared.getFlashcards(forModuleId: moduleId)
+            // Strict exclusion: exclude flagged cards (reserved for QA/editing) and trivial/overly basic cards
+            let eligibleCards = allCards.filter { card in
+                if card.isFlagged { return false }
+                let trimmedFront = card.front.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmedBack = card.back.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmedFront.count < 8 || trimmedBack.count < 3 { return false }
+                return true
+            }
+            let cardPool = eligibleCards.isEmpty ? allCards : eligibleCards
+            self.logToFile("[AI Helper LOG] Total eligible non-flagged cards found for module \(moduleCode): \(cardPool.count)")
+            
+            guard !cardPool.isEmpty else {
+                self.isAIBusy = false
+                self.currentAITaskDescription = ""
+                return
+            }
+            
+            // Stratified Semester Sampling across creation/ID spectrum to ensure equal representation of early, mid, and late lectures
+            let candidates: [Flashcard]
+            if cardPool.count <= 50 {
+                candidates = cardPool.shuffled()
+            } else {
+                let sortedById = cardPool.sorted(by: { $0.id < $1.id })
+                let bucketCount = 5
+                let chunkSize = max(1, sortedById.count / bucketCount)
+                var sampled: [Flashcard] = []
+                for i in 0..<bucketCount {
+                    let start = i * chunkSize
+                    let end = (i == bucketCount - 1) ? sortedById.count : min((i + 1) * chunkSize, sortedById.count)
+                    if start < end {
+                        let bucketSlice = Array(sortedById[start..<end])
+                        let bucketHard = bucketSlice.sorted(by: { $0.easeFactor < $1.easeFactor }).prefix(5)
+                        let bucketRandom = bucketSlice.filter { c in !bucketHard.contains(where: { $0.id == c.id }) }.shuffled().prefix(5)
+                        sampled.append(contentsOf: bucketHard)
+                        sampled.append(contentsOf: bucketRandom)
+                    }
+                }
+                candidates = sampled.shuffled()
+            }
+            
+            var cardSummaries: [[String: Any]] = []
+            for c in candidates {
+                cardSummaries.append([
+                    "id": c.id,
+                    "front": String(c.front.prefix(150)),
+                    "back": String(c.back.prefix(150)),
+                    "easeFactor": c.easeFactor
+                ])
+            }
+            
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: cardSummaries, options: []),
+                  let jsonString = String(data: jsonData, encoding: .utf8) else {
+                let fallback = Array(candidates.shuffled().prefix(25)).map(\.id)
+                UserDefaults.standard.set(fallback, forKey: "pre_exam_ai_cards_\(moduleId)")
+                self.aiCuratedCardsVersion += 1
+                self.isAIBusy = false
+                self.currentAITaskDescription = ""
+                return
+            }
+            
+            let model = await getOllamaModel()
+            let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+            self.logToFile("[AI Helper LOG] Dispatching pre-exam card curation to provider: \(provider), model: \(model)...")
+            
+            let prompt = """
+            You are a STEM exam coach for module \(moduleCode). Select the 25 BEST flashcards for a 40-minute pre-exam memory priming session from the candidates below.
+            
+            UNIFORM SEMESTER COVERAGE REQUIREMENT:
+            The candidates below span early, middle, and recent/late lectures of the module.
+            Select 25 cards that provide BALANCED, EVEN COVERAGE across the ENTIRE course.
+            DO NOT cluster your selections in early lectures — ensure recent and later lecture topics are strongly represented in Phase 1!
+            
+            Categorize and pick cards representing:
+            1. Core Definitions and Theorems
+            2. Validity and Applicability Constraints
+            3. Boundary Conditions and Limiting Cases
+            4. Notation and Sign Conventions
+            
+            STRICT EXCLUSION RULES:
+            1. EXCLUDE any trivial, elementary, or overly basic flashcards (e.g. basic unit definitions or single-word trivial facts).
+            2. EXCLUDE cards requiring long multi-step calculations or multi-page derivations.
+            3. Focus ONLY on high-yield, non-trivial core concepts, validity conditions, boundary cases, and notation traps.
+            
+            Candidates JSON:
+            \(jsonString)
+            
+            OUTPUT REQUIREMENT:
+            Return ONLY a raw JSON array of up to 25 integer card IDs, e.g. [12, 45, 3, 19, 88]. Do NOT include any markdown formatting, code block markers, or commentary text.
+            """
+            
+            var selectedIds: [Int] = []
+            if let response = await callOllama(prompt: prompt, model: model) {
+                self.logToFile("[AI Helper LOG] Response received (length \(response.count)): '\(response.prefix(150))...'")
+                
+                if let start = response.firstIndex(of: "["),
+                   let end = response.lastIndex(of: "]"),
+                   start <= end {
+                    let jsonSubstring = String(response[start...end])
+                    if let data = jsonSubstring.data(using: .utf8),
+                       let ids = try? JSONSerialization.jsonObject(with: data, options: []) as? [Int],
+                       !ids.isEmpty {
+                        selectedIds = ids
+                        self.logToFile("[AI Helper LOG] Successfully parsed \(ids.count) AI-selected card IDs: \(ids)")
+                    } else {
+                        self.logToFile("[AI Helper LOG] Substring JSON array extraction failed for string: '\(jsonSubstring.prefix(100))'")
+                    }
+                } else {
+                    self.logToFile("[AI Helper LOG] No '[' or ']' brackets found in response.")
+                }
+            } else {
+                self.logToFile("[AI Helper LOG] callOllama returned nil during pre-exam curation.")
+            }
+            
+            if selectedIds.isEmpty {
+                self.logToFile("[AI Helper LOG] AI curation returned 0 valid IDs — executing randomized candidate fallback deck.")
+                selectedIds = Array(candidates.shuffled().prefix(min(25, candidates.count))).map(\.id)
+            }
+            
+            UserDefaults.standard.set(selectedIds, forKey: "pre_exam_ai_cards_\(moduleId)")
+            UserDefaults.standard.synchronize()
+            self.aiCuratedCardsVersion += 1
+            self.isAIBusy = false
+            self.currentAITaskDescription = ""
+            self.logToFile("[AI Helper LOG] Pre-exam card curation completed for module \(moduleCode). Saved \(selectedIds.count) card IDs to persistent UserDefaults.")
         }
     }
 }
