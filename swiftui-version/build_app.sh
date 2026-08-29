@@ -68,6 +68,7 @@ echo "Updating Desktop app bundle..."
 rm -rf "${DESKTOP_APP}"
 cp -R "${APP_BUNDLE}" "${DESKTOP_APP}"
 xattr -cr "${DESKTOP_APP}"
+codesign --force --deep --sign - "${DESKTOP_APP}"
 touch "${DESKTOP_APP}"
 rm -rf "${DESKTOP_BUILD_DIR}"
 

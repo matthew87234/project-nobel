@@ -71,6 +71,8 @@ if [ -f "${SRC_DIR}/Resources/MenuBarIcon.png" ]; then
 fi
 
 xattr -cr "${APP_BUNDLE}"
+echo "Signing application bundle with ad-hoc identity..."
+codesign --force --deep --sign - "${APP_BUNDLE}"
 
 echo "=================================================="
 echo " 3. Generating High-Res DMG Background Image"

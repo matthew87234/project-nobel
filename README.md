@@ -13,7 +13,9 @@ Download the latest pre-compiled disk image from the GitHub Releases page:
 1. Download `Project-Nobel-Installer.dmg`.
 2. Open the downloaded `.dmg` file.
 3. Drag **Project Nobel** into your **Applications** folder.
-4. Launch Project Nobel from Applications or Spotlight.
+4. If macOS displays an unidentified developer prompt on first launch:
+   - In Terminal, run: `xattr -cr "/Applications/Project Nobel.app"`
+   - Or go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
 > **Note on Data Persistence:** All your flashcards, problem solving statistics, lecture notes, and Feynman chat sessions are stored securely in `~/.physics_study_app/physics_study.db`. Upgrading or reinstalling the app via `.dmg` will never overwrite or erase your study data.
 
