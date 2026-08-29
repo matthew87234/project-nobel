@@ -19,6 +19,9 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
+      - name: Install Packaging Dependencies
+        run: python3 -m pip install dmgbuild
+
       - name: Build Application and Generate .dmg
         run: |
           chmod +x ./create_dmg.sh

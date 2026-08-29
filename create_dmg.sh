@@ -8,16 +8,17 @@ DMG_STAGING="${REPO_ROOT}/.build_dmg_staging"
 APP_NAME="Project Nobel"
 DMG_OUTPUT_NAME="Project-Nobel-Installer.dmg"
 FINAL_DMG="${REPO_ROOT}/${DMG_OUTPUT_NAME}"
+BG_IMAGE="${REPO_ROOT}/dmg_background.png"
 
 echo "=================================================="
-echo " Building ${APP_NAME} Release Binary"
+echo " 1. Building ${APP_NAME} Release Binary"
 echo "=================================================="
 
 cd "${SRC_DIR}"
 swift build -c release
 
 echo "=================================================="
-echo " Creating Application Bundle (.app)"
+echo " 2. Creating Application Bundle (.app)"
 echo "=================================================="
 
 APP_BUNDLE="${DMG_STAGING}/${APP_NAME}.app"
@@ -69,31 +70,26 @@ if [ -f "${SRC_DIR}/Resources/MenuBarIcon.png" ]; then
     cp "${SRC_DIR}/Resources/MenuBarIcon.png" "${APP_BUNDLE}/Contents/Resources/MenuBarIcon.png"
 fi
 
-# Clear quarantine on binary
 xattr -cr "${APP_BUNDLE}"
 
 echo "=================================================="
-echo " Preparing Disk Image Layout & /Applications Link"
+echo " 3. Generating High-Res DMG Background Image"
 echo "=================================================="
 
-# Create Applications shortcut inside DMG
-ln -s /Applications "${DMG_STAGING}/Applications"
+swift "${REPO_ROOT}/generate_dmg_background.swift" "${BG_IMAGE}"
 
 echo "=================================================="
-echo " Generating Compressed .dmg File"
+echo " 4. Creating Professional DMG with dmgbuild"
 echo "=================================================="
 
 rm -f "${FINAL_DMG}"
 
-hdiutil create \
-    -volname "Project Nobel" \
-    -srcfolder "${DMG_STAGING}" \
-    -ov \
-    -format UDZO \
-    "${FINAL_DMG}"
+cd "${REPO_ROOT}"
+python3 -m dmgbuild -s "${REPO_ROOT}/dmgbuild_settings.py" "Project Nobel" "${FINAL_DMG}"
 
-# Cleanup staging directory
+# Cleanup staging and generated background
 rm -rf "${DMG_STAGING}"
+rm -f "${BG_IMAGE}"
 
 echo "=================================================="
 echo " DMG Successfully Created!"
