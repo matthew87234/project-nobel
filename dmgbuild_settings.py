@@ -26,13 +26,13 @@ show_pathbar = False
 show_sidebar = False
 sidebar_width = 0
 
-window_rect = ((200, 120), (660, 400))
+window_rect = ((200, 120), (600, 380))
 default_view = 'icon-view'
 
-icon_size = 120
-text_size = 13
+icon_size = 110
+text_size = 12
 
 icon_locations = {
-    'Project Nobel.app': (160, 200),
-    'Applications': (500, 200)
+    'Project Nobel.app': (150, 185),
+    'Applications': (450, 185)
 }
