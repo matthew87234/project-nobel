@@ -6,6 +6,7 @@ struct PrimerSectionItem: Identifiable {
     let content: String
 }
 
+@MainActor
 struct PreLectureView: View {
     let activeModuleId: Int?
     

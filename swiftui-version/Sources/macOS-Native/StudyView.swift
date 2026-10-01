@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 
+@MainActor
 struct StudyView: View {
     let activeModuleId: Int?
     
