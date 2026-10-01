@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct FeynmanManagerView: View {
     @Binding var isPresented: Bool
     
@@ -150,6 +151,7 @@ struct FeynmanManagerView: View {
     }
 }
 
+@MainActor
 struct FeynmanSessionEditView: View {
     @Binding var isPresented: Bool
     let session: FeynmanSession

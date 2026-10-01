@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 
+@MainActor
 struct ModulesView: View {
     let activeModuleId: Int?
     

@@ -77,6 +77,7 @@ struct ExtractedProblem: Identifiable, Hashable {
     var isSelected: Bool = true
 }
 
+@MainActor
 struct ProblemsView: View {
     let activeModuleId: Int?
     var activeYear: Int = 1
@@ -2163,6 +2164,7 @@ final class ProblemURLCollector: @unchecked Sendable {
     }
 }
 
+@MainActor
 struct BatchImporterQueueView: View {
     @Binding var pendingQuestions: [PendingExtractionItem]
     @Binding var pendingAnswers: [PendingExtractionItem]
@@ -2476,6 +2478,7 @@ struct StepRowPracticeView: View {
 
 // MARK: - Problem Metric Chart Popup Views
 
+@MainActor
 struct ProblemDueProjectionChartView: View {
     let moduleId: Int?
     var year: Int? = nil
@@ -2537,6 +2540,7 @@ struct ProblemDueProjectionChartView: View {
     }
 }
 
+@MainActor
 struct ProblemSeverityChartView: View {
     let moduleId: Int?
     var year: Int? = nil
@@ -2595,6 +2599,7 @@ struct ProblemSeverityChartView: View {
     }
 }
 
+@MainActor
 struct ProblemTopicChartView: View {
     let moduleId: Int?
     var year: Int? = nil
@@ -2653,6 +2658,7 @@ struct ProblemTopicChartView: View {
     }
 }
 
+@MainActor
 struct ProblemFlaggedChartView: View {
     let moduleId: Int?
     var year: Int? = nil

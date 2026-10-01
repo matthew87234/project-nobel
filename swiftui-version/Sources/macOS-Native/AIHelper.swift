@@ -141,7 +141,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         return URLSession(configuration: config)
     }()
     
-    static func normalizedOllamaURL(from rawHost: String?, defaultHost: String = "http://localhost:11434") -> URL? {
+    nonisolated static func normalizedOllamaURL(from rawHost: String?, defaultHost: String = "http://localhost:11434") -> URL? {
         let input = (rawHost ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         var host = input.isEmpty ? defaultHost : input
         if !host.lowercased().hasPrefix("http://") && !host.lowercased().hasPrefix("https://") {

@@ -2,6 +2,7 @@ import SwiftUI
 import Charts
 import Combine
 
+@MainActor
 struct DayStudyDetailPopover: View {
     let date: Date
     let breakdown: DatabaseManager.DailyStudyBreakdown?
@@ -121,6 +122,7 @@ struct DayStudyDetailPopover: View {
     }
 }
 
+@MainActor
 struct HeatmapView: View {
     let secondsData: [String: DatabaseManager.DailyStudyBreakdown]
     @State private var selectedDate: Date? = nil
@@ -281,6 +283,7 @@ struct HeatmapView: View {
     }
 }
 
+@MainActor
 struct DashboardView: View {
     let activeYear: Int
 

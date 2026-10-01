@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct ModuleManagerView: View {
     @Binding var isPresented: Bool
     let onRefresh: () -> Void

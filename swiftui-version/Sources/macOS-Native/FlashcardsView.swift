@@ -269,6 +269,7 @@ struct PresetCardView: View {
     }
 }
 
+@MainActor
 struct FlashcardsView: View {
     let activeModuleId: Int?
     var activeYear: Int = 1
@@ -1871,6 +1872,7 @@ struct FlashcardsView: View {
         }
     }
     
+@MainActor
 struct EditFlashcardSheetView: View {
     let card: Flashcard
     let onSave: (String, String) -> Void
@@ -2287,6 +2289,7 @@ struct EditFlashcardSheetView: View {
 
 // MARK: - Flashcard Metric Chart Views
 
+@MainActor
 struct WeeklyAvgTimeChartView: View {
     let moduleId: Int?
     
@@ -2349,6 +2352,7 @@ struct WeeklyAvgTimeChartView: View {
     }
 }
 
+@MainActor
 struct DueProjectionChartView: View {
     let moduleId: Int?
     
@@ -2402,6 +2406,7 @@ struct DueProjectionChartView: View {
     }
 }
 
+@MainActor
 struct EaseDistributionChartView: View {
     let allCards: [Flashcard]
     
@@ -2468,6 +2473,7 @@ struct EaseDistributionChartView: View {
     }
 }
 
+@MainActor
 struct CumulativeCreatedChartView: View {
     let moduleId: Int?
     let allCards: [Flashcard]

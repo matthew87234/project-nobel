@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct PreExamRoutineView: View {
     let activeModule: Module?
     var initialPhase: Int = 1

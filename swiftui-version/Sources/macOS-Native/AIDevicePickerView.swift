@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct AIDevicePickerView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var aiHelper = AIHelper.shared

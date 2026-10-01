@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 
+@MainActor
 struct PostLectureView: View {
     let activeModuleId: Int?
     

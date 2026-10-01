@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct SettingsView: View {
     @State private var selectedTab = "AI Settings"
     
@@ -29,6 +30,7 @@ struct SettingsView: View {
 }
 
 // MARK: - AI Settings Tab
+@MainActor
 struct AISettingsView: View {
     @State private var activeSection: String = "text"
     
@@ -556,6 +558,7 @@ struct AISettingsView: View {
 }
 
 // MARK: - Anki Sync Settings Tab
+@MainActor
 struct AnkiSyncSettingsView: View {
     @ObservedObject private var ankiEngine = AnkiSyncEngine.shared
     
@@ -633,6 +636,7 @@ struct AnkiSyncSettingsView: View {
 }
 
 // MARK: - General Settings Tab
+@MainActor
 struct GeneralSettingsView: View {
     var body: some View {
         VStack(spacing: 25) {
