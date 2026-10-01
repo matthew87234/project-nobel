@@ -1,17 +1,31 @@
 import Foundation
 import PDFKit
 
+struct OllamaOptions: Codable {
+    let temperature: Double?
+    let num_predict: Int?
+    let top_p: Double?
+    
+    init(temperature: Double? = nil, num_predict: Int? = nil, top_p: Double? = nil) {
+        self.temperature = temperature
+        self.num_predict = num_predict
+        self.top_p = top_p
+    }
+}
+
 struct GenerateRequest: Codable {
     let model: String
     let prompt: String
     let stream: Bool
     let images: [String]?
+    let options: OllamaOptions?
     
-    init(model: String, prompt: String, stream: Bool = false, images: [String]? = nil) {
+    init(model: String, prompt: String, stream: Bool = false, images: [String]? = nil, options: OllamaOptions? = nil) {
         self.model = model
         self.prompt = prompt
         self.stream = stream
         self.images = images
+        self.options = options
     }
 }
 
@@ -162,6 +176,50 @@ struct ExtractionGroup: Identifiable, Equatable {
     }
     
     // Global AI Activity Indicator State
+    nonisolated static func optimizeImageForOCR(_ image: NSImage, maxDimension: CGFloat = 800) -> String? {
+        let origSize = image.size
+        guard origSize.width > 0 && origSize.height > 0 else { return nil }
+        
+        let scale = min(1.0, min(maxDimension / origSize.width, maxDimension / origSize.height))
+        let targetSize = NSSize(width: max(1, origSize.width * scale), height: max(1, origSize.height * scale))
+        
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(targetSize.width),
+            pixelsHigh: Int(targetSize.height),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )
+        guard let bitmapRep = rep else { return nil }
+        
+        NSGraphicsContext.saveGraphicsState()
+        guard let context = NSGraphicsContext(bitmapImageRep: bitmapRep) else {
+            NSGraphicsContext.restoreGraphicsState()
+            return nil
+        }
+        NSGraphicsContext.current = context
+        
+        let rect = NSRect(origin: .zero, size: targetSize)
+        NSColor.white.setFill()
+        rect.fill()
+        
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
+        NSGraphicsContext.restoreGraphicsState()
+        
+        if let jpegData = bitmapRep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+            return jpegData.base64EncodedString()
+        }
+        if let pngData = bitmapRep.representation(using: .png, properties: [:]) {
+            return pngData.base64EncodedString()
+        }
+        return nil
+    }
+    
     @Published var isAIBusy: Bool = false
     @Published var currentAITaskDescription: String = ""
     @Published var isCurrentAILocal: Bool = true
@@ -1401,7 +1459,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         guard let baseURL = AIHelper.normalizedOllamaURL(from: targetHost, defaultHost: "http://localhost:11434") else { return [] }
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = provider == "tailscale" ? 6.0 : 4.0
+        request.timeoutInterval = 1.5
         
         do {
             let (data, _) = try await session.data(for: request)
@@ -1473,7 +1531,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") else { return defaultVisionModel }
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = provider == "tailscale" ? 6.0 : 4.0
+        request.timeoutInterval = 1.5
         
         do {
             let (data, _) = try await session.data(for: request)
@@ -1519,7 +1577,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         return regex.firstMatch(in: text, options: [], range: range) != nil
     }
     
-    func callOllama(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval = 300.0, forceLocal: Bool = false) async -> String? {
+    func callOllama(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval = 300.0, forceLocal: Bool = false, options: OllamaOptions? = nil) async -> String? {
         let isWasBusy = self.isAIBusy
         if !isWasBusy {
             startAITask(description: "Processing AI Request...")
@@ -1571,7 +1629,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         
         for attempt in 1...maxRetries {
             self.logToFile("[AI Helper LOG] callOllama (\(effectiveProvider)) attempt \(attempt)/\(maxRetries) for model: \(targetModel)")
-            if let result = await callAPIOnce(prompt: prompt, model: targetModel, images: effectiveImages, timeout: timeout, provider: effectiveProvider) {
+            if let result = await callAPIOnce(prompt: prompt, model: targetModel, images: effectiveImages, timeout: timeout, provider: effectiveProvider, options: options) {
                 if hasRepetitiveGlitch(result) {
                     self.logToFile("[AI Helper LOG] Repetitive glitch detected (attempt \(attempt)/\(maxRetries)): '\(result.prefix(100))...'")
                     continue
@@ -1603,7 +1661,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             if let localBaseURL = AIHelper.normalizedOllamaURL(from: localHost, defaultHost: "http://localhost:11434") {
                 let tagsUrl = localBaseURL.appendingPathComponent("api/tags")
                 var checkReq = URLRequest(url: tagsUrl)
-                checkReq.timeoutInterval = 1.5
+                checkReq.timeoutInterval = 1.0
                 if let (data, resp) = try? await session.data(for: checkReq),
                    let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200,
                    let tags = try? JSONDecoder().decode(TagsResponse.self, from: data),
@@ -1615,7 +1673,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                         fallbackModel = await getOllamaModel(forceLocal: true)
                     }
                     self.logToFile("[AI Helper LOG] Seamlessly falling back to Local Ollama with model '\(fallbackModel)'...")
-                    if let localResult = await callAPIOnce(prompt: prompt, model: fallbackModel, images: effectiveImages, timeout: timeout, provider: "local") {
+                    if let localResult = await callAPIOnce(prompt: prompt, model: fallbackModel, images: effectiveImages, timeout: timeout, provider: "local", options: options) {
                         if !hasRepetitiveGlitch(localResult) {
                             return localResult
                         }
@@ -1641,7 +1699,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         return nil
     }
     
-    private func callAPIOnce(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval, provider: String) async -> String? {
+    private func callAPIOnce(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval, provider: String, options: OllamaOptions? = nil) async -> String? {
         if provider == "local" || provider == "tailscale" {
             let host: String
             if provider == "tailscale" {
@@ -1666,7 +1724,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.timeoutInterval = timeout
             
-            let body = GenerateRequest(model: model, prompt: prompt, stream: false, images: images)
+            let body = GenerateRequest(model: model, prompt: prompt, stream: false, images: images, options: options)
             do {
                 request.httpBody = try JSONEncoder().encode(body)
                 let (data, response) = try await session.data(for: request)
@@ -2267,13 +2325,14 @@ struct ExtractionGroup: Identifiable, Equatable {
             \(rawEquation)
             """
             
-            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            let fastOptions = OllamaOptions(temperature: 0.0, num_predict: 256, top_p: 0.9)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal, options: fastOptions)
             // Bidirectional fallback: if preferred provider failed, try the opposite (Local <-> Remote)
             if res == nil {
                 let fallbackUseLocal = !useLocal
                 self.logToFile("[AI Helper LOG] LaTeX translation failed on preferred provider, trying fallback (forceLocal: \(fallbackUseLocal))...")
                 let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
-                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal, options: fastOptions)
             }
             return cleanLaTeXOutput(res)
         }
@@ -2287,11 +2346,12 @@ struct ExtractionGroup: Identifiable, Equatable {
             Do NOT wrap the equation in any delimiters like $ or $$ or \\[ or \\]. \
             Return ONLY the raw LaTeX code itself. Do NOT include any conversational text, explanations, intro, or outro.
             """
+            let fastOptions = OllamaOptions(temperature: 0.0, num_predict: 256, top_p: 0.9)
             
             // 1. Initial attempt with preferred provider
             var res: String? = nil
             if let visionModel = await getOllamaVisionModel(forceLocal: useLocal) {
-                res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 120.0, forceLocal: useLocal)
+                res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 60.0, forceLocal: useLocal, options: fastOptions)
             }
             
             // 2. Bidirectional fallback (Local <-> Tailscale)
@@ -2299,7 +2359,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                 let fallbackUseLocal = !useLocal
                 self.logToFile("[AI Helper LOG] LaTeX image transcription failed on preferred provider, trying fallback (forceLocal: \(fallbackUseLocal))...")
                 if let fallbackVisionModel = await getOllamaVisionModel(forceLocal: fallbackUseLocal) {
-                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 120.0, forceLocal: fallbackUseLocal)
+                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 60.0, forceLocal: fallbackUseLocal, options: fastOptions)
                 }
             }
             

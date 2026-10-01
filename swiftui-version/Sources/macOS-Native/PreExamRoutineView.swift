@@ -1317,10 +1317,8 @@ struct PreExamRoutineView: View {
     private func pasteClipboardImage() {
         if let image = NSImage(pasteboard: NSPasteboard.general) {
             self.latexClipboardImage = image
-            if let tiff = image.tiffRepresentation,
-               let bitmap = NSBitmapImageRep(data: tiff),
-               let pngData = bitmap.representation(using: .png, properties: [:]) {
-                self.latexImageBase64 = pngData.base64EncodedString()
+            if let optimized = AIHelper.optimizeImageForOCR(image) {
+                self.latexImageBase64 = optimized
                 translateImageToLatex()
             }
         }
