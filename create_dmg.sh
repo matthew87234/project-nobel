@@ -10,8 +10,12 @@ DMG_OUTPUT_NAME="Project-Nobel-Installer.dmg"
 FINAL_DMG="${REPO_ROOT}/${DMG_OUTPUT_NAME}"
 BG_IMAGE="${REPO_ROOT}/dmg_background.png"
 
-if [ -z "$SDKROOT" ] && [ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]; then
-    export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+if [ -z "$SDKROOT" ]; then
+    if [ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]; then
+        export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+    elif command -v xcrun >/dev/null 2>&1; then
+        export SDKROOT="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+    fi
 fi
 
 echo "=================================================="
