@@ -10,6 +10,10 @@ DMG_OUTPUT_NAME="Project-Nobel-Installer.dmg"
 FINAL_DMG="${REPO_ROOT}/${DMG_OUTPUT_NAME}"
 BG_IMAGE="${REPO_ROOT}/dmg_background.png"
 
+if [ -z "$SDKROOT" ] && [ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]; then
+    export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+fi
+
 echo "=================================================="
 echo " 1. Building ${APP_NAME} Release Binary"
 echo "=================================================="

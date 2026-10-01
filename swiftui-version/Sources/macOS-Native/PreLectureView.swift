@@ -64,10 +64,30 @@ struct PreLectureView: View {
                                 .background(Color(NSColor.controlBackgroundColor))
                                 .cornerRadius(12)
                         } else if parsedSections.isEmpty {
-                            VStack {
+                            VStack(spacing: 12) {
                                 Spacer().frame(height: 50)
-                                Text("No primer generated. Ensure note has summary and try again.")
+                                Image(systemName: AIHelper.shared.isAIDisconnected ? "wifi.slash" : "lightbulb")
+                                    .font(.system(size: 32))
                                     .foregroundColor(.secondary)
+                                Text(AIHelper.shared.isAIDisconnected ? (AIHelper.shared.disconnectionMessage.isEmpty ? "Tailscale Disconnected" : AIHelper.shared.disconnectionMessage) : "No primer generated yet.")
+                                    .font(.headline)
+                                    .foregroundColor(.secondary)
+                                Text(AIHelper.shared.isAIDisconnected ? "Unable to reach AI server to generate primer." : "Ensure note has summary and try generating again.")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                
+                                Button(action: {
+                                    loadPrimer(for: selectedNote)
+                                }) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "arrow.clockwise")
+                                        Text("Retry AI Primer")
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.blue)
+                                .controlSize(.small)
+                                .pointingHandCursor()
                             }
                             .frame(maxWidth: .infinity, alignment: .center)
                         } else {

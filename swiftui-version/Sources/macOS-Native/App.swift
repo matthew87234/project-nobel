@@ -89,12 +89,14 @@ struct PhysicsStudyApp: App {
             }
         }
         
-        // Ensure local model defaults are persisted (@AppStorage only writes when the Settings view is rendered)
         if UserDefaults.standard.string(forKey: "local_model_vision") == nil {
             UserDefaults.standard.set("qwen2.5vl:7b", forKey: "local_model_vision")
         }
         if UserDefaults.standard.string(forKey: "local_model_general") == nil {
             UserDefaults.standard.set("qwen2.5-coder:7b", forKey: "local_model_general")
+        }
+        if UserDefaults.standard.object(forKey: "background_ai_enabled") == nil {
+            UserDefaults.standard.set(true, forKey: "background_ai_enabled")
         }
         
         // Only launch Ollama serve if using local provider.
@@ -106,42 +108,48 @@ struct PhysicsStudyApp: App {
     
     var body: some Scene {
         WindowGroup {
-            NavigationSplitView {
-                // Sidebar
-                VStack(alignment: .leading, spacing: 10) {
-                    Button(action: {
-                        sidebarSelection = "Dashboard"
-                    }) {
-                        Text("Project Nobel")
-                            .font(.system(size: 20, weight: .bold))
-                            .foregroundColor(.primary)
-                    }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                    .padding(.horizontal)
-                    .padding(.top, 20)
-                    
-                    // Sidebar Navigation Links
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 14) {
-                            sidebarListContent
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.top, 4)
-                    }
-                    .id(isExamMode)
-                    
-                    preExamSidebarControls
-                    
-                    aiStatusView
+            VStack(spacing: 0) {
+                if DatabaseManager.isDesktopApp {
+                    testProgramBanner
                 }
-                .frame(minWidth: 220)
-                .background(.ultraThinMaterial)
-            } detail: {
-                // Detail Pane
-                detailView
+                
+                NavigationSplitView {
+                    // Sidebar
+                    VStack(alignment: .leading, spacing: 10) {
+                        Button(action: {
+                            sidebarSelection = "Dashboard"
+                        }) {
+                            Text("Project Nobel")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundColor(.primary)
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .padding(.horizontal)
+                        .padding(.top, 20)
+                        
+                        // Sidebar Navigation Links
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 14) {
+                                sidebarListContent
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.top, 4)
+                        }
+                        .id(isExamMode)
+                        
+                        preExamSidebarControls
+                        
+                        aiStatusView
+                    }
+                    .frame(minWidth: 220)
+                    .background(.ultraThinMaterial)
+                } detail: {
+                    // Detail Pane
+                    detailView
+                }
+                .navigationSplitViewStyle(.balanced)
             }
-            .navigationSplitViewStyle(.balanced)
             .toolbarBackground(.visible, for: .windowToolbar)
             .toolbar {
                 ToolbarItem(placement: .navigation) {
@@ -215,8 +223,16 @@ struct PhysicsStudyApp: App {
                         }
                     )
             }
+            .sheet(isPresented: $aiHelper.showTailscaleSetupModal) {
+                AIDevicePickerView()
+            }
             .onAppear {
                 restoreSettings()
+                let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+                let tailHost = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
+                if provider == "tailscale" && tailHost.isEmpty {
+                    aiHelper.showTailscaleSetupModal = true
+                }
             }
             .onChange(of: activeYear) { oldValue, newValue in
                 Task {
@@ -547,6 +563,41 @@ struct PhysicsStudyApp: App {
     }
     
     @ViewBuilder
+    private var testProgramBanner: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Color.orange)
+                .frame(width: 7, height: 7)
+            
+            Text("TEST PROGRAM")
+                .font(.system(size: 11, weight: .black, design: .monospaced))
+                .foregroundColor(.orange)
+            
+            Text("•")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(.secondary.opacity(0.6))
+            
+            Text("Desktop Sandbox Environment (physics_study_desktop.db)")
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundColor(.secondary)
+            
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .background(
+            Color(NSColor.windowBackgroundColor)
+                .overlay(Color.orange.opacity(0.08))
+        )
+        .overlay(
+            Rectangle()
+                .frame(height: 1)
+                .foregroundColor(Color.orange.opacity(0.25)),
+            alignment: .bottom
+        )
+    }
+    
+    @ViewBuilder
     private var aiStatusView: some View {
         if aiHelper.isAIDisconnected {
             VStack(alignment: .leading, spacing: 6) {
@@ -572,10 +623,15 @@ struct PhysicsStudyApp: App {
                     Button(action: {
                         aiHelper.retryConnectionAndQueue()
                     }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 9, weight: .bold))
-                            Text("Try Again")
+                        HStack(spacing: 4) {
+                            if aiHelper.isRetryingConnection {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 9, weight: .bold))
+                            }
+                            Text(aiHelper.isRetryingConnection ? "Checking..." : "Try Again")
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
                         }
                         .padding(.horizontal, 7)
@@ -585,6 +641,7 @@ struct PhysicsStudyApp: App {
                         .cornerRadius(5)
                     }
                     .buttonStyle(.plain)
+                    .disabled(aiHelper.isRetryingConnection)
                     .help("Check AI server connection and resume processing")
                 }
             }

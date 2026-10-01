@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 struct RatioTrackerBar: View {
     var isExamMode: Bool = false

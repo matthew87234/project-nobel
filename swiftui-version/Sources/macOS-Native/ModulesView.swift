@@ -96,6 +96,9 @@ struct ModulesView: View {
         .onAppear {
             loadNotes()
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("NoteAnalysisCompleted"))) { _ in
+            loadNotes()
+        }
     }
     
     private func noteItemRow(_ note: Note) -> some View {

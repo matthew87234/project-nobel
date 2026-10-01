@@ -1185,7 +1185,7 @@ struct PreExamRoutineView: View {
                         .font(.title2)
                         .bold()
                     
-                    Text("Paste an image from your clipboard (e.g. screenshot of a formula or notes) or describe an equation in plain text, and local AI (Qwen) will convert it into raw LaTeX code.")
+                    Text("Paste an image from your clipboard (e.g. screenshot of a formula or notes) or describe an equation in plain text, and AI will convert it into clean LaTeX code.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                     
@@ -1251,7 +1251,7 @@ struct PreExamRoutineView: View {
                         if isTranslatingLaTeX {
                             HStack {
                                 ProgressView().controlSize(.small)
-                                Text("Translating equation via local AI...")
+                                Text("Translating equation via AI...")
                                     .foregroundColor(.secondary)
                             }
                         } else {
@@ -1264,7 +1264,7 @@ struct PreExamRoutineView: View {
                     }
                     
                     // Result Preview
-                    if !latexResult.isEmpty {
+                    if !latexResult.isEmpty && !latexResult.hasPrefix("Error:") && !latexResult.hasPrefix("No vision model") {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Live Math Preview:")
                                 .font(.caption)
@@ -1297,7 +1297,7 @@ struct PreExamRoutineView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
-                .disabled(latexResult.isEmpty)
+                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
             }
         }
         .padding(20)
@@ -1327,6 +1327,7 @@ struct PreExamRoutineView: View {
     
     private func translateTextToLatex() {
         self.isTranslatingLaTeX = true
+        self.latexResult = ""
         Task {
             let res = await AIHelper.shared.translateToLaTeX(rawEquation: latexInput)
             DispatchQueue.main.async {
@@ -1334,6 +1335,8 @@ struct PreExamRoutineView: View {
                 if let latex = res {
                     let wrapped = self.wrapInLaTeXDelimiters(latex)
                     self.latexResult = wrapped
+                } else {
+                    self.latexResult = "Error: Could not translate equation. Verify that your AI host (Local or Tailscale) is connected."
                 }
             }
         }
@@ -1341,17 +1344,20 @@ struct PreExamRoutineView: View {
     
     private func translateImageToLatex() {
         self.isTranslatingLaTeX = true
+        self.latexResult = ""
         Task {
             let res = await AIHelper.shared.translateImageToLaTeX(base64Image: latexImageBase64)
             DispatchQueue.main.async {
                 self.isTranslatingLaTeX = false
                 if let latex = res {
                     if latex == "MODEL_NOT_FOUND" {
-                        self.latexResult = "No local vision model found. Please pull qwen2.5vl."
+                        self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
                     } else {
                         let wrapped = self.wrapInLaTeXDelimiters(latex)
                         self.latexResult = wrapped
                     }
+                } else {
+                    self.latexResult = "Error: Could not transcribe equation image. Verify that your AI host (Local or Tailscale) is connected."
                 }
             }
         }

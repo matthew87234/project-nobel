@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 struct StudyView: View {
     let activeModuleId: Int?
@@ -105,8 +106,41 @@ struct StudyView: View {
                                             displayNoteDetails(selectedNote)
                                         }) {
                                             HStack(spacing: 6) {
-                                                Image(systemName: "arrow.clockwise")
-                                                Text("Try Again")
+                                                if AIHelper.shared.isRetryingConnection {
+                                                    ProgressView()
+                                                        .controlSize(.mini)
+                                                } else {
+                                                    Image(systemName: "arrow.clockwise")
+                                                }
+                                                Text(AIHelper.shared.isRetryingConnection ? "Checking..." : "Try Again")
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .tint(.blue)
+                                        .controlSize(.small)
+                                        .disabled(AIHelper.shared.isRetryingConnection)
+                                        .pointingHandCursor()
+                                    }
+                                    .padding(.vertical, 4)
+                                } else if isAnalyzing {
+                                    HStack {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("Generating AI Summary...")
+                                            .foregroundColor(.secondary)
+                                    }
+                                } else if summaryText.isEmpty {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("No AI summary generated yet.")
+                                            .font(.subheadline)
+                                            .foregroundColor(.secondary)
+                                        
+                                        Button(action: {
+                                            regenerateSummary()
+                                        }) {
+                                            HStack(spacing: 6) {
+                                                Image(systemName: "sparkles")
+                                                Text("Generate AI Summary")
                                             }
                                         }
                                         .buttonStyle(.borderedProminent)
@@ -115,13 +149,6 @@ struct StudyView: View {
                                         .pointingHandCursor()
                                     }
                                     .padding(.vertical, 4)
-                                } else if isAnalyzing || summaryText.isEmpty {
-                                    HStack {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                        Text("Generating AI Summary...")
-                                            .foregroundColor(.secondary)
-                                    }
                                 } else {
                                     CondensedSummaryView(summaryText: summaryText)
                                 }
@@ -182,6 +209,18 @@ struct StudyView: View {
         .onReceive(timer) { _ in
             checkBackgroundProcessComplete()
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("NoteAnalysisCompleted"))) { notification in
+            if let modId = activeModuleId {
+                self.notes = DatabaseManager.shared.getNotes(forModuleId: modId)
+            }
+            if let noteId = notification.userInfo?["noteId"] as? Int, noteId == selectedNote?.id {
+                if let updated = DatabaseManager.shared.getNote(id: noteId) {
+                    self.selectedNote = updated
+                    self.summaryText = updated.aiSummary ?? ""
+                    self.isAnalyzing = false
+                }
+            }
+        }
     }
     
     private func loadNotes() {
@@ -219,17 +258,6 @@ struct StudyView: View {
             // Trigger async analysis if Ollama is running and not already queued
             Task {
                 await AIHelper.shared.ensureNoteSummarized(noteId: targetId)
-                // Reload note data
-                if let updated = DatabaseManager.shared.getNote(id: targetId) {
-                    DispatchQueue.main.async {
-                        if self.selectedNote?.id == targetId {
-                            self.notes = DatabaseManager.shared.getNotes(forModuleId: self.activeModuleId ?? 0)
-                            self.selectedNote = updated
-                            self.summaryText = updated.aiSummary ?? ""
-                            self.isAnalyzing = false
-                        }
-                    }
-                }
             }
         }
     }
@@ -273,17 +301,9 @@ struct StudyView: View {
         self.summaryText = ""
         self.isAnalyzing = true
         
-        // Trigger background AI task and show spinner until 100% finished
+        // Trigger background AI task
         Task {
             await AIHelper.shared.processNoteSync(noteId: targetId)
-            DispatchQueue.main.async {
-                if self.selectedNote?.id == targetId {
-                    if let freshNote = DatabaseManager.shared.getNote(id: targetId), let freshSummary = freshNote.aiSummary, !freshSummary.isEmpty {
-                        self.summaryText = freshSummary
-                    }
-                    self.isAnalyzing = false
-                }
-            }
         }
     }
     

@@ -30,6 +30,19 @@ struct TagsResponse: Codable {
     }
     let models: [ModelInfo]
 }
+
+struct DiscoveredAIHost: Identifiable, Hashable {
+    var id: String { hostURL }
+    let name: String
+    let ip: String
+    let port: Int
+    let hostURL: String
+    let models: [String]
+    let generalModels: [String]
+    let visionModels: [String]
+    let isOnline: Bool
+    let responseTimeMs: Int
+}
 struct PendingExtractionItem: Identifiable, Equatable {
     let id: UUID
     enum ItemType {
@@ -81,19 +94,22 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     var latexAlwaysLocal: Bool {
         if UserDefaults.standard.object(forKey: "latex_always_local") == nil {
-            return true
+            return false
         }
         return UserDefaults.standard.bool(forKey: "latex_always_local")
     }
     
     var feynmanAlwaysLocal: Bool {
         if UserDefaults.standard.object(forKey: "feynman_always_local") == nil {
-            return true
+            return false
         }
         return UserDefaults.standard.bool(forKey: "feynman_always_local")
     }
     
     var isBackgroundAIEnabled: Bool {
+        if UserDefaults.standard.object(forKey: "background_ai_enabled") == nil {
+            return true
+        }
         return UserDefaults.standard.bool(forKey: "background_ai_enabled")
     }
     
@@ -119,15 +135,30 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 600.0
-        config.timeoutIntervalForResource = 1200.0
-        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = 60.0
+        config.timeoutIntervalForResource = 120.0
+        config.waitsForConnectivity = false
         return URLSession(configuration: config)
     }()
+    
+    static func normalizedOllamaURL(from rawHost: String?, defaultHost: String = "http://localhost:11434") -> URL? {
+        let input = (rawHost ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var host = input.isEmpty ? defaultHost : input
+        if !host.lowercased().hasPrefix("http://") && !host.lowercased().hasPrefix("https://") {
+            host = "http://" + host
+        }
+        while host.hasSuffix("/") {
+            host.removeLast()
+        }
+        if let url = URL(string: host), url.port == nil && !host.contains(":") {
+            host = "\(host):11434"
+        }
+        return URL(string: host)
+    }
+    
     private var baseURL: URL {
         let host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
-        let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        return URL(string: cleanHost) ?? URL(string: "http://localhost:11434")!
+        return AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") ?? URL(string: "http://localhost:11434")!
     }
     
     // Global AI Activity Indicator State
@@ -142,30 +173,36 @@ struct ExtractionGroup: Identifiable, Equatable {
     // Disconnection & Error State
     @Published var isAIDisconnected: Bool = false
     @Published var disconnectionMessage: String = ""
+    @Published var isRetryingConnection: Bool = false
+    
+    // Tailscale Network Discovery State
+    @Published var discoveredHosts: [DiscoveredAIHost] = []
+    @Published var isScanningTailscale: Bool = false
+    @Published var showTailscaleSetupModal: Bool = false
     
     func isProcessingNote(id: Int) -> Bool {
         return activeProcessingNoteIds.contains(id)
     }
     
     func retryConnectionAndQueue() {
+        guard !isRetryingConnection else { return }
         Task { @MainActor in
-            self.isAIDisconnected = false
-            self.disconnectionMessage = ""
-            self.isAIBusy = true
-            self.startAITask(description: "Retrying AI connection...")
+            self.isRetryingConnection = true
         }
         Task {
             let isOnline = await self.isOllamaRunning()
             await MainActor.run {
+                self.isRetryingConnection = false
                 if isOnline {
                     self.isAIDisconnected = false
                     self.disconnectionMessage = ""
-                    self.finishAITask()
+                    self.finishAITask(force: true)
                 } else {
                     let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
                     self.isAIDisconnected = true
                     self.disconnectionMessage = provider == "tailscale" ? "Tailscale Disconnected" : "AI Server Disconnected"
                     self.isAIBusy = false
+                    self.isProcessing = false
                     self.activeProcessingNoteIds.removeAll()
                 }
             }
@@ -176,6 +213,8 @@ struct ExtractionGroup: Identifiable, Equatable {
         let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
         if provider == "cloud" {
             return UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud"
+        } else if provider == "tailscale" {
+            return UserDefaults.standard.string(forKey: "tailscale_model_general") ?? "qwen2.5-coder:14b"
         } else {
             return UserDefaults.standard.string(forKey: "local_model_general") ?? "qwen2.5-coder:14b"
         }
@@ -1192,29 +1231,184 @@ struct ExtractionGroup: Identifiable, Equatable {
         return false
     }
     
+    // MARK: - Tailscale & Network Discovery
+    
+    func scanTailscaleNetwork() async -> [DiscoveredAIHost] {
+        await MainActor.run {
+            self.isScanningTailscale = true
+        }
+        defer {
+            Task { @MainActor in
+                self.isScanningTailscale = false
+            }
+        }
+        
+        var candidateTargets: [(name: String, ipOrHost: String, port: Int)] = []
+        
+        // 1. Current configured host
+        let currentTailHost = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
+        if !currentTailHost.isEmpty, let url = URL(string: currentTailHost), let host = url.host {
+            candidateTargets.append((name: "Current Host", ipOrHost: host, port: url.port ?? 11434))
+        }
+        
+        // 2. Discover peers from Tailscale CLI / status
+        let cliPeers = await discoverTailscalePeersFromCLI()
+        for peer in cliPeers {
+            if !candidateTargets.contains(where: { $0.ipOrHost == peer.ip }) {
+                candidateTargets.append((name: peer.name, ipOrHost: peer.ip, port: 11434))
+            }
+        }
+        
+        // 3. Local machine option
+        if !candidateTargets.contains(where: { $0.ipOrHost == "127.0.0.1" || $0.ipOrHost == "localhost" }) {
+            candidateTargets.append((name: "Local Machine", ipOrHost: "127.0.0.1", port: 11434))
+        }
+        
+        // 4. Concurrently probe each candidate
+        var discovered: [DiscoveredAIHost] = []
+        await withTaskGroup(of: DiscoveredAIHost?.self) { group in
+            for target in candidateTargets {
+                group.addTask {
+                    await self.probeHost(name: target.name, ipOrHost: target.ipOrHost, port: target.port)
+                }
+            }
+            
+            for await result in group {
+                if let host = result {
+                    discovered.append(host)
+                }
+            }
+        }
+        
+        let sorted = discovered.sorted { a, b in
+            if a.isOnline != b.isOnline { return a.isOnline && !b.isOnline }
+            return a.responseTimeMs < b.responseTimeMs
+        }
+        
+        await MainActor.run {
+            self.discoveredHosts = sorted
+        }
+        
+        return sorted
+    }
+    
+    func probeHost(name: String, ipOrHost: String, port: Int = 11434) async -> DiscoveredAIHost? {
+        let scheme = ipOrHost.hasPrefix("http://") || ipOrHost.hasPrefix("https://") ? "" : "http://"
+        let hostURLString = "\(scheme)\(ipOrHost):\(port)"
+        guard let baseURL = URL(string: hostURLString) else { return nil }
+        let tagsURL = baseURL.appendingPathComponent("api/tags")
+        
+        var request = URLRequest(url: tagsURL)
+        request.timeoutInterval = 2.0
+        
+        let start = Date()
+        do {
+            let (data, response) = try await session.data(for: request)
+            let duration = Int(Date().timeIntervalSince(start) * 1000)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            guard let tags = try? JSONDecoder().decode(TagsResponse.self, from: data) else { return nil }
+            
+            let allModels = tags.models.map { $0.name }
+            let visionKeywords = ["vl", "vision", "llava", "minicpm", "moondream"]
+            let visionModels = allModels.filter { name in
+                let lower = name.lowercased()
+                return visionKeywords.contains { lower.contains($0) }
+            }
+            let generalModels = allModels.filter { name in
+                let lower = name.lowercased()
+                return !visionKeywords.contains { lower.contains($0) }
+            }
+            
+            let displayName = (name.isEmpty || name == "Current Host") ? ipOrHost : name
+            return DiscoveredAIHost(
+                name: displayName,
+                ip: ipOrHost,
+                port: port,
+                hostURL: hostURLString,
+                models: allModels,
+                generalModels: generalModels,
+                visionModels: visionModels,
+                isOnline: true,
+                responseTimeMs: duration
+            )
+        } catch {
+            return nil
+        }
+    }
+    
+    private func discoverTailscalePeersFromCLI() async -> [(name: String, ip: String)] {
+        let possiblePaths = [
+            "/usr/local/bin/tailscale",
+            "/opt/homebrew/bin/tailscale",
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+            "/usr/bin/tailscale"
+        ]
+        
+        var peers: [(name: String, ip: String)] = []
+        
+        for path in possiblePaths {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = ["status", "--json"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = Pipe()
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let selfObj = json["Self"] as? [String: Any],
+                       let hostName = selfObj["HostName"] as? String,
+                       let ips = selfObj["TailscaleIPs"] as? [String],
+                       let v4 = ips.first(where: { $0.contains(".") }) {
+                        peers.append((name: "\(hostName) (This Device)", ip: v4))
+                    }
+                    
+                    if let peerDict = json["Peer"] as? [String: [String: Any]] {
+                        for (_, info) in peerDict {
+                            let hostName = (info["HostName"] as? String) ?? "Tailscale Peer"
+                            if let ips = info["TailscaleIPs"] as? [String],
+                               let v4 = ips.first(where: { $0.contains(".") }) {
+                                peers.append((name: hostName, ip: v4))
+                            }
+                        }
+                    }
+                }
+                if !peers.isEmpty { break }
+            } catch {
+                continue
+            }
+        }
+        
+        return peers
+    }
+
     // MARK: - API communication helpers
     
-    func fetchAvailableOllamaModels(host: String? = nil) async -> [String] {
-        let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+    func fetchAvailableOllamaModels(host: String? = nil, forceLocal: Bool = false) async -> [String] {
+        let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
         let targetHost: String
         if let h = host, !h.isEmpty {
             targetHost = h
         } else {
-            targetHost = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.100.100.100:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
+            targetHost = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
         }
         
-        let cleanHost = targetHost.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        guard let baseURL = URL(string: cleanHost) else { return [] }
+        guard !targetHost.isEmpty else { return [] }
+        guard let baseURL = AIHelper.normalizedOllamaURL(from: targetHost, defaultHost: "http://localhost:11434") else { return [] }
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = 3.0
+        request.timeoutInterval = provider == "tailscale" ? 6.0 : 4.0
         
         do {
             let (data, _) = try await session.data(for: request)
             let tags = try JSONDecoder().decode(TagsResponse.self, from: data)
             return tags.models.map { $0.name }.sorted()
         } catch {
-            print("[AI Helper] Could not fetch available models from \(cleanHost): \(error)")
+            print("[AI Helper] Could not fetch available models from \(url.absoluteString): \(error)")
             return []
         }
     }
@@ -1231,7 +1425,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         let preferred = UserDefaults.standard.string(forKey: preferredKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         
         // Dynamically fetch installed models from Ollama server
-        let installed = await fetchAvailableOllamaModels()
+        let installed = await fetchAvailableOllamaModels(forceLocal: forceLocal)
         if !installed.isEmpty {
             // 1. If preferred model is in installed models list, return it
             if !preferred.isEmpty && installed.contains(preferred) {
@@ -1249,28 +1443,37 @@ struct ExtractionGroup: Identifiable, Equatable {
             return installed.first!
         }
         
-        return preferred.isEmpty ? "qwen2.5-coder:14b" : preferred
+        return preferred.isEmpty ? (provider == "tailscale" ? "qwen2.5-coder:14b" : "qwen2.5-coder:7b") : preferred
     }
     
     func getOllamaVisionModel(forceLocal: Bool = false) async -> String? {
-        let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "vision_provider") ?? "local")
+        let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "vision_provider") ?? (UserDefaults.standard.string(forKey: "ai_provider") ?? "local"))
         if provider == "tailscale" {
-            if let preferred = UserDefaults.standard.string(forKey: "vision_tailscale_model"), !preferred.isEmpty {
+            let preferred = UserDefaults.standard.string(forKey: "vision_tailscale_model")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !preferred.isEmpty {
                 return preferred
             }
         } else {
-            if let preferred = UserDefaults.standard.string(forKey: "local_model_vision"), !preferred.isEmpty {
+            let preferred = UserDefaults.standard.string(forKey: "local_model_vision")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !preferred.isEmpty {
                 return preferred
             }
         }
         
         let defaultVisionModel = "qwen2.5vl:7b"
-        let host = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "vision_tailscale_host") ?? "http://100.100.100.100:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
-        let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        guard let baseURL = URL(string: cleanHost) else { return defaultVisionModel }
+        let host: String
+        if provider == "tailscale" {
+            let vHost = UserDefaults.standard.string(forKey: "vision_tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let tHost = UserDefaults.standard.string(forKey: "tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            host = !vHost.isEmpty ? vHost : tHost
+        } else {
+            host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
+        }
+        
+        guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") else { return defaultVisionModel }
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = 2.0
+        request.timeoutInterval = provider == "tailscale" ? 6.0 : 4.0
         
         do {
             let (data, _) = try await session.data(for: request)
@@ -1373,10 +1576,39 @@ struct ExtractionGroup: Identifiable, Equatable {
                     self.logToFile("[AI Helper LOG] Repetitive glitch detected (attempt \(attempt)/\(maxRetries)): '\(result.prefix(100))...'")
                     continue
                 }
+                await MainActor.run {
+                    if self.isAIDisconnected {
+                        self.isAIDisconnected = false
+                        self.disconnectionMessage = ""
+                    }
+                }
                 return result
             } else {
                 self.logToFile("[AI Helper LOG] callAPIOnce returned nil (attempt \(attempt)/\(maxRetries))")
+                if attempt < maxRetries {
+                    let online = await self.isOllamaRunning()
+                    if !online {
+                        self.logToFile("[AI Helper LOG] AI host unreachable on attempt \(attempt), stopping retries.")
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
             }
+        }
+        
+        await MainActor.run {
+            self.isAIDisconnected = true
+            if effectiveProvider == "tailscale" {
+                self.disconnectionMessage = "Tailscale Disconnected"
+            } else if effectiveProvider == "local" {
+                self.disconnectionMessage = "Ollama Server Offline"
+            } else {
+                self.disconnectionMessage = "AI Server Disconnected"
+            }
+            self.isAIBusy = false
+            self.isProcessing = false
+            self.activeProcessingNoteIds.removeAll()
+            self.finishAITask(force: true)
         }
         return nil
     }
@@ -1386,15 +1618,20 @@ struct ExtractionGroup: Identifiable, Equatable {
             let host: String
             if provider == "tailscale" {
                 if images != nil {
-                    host = UserDefaults.standard.string(forKey: "vision_tailscale_host") ?? "http://100.100.100.100:11434"
+                    let vHost = UserDefaults.standard.string(forKey: "vision_tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let tHost = UserDefaults.standard.string(forKey: "tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    host = !vHost.isEmpty ? vHost : tHost
                 } else {
-                    host = UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.100.100.100:11434"
+                    host = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
                 }
             } else {
                 host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
             }
-            let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-            guard let url = URL(string: "\(cleanHost)/api/generate") else { return nil }
+            guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") else {
+                self.logToFile("[AI Helper LOG] No valid host configured for \(provider).")
+                return nil
+            }
+            let url = baseURL.appendingPathComponent("api/generate")
             
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
@@ -1404,28 +1641,16 @@ struct ExtractionGroup: Identifiable, Equatable {
             let body = GenerateRequest(model: model, prompt: prompt, stream: false, images: images)
             do {
                 request.httpBody = try JSONEncoder().encode(body)
-                let (data, _) = try await session.data(for: request)
+                let (data, response) = try await session.data(for: request)
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+                    let errBody = String(data: data, encoding: .utf8) ?? ""
+                    self.logToFile("[AI Helper LOG] HTTP \(httpResponse.statusCode) from \(provider) Ollama (\(url.absoluteString)): \(errBody)")
+                    return nil
+                }
                 let responseObj = try JSONDecoder().decode(GenerateResponse.self, from: data)
                 return responseObj.response.trimmingCharacters(in: .whitespacesAndNewlines)
             } catch {
-                self.logToFile("[AI Helper LOG] Error communicating with \(provider) Ollama: \(error)")
-                let urlError = error as? URLError
-                let isTemporaryTimeout = (urlError?.code == .timedOut || urlError?.code == .cancelled || urlError?.code == .networkConnectionLost)
-                
-                if !isTemporaryTimeout {
-                    await MainActor.run {
-                        self.isAIDisconnected = true
-                        if provider == "tailscale" {
-                            self.disconnectionMessage = "Tailscale Disconnected"
-                        } else {
-                            self.disconnectionMessage = "Ollama Server Offline"
-                        }
-                        self.isAIBusy = false
-                        self.activeProcessingNoteIds.removeAll()
-                    }
-                } else {
-                    self.logToFile("[AI Helper LOG] Request timed out or network blip (\(error.localizedDescription)). Server remains active for retries.")
-                }
+                self.logToFile("[AI Helper LOG] Error communicating with \(provider) Ollama (\(url.absoluteString)): \(error.localizedDescription)")
                 return nil
             }
         } else {
@@ -1519,9 +1744,8 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     func pullOllamaModel(modelName: String) async -> Bool {
         let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
-        let host = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.100.100.100:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
-        let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        guard let bURL = URL(string: cleanHost) else { return false }
+        let host = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.64.0.4:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
+        guard let bURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: provider == "tailscale" ? "http://100.64.0.4:11434" : "http://localhost:11434") else { return false }
         let url = bURL.appendingPathComponent("api/pull")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1794,19 +2018,35 @@ struct ExtractionGroup: Identifiable, Equatable {
         """
         
         if let res = await callOllama(prompt: prompt, model: model) {
-            var cleaned = res.trimmingCharacters(in: .whitespacesAndNewlines)
+            var cleaned = res.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
+                             .trimmingCharacters(in: .whitespacesAndNewlines)
+            let lines = cleaned.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            if let first = lines.first {
+                cleaned = first
+            }
             cleaned = cleaned.replacingOccurrences(of: "\"", with: "")
-            cleaned = cleaned.replacingOccurrences(of: "'", with: "'")
+            cleaned = cleaned.replacingOccurrences(of: "'", with: "")
+            cleaned = cleaned.replacingOccurrences(of: "*", with: "")
+            cleaned = cleaned.replacingOccurrences(of: "#", with: "")
             if cleaned.lowercased().hasPrefix("title:") {
                 cleaned = String(cleaned.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
             }
             if cleaned.hasPrefix("- ") || cleaned.hasPrefix("• ") {
                 cleaned = String(cleaned.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            if !cleaned.isEmpty && cleaned.count <= 50 {
+            if !cleaned.isEmpty {
+                if cleaned.count > 50 {
+                    cleaned = String(cleaned.prefix(50))
+                }
                 _ = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: cleaned)
                 print("[AI Helper] Renamed Note ID \(noteId) title to: '\(cleaned)'")
+            } else {
+                let fallback = cleanFilenameTitle(rawFileName)
+                _ = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: fallback)
             }
+        } else {
+            let fallback = cleanFilenameTitle(rawFileName)
+            _ = DatabaseManager.shared.updateNoteTitle(topicId: note.topicId, noteId: note.id, newTitle: fallback)
         }
     }
     
@@ -1846,31 +2086,18 @@ struct ExtractionGroup: Identifiable, Equatable {
             await generateDescriptiveTitle(noteId: noteId)
         }
         
-        // Extract text
-        let pdfText = extractTextFromPDF(path: note.filePath)
-        if pdfText.isEmpty {
-            // Check if the file physically exists on disk
-            if !FileManager.default.fileExists(atPath: note.filePath) {
-                print("[AI Helper] Note file physically missing at \(note.filePath). Blacklisting to avoid infinite loops.")
-                self.failedNoteTimes[noteId] = Date()
-                return
-            }
-            // If it exists but read failed (possibly waiting for macOS permission dialog), skip with a cooldown so we don't spin in a tight loop.
-            print("[AI Helper] Note file exists but could not be read (possibly permission pending). Cooldown for 5 minutes.")
+        // Check if file physically exists on disk
+        if !FileManager.default.fileExists(atPath: note.filePath) {
+            print("[AI Helper] Note file physically missing at \(note.filePath). Blacklisting to avoid infinite loops.")
             self.failedNoteTimes[noteId] = Date()
             return
         }
         
-        // Truncate to ~4000 characters to avoid model context bloat
-        var truncatedText = pdfText
-        if pdfText.count > 4000 {
-            truncatedText = String(pdfText.prefix(4000))
-        }
+        // Extract text
+        let pdfText = extractTextFromPDF(path: note.filePath, maxPages: 25)
+        var summaryRes: String? = nil
         
-        let model = await getOllamaModel()
-        
-        // Generate condensed formula-first study notes with centered equations
-        let summaryPrompt = """
+        let summaryPromptTemplate = """
         Summarize the following physics lecture into a minimal, formula-first study guide.
 
         CRITICAL FORMAT RULES:
@@ -1896,11 +2123,27 @@ struct ExtractionGroup: Identifiable, Equatable {
         Electric field E represents force per unit positive test charge q0.
 
         Now, synthesize the following lecture notes using the exact format above:
-
-        Lecture notes:
-        \(truncatedText)
         """
-        let summaryRes = await callOllama(prompt: summaryPrompt, model: model)
+        
+        if !pdfText.isEmpty && pdfText.count >= 40 {
+            var truncatedText = pdfText
+            if pdfText.count > 5000 {
+                truncatedText = String(pdfText.prefix(5000))
+            }
+            let model = await getOllamaModel()
+            let prompt = "\(summaryPromptTemplate)\n\nLecture notes:\n\(truncatedText)"
+            summaryRes = await callOllama(prompt: prompt, model: model)
+        } else {
+            // Visual / Scanned PDF or sparse text — convert pages to images and use vision model
+            print("[AI Helper] Note ID \(noteId) text is sparse/empty (\(pdfText.count) chars) — attempting visual extraction via vision model...")
+            let images = convertPDFToImages(path: note.filePath, maxPages: 4)
+            if !images.isEmpty {
+                let visionModel = await getOllamaVisionModel() ?? "qwen2.5vl:7b"
+                let prompt = "\(summaryPromptTemplate)\n\nPlease extract and summarize the core physics equations and concepts from these lecture note pages into the required formula-first format."
+                summaryRes = await callOllama(prompt: prompt, model: visionModel, images: images, timeout: 300.0)
+            }
+        }
+        
         if let res = summaryRes {
             var cleanedSummary = res.replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
             var lines = cleanedSummary.components(separatedBy: .newlines)
@@ -1912,7 +2155,23 @@ struct ExtractionGroup: Identifiable, Equatable {
                 }
             }
             _ = DatabaseManager.shared.updateNoteAI(noteId: noteId, summary: cleanedSummary, primer: nil)
+            self.failedNoteTimes.removeValue(forKey: noteId)
             print("[AI Helper] Completed analysis for Note ID: \(noteId)")
+            
+            // Also generate pre-lecture primer automatically
+            let moduleId = DatabaseManager.shared.getModuleId(forTopicId: note.topicId)
+            let allNotes = DatabaseManager.shared.getNotes(forModuleId: moduleId)
+            let prevNoteId: Int? = {
+                if let idx = allNotes.firstIndex(where: { $0.id == noteId }), idx > 0 {
+                    return allNotes[idx - 1].id
+                }
+                return nil
+            }()
+            _ = await generatePreLecturePrimer(currentNoteId: noteId, prevNoteId: prevNoteId)
+            
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: NSNotification.Name("NoteAnalysisCompleted"), object: nil, userInfo: ["noteId": noteId])
+            }
         } else {
             print("[AI Helper] Failed to generate summary for Note ID: \(noteId)")
             self.failedNoteTimes[noteId] = Date()
@@ -1933,24 +2192,33 @@ struct ExtractionGroup: Identifiable, Equatable {
     private func cleanLaTeXOutput(_ text: String?) -> String? {
         guard var result = text?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
         
+        // Strip markdown code fences like ```latex \n ... \n ``` or ``` \n ... \n ```
         if result.hasPrefix("```") {
             let lines = result.components(separatedBy: .newlines)
-            if lines.count >= 3 && lines.first?.hasPrefix("```") == true && lines.last?.hasPrefix("```") == true {
-                result = lines[1..<(lines.count - 1)].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if lines.count >= 2 {
+                var innerLines = lines
+                if innerLines.first?.hasPrefix("```") == true {
+                    innerLines.removeFirst()
+                }
+                if innerLines.last?.hasPrefix("```") == true {
+                    innerLines.removeLast()
+                }
+                result = innerLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
         
-        if result.hasPrefix("$$") && result.hasSuffix("$$") {
+        // Strip inline delimiters
+        if result.hasPrefix("$$") && result.hasSuffix("$$") && result.count >= 4 {
             result = String(result.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if result.hasPrefix("$") && result.hasSuffix("$") {
+        } else if result.hasPrefix("$") && result.hasSuffix("$") && result.count >= 2 {
             result = String(result.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if result.hasPrefix("\\[") && result.hasSuffix("\\]") {
+        } else if result.hasPrefix("\\[") && result.hasSuffix("\\]") && result.count >= 4 {
             result = String(result.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if result.hasPrefix("\\(") && result.hasSuffix("\\)") {
+        } else if result.hasPrefix("\\(") && result.hasSuffix("\\)") && result.count >= 4 {
             result = String(result.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         
-        return result
+        return result.isEmpty ? nil : result
     }
     
     func translateToLaTeX(rawEquation: String) async -> String? {
@@ -1971,7 +2239,13 @@ struct ExtractionGroup: Identifiable, Equatable {
             \(rawEquation)
             """
             
-            let res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            // If local was forced but failed or was offline, fallback to active provider (e.g. Tailscale)
+            if res == nil && useLocal {
+                self.logToFile("[AI Helper LOG] Local LaTeX translation failed, falling back to configured provider...")
+                let fallbackModel = await getOllamaModel(forceLocal: false)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            }
             return cleanLaTeXOutput(res)
         }
     }
@@ -1989,7 +2263,14 @@ struct ExtractionGroup: Identifiable, Equatable {
             Return ONLY the raw LaTeX code itself. Do NOT include any conversational text, explanations, intro, or outro.
             """
             
-            let res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 300.0, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 300.0, forceLocal: useLocal)
+            // If local was forced but failed or was offline, fallback to configured vision provider (e.g. Tailscale)
+            if res == nil && useLocal {
+                self.logToFile("[AI Helper LOG] Local LaTeX image transcription failed, falling back to configured vision provider...")
+                if let fallbackVisionModel = await getOllamaVisionModel(forceLocal: false) {
+                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 300.0, forceLocal: false)
+                }
+            }
             return cleanLaTeXOutput(res)
         }
     }
@@ -2246,7 +2527,12 @@ struct ExtractionGroup: Identifiable, Equatable {
 
             Do NOT include any conversational introduction or outro. Start directly with 'Rating:'.
             """
-            return await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            if res == nil && useLocal {
+                let fallbackModel = await getOllamaModel(forceLocal: false)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            }
+            return res
         }
     }
     
@@ -2278,7 +2564,11 @@ struct ExtractionGroup: Identifiable, Equatable {
             Student:
             """
             
-            let res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            if res == nil && useLocal {
+                let fallbackModel = await getOllamaModel(forceLocal: false)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            }
             return res ?? "I'm having a bit of trouble formulating my thoughts right now. Could you please rephrase or expand on your previous explanation?"
         }
     }
@@ -2300,7 +2590,11 @@ struct ExtractionGroup: Identifiable, Equatable {
             Student Question:
             """
             
-            let res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            if res == nil && useLocal {
+                let fallbackModel = await getOllamaModel(forceLocal: false)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            }
             return res ?? "Can you explain the main physical concepts and principles covered in the '\(noteTitle)' lecture?"
         }
     }
@@ -2312,18 +2606,20 @@ struct ExtractionGroup: Identifiable, Equatable {
         if provider == "local" || provider == "tailscale" {
             let host: String
             if provider == "tailscale" {
-                host = UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.100.100.100:11434"
+                host = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
             } else {
                 host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
             }
-            let cleanHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-            guard let bURL = URL(string: cleanHost) else { return false }
+            guard !host.isEmpty, let bURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") else { return false }
             let url = bURL.appendingPathComponent("api/tags")
             var request = URLRequest(url: url)
-            request.timeoutInterval = 1.0
+            request.timeoutInterval = provider == "tailscale" ? 3.0 : 2.0
             do {
-                _ = try await session.data(for: request)
-                return true
+                let (_, response) = try await session.data(for: request)
+                if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 {
+                    return true
+                }
+                return false
             } catch {
                 return false
             }
@@ -2403,91 +2699,115 @@ struct ExtractionGroup: Identifiable, Equatable {
             print("[AI Helper] Background processor manager started.")
             while true {
                 do {
-                    // Check for 5 minutes (300 seconds) inactivity
-                    await MainActor.run {
-                        if self.isAutoPowerSaverEnabled {
-                            let idleTime = Date().timeIntervalSince(self.lastAIAccessTimestamp)
-                            if idleTime > 300 && !self.isPowerSavingMode {
-                                self.isPowerSavingMode = true
-                                self.activeJobDescription = "Power Saving Mode"
-                                print("[AI Helper] 5 minutes of AI inactivity reached — entering Power Saving Mode.")
-                                PhysicsStudyApp.stopOllamaServer()
-                            }
-                        }
-                    }
-                    
-                    let powerSaving = await MainActor.run { self.isPowerSavingMode }
                     let bgEnabled = await MainActor.run { self.isBackgroundAIEnabled }
-                    
-                    // If power saving is active or background AI generation is disabled, sleep longer
-                    if powerSaving || !bgEnabled {
+                    if !bgEnabled {
                         await MainActor.run {
-                            if powerSaving {
-                                self.activeJobDescription = "Power Saving Mode"
-                            } else if !bgEnabled {
-                                self.activeJobDescription = "Background AI Disabled"
-                            }
+                            self.activeJobDescription = "Background AI Disabled"
                         }
-                        try await Task.sleep(nanoseconds: 15_000_000_000) // Sleep 15s when inactive/disabled
+                        try await Task.sleep(nanoseconds: 10_000_000_000) // Sleep 10s when disabled
                         continue
                     }
                     
-                    // Check if any user request is active. If so, wait.
+                    // Check if any interactive user request is active. If so, yield.
                     let isUserBusy = await MainActor.run { self.activeUserRequestsCount > 0 }
                     if isUserBusy {
                         try await Task.sleep(nanoseconds: 2_000_000_000) // Sleep 2s
                         continue
                     }
                     
-                    let online = await self.isOllamaRunning()
+                    let pendingJob = await self.getNextPendingJob()
+                    let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+                    let isLocalProvider = (provider == "local")
                     
-                    let isUserBusyAfterCheck = await MainActor.run { self.activeUserRequestsCount > 0 }
-                    if isUserBusyAfterCheck {
-                        try await Task.sleep(nanoseconds: 2_000_000_000)
-                        continue
-                    }
-                    
-                    if online, let job = await self.getNextPendingJob() {
-                        if self.awakeActivityToken == nil {
-                            self.awakeActivityToken = ProcessInfo.processInfo.beginActivity(
-                                options: [.background, .idleSystemSleepDisabled],
-                                reason: "Processing AI summaries and primers overnight"
-                            )
-                            print("[AI Helper] System sleep disabled while processing queue.")
-                        }
-                        
-                        self.isProcessing = true
-                        self.activeJobDescription = job.description
-                        
-                        let task = Task {
-                            await job.task()
-                        }
+                    if let job = pendingJob {
+                        // Pending work found! Make sure power saving mode is disengaged
                         await MainActor.run {
-                            self.currentBackgroundTask = task
+                            if self.isPowerSavingMode {
+                                self.isPowerSavingMode = false
+                                print("[AI Helper] Pending AI tasks detected — exiting Power Saving Mode.")
+                                if isLocalProvider {
+                                    PhysicsStudyApp.startOllamaServer()
+                                }
+                            }
                         }
                         
-                        await task.value
-                        
-                        await MainActor.run {
-                            self.currentBackgroundTask = nil
+                        let online = await self.isOllamaRunning()
+                        if online {
+                            await MainActor.run {
+                                if self.isAIDisconnected {
+                                    self.isAIDisconnected = false
+                                    self.disconnectionMessage = ""
+                                }
+                            }
+                            if self.awakeActivityToken == nil {
+                                self.awakeActivityToken = ProcessInfo.processInfo.beginActivity(
+                                    options: [.background, .idleSystemSleepDisabled],
+                                    reason: "Processing AI summaries and primers overnight"
+                                )
+                                print("[AI Helper] System sleep disabled while processing queue.")
+                            }
+                            
+                            self.isProcessing = true
+                            self.activeJobDescription = job.description
+                            
+                            let task = Task {
+                                await job.task()
+                            }
+                            await MainActor.run {
+                                self.currentBackgroundTask = task
+                            }
+                            
+                            await task.value
+                            
+                            await MainActor.run {
+                                self.currentBackgroundTask = nil
+                            }
+                            
+                            self.isProcessing = false
+                            self.activeJobDescription = "Idle"
+                            try await Task.sleep(nanoseconds: 2_000_000_000) // 2s cooldown
+                            continue
+                        } else {
+                            await MainActor.run {
+                                let prov = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+                                self.isAIDisconnected = true
+                                self.disconnectionMessage = prov == "tailscale" ? "Tailscale Disconnected" : "AI Server Offline"
+                                self.isProcessing = false
+                                self.isAIBusy = false
+                                self.activeJobDescription = "AI Server Offline"
+                            }
+                            try await Task.sleep(nanoseconds: 5_000_000_000)
+                            continue
                         }
-                        
-                        self.isProcessing = false
-                        self.activeJobDescription = "Idle"
-                        try await Task.sleep(nanoseconds: 5_000_000_000) // 5s cooldown
                     } else {
+                        // No pending jobs in the queue
                         if let token = self.awakeActivityToken {
                             ProcessInfo.processInfo.endActivity(token)
                             self.awakeActivityToken = nil
                             print("[AI Helper] System sleep re-enabled (queue idle).")
                         }
                         
-                        self.activeJobDescription = online ? "Idle" : "Waiting for Ollama..."
-                        try await Task.sleep(nanoseconds: 10_000_000_000) // 10s idle sleep
+                        // Check for power saver (only when queue is empty and provider is local)
+                        await MainActor.run {
+                            if isLocalProvider && self.isAutoPowerSaverEnabled {
+                                let idleTime = Date().timeIntervalSince(self.lastAIAccessTimestamp)
+                                if idleTime > 300 && !self.isPowerSavingMode {
+                                    self.isPowerSavingMode = true
+                                    self.activeJobDescription = "Power Saving Mode"
+                                    print("[AI Helper] 5 minutes of AI inactivity reached — entering Power Saving Mode.")
+                                    PhysicsStudyApp.stopOllamaServer()
+                                }
+                            }
+                            if !self.isPowerSavingMode {
+                                self.activeJobDescription = "Idle"
+                            }
+                        }
+                        
+                        try await Task.sleep(nanoseconds: 8_000_000_000) // 8s idle sleep
                     }
                 } catch {
                     print("[AI Helper] Error in background processor: \(error)")
-                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
                 }
             }
         }
@@ -2499,32 +2819,39 @@ struct ExtractionGroup: Identifiable, Equatable {
     }
     
     private func getNextPendingJob() async -> PendingJob? {
-        // Fetch all notes
         let allModules = DatabaseManager.shared.getModules()
         
+        // Pass 1: Prioritize missing note summaries across ALL modules first!
         for module in allModules {
             let notes = DatabaseManager.shared.getNotes(forModuleId: module.id)
-            for (idx, note) in notes.enumerated() {
-                // Skip processing if note file path is empty
-                guard !note.filePath.isEmpty else {
-                    continue
+            for note in notes {
+                guard !note.filePath.isEmpty else { continue }
+                if (note.aiSummary == nil || note.aiSummary?.isEmpty == true || note.aiSummary?.contains("Unable to generate summary") == true) && !self.isNoteFailed(noteId: note.id) {
+                    return PendingJob(description: "Analyze Note (Note ID \(note.id))") {
+                        await self.processNoteSync(noteId: note.id)
+                    }
                 }
-                
-                // If title is generic (e.g. Lecture_1), queue AI title generation
+            }
+        }
+        
+        // Pass 2: Rename generic lecture titles across all modules
+        for module in allModules {
+            let notes = DatabaseManager.shared.getNotes(forModuleId: module.id)
+            for note in notes {
+                guard !note.filePath.isEmpty else { continue }
                 if self.isDefaultTitle(note.title) && !self.isNoteFailed(noteId: note.id) {
                     return PendingJob(description: "Rename Title (Note ID \(note.id))") {
                         await self.generateDescriptiveTitle(noteId: note.id)
                     }
                 }
-                
-                // If summary is missing or has error text
-                if (note.aiSummary == nil || note.aiSummary?.isEmpty == true || note.aiSummary?.contains("Unable to generate summary") == true) && !self.isNoteFailed(noteId: note.id) {
-                    return PendingJob(description: "Summary (Note ID \(note.id))") {
-                        await self.processNoteSync(noteId: note.id)
-                    }
-                }
-                
-                // If pre-lecture primer is missing or has error text
+            }
+        }
+        
+        // Pass 3: Missing pre-lecture primers across all modules
+        for module in allModules {
+            let notes = DatabaseManager.shared.getNotes(forModuleId: module.id)
+            for (idx, note) in notes.enumerated() {
+                guard !note.filePath.isEmpty else { continue }
                 if (note.preLecturePrimer == nil || note.preLecturePrimer?.isEmpty == true || note.preLecturePrimer?.contains("Unable to generate pre-lecture primer") == true) && !self.isNoteFailed(noteId: note.id) {
                     let prevNoteId = idx > 0 ? notes[idx - 1].id : nil
                     return PendingJob(description: "Primer (Note ID \(note.id))") {
@@ -2533,6 +2860,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                 }
             }
         }
+        
         return nil
     }
     

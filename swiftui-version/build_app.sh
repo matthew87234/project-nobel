@@ -9,6 +9,10 @@ APP_NAME="Project Nobel"
 APP_BUNDLE="${DESKTOP_BUILD_DIR}/${APP_NAME}.app"
 DESKTOP_APP="/Users/matthewt/Desktop/${APP_NAME}.app"
 
+if [ -z "$SDKROOT" ] && [ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]; then
+    export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
+fi
+
 echo "Building Swift Package Manager target in release mode..."
 cd "${SRC_DIR}"
 swift build -c release

@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 struct PostLectureView: View {
     let activeModuleId: Int?

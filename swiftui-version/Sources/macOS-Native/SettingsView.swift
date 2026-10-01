@@ -33,15 +33,15 @@ struct AISettingsView: View {
     @State private var activeSection: String = "text"
     
     // Local routing overrides
-    @AppStorage("latex_always_local") private var latexAlwaysLocal: Bool = true
-    @AppStorage("feynman_always_local") private var feynmanAlwaysLocal: Bool = true
-    @AppStorage("background_ai_enabled") private var backgroundAIEnabled: Bool = false
+    @AppStorage("latex_always_local") private var latexAlwaysLocal: Bool = false
+    @AppStorage("feynman_always_local") private var feynmanAlwaysLocal: Bool = false
+    @AppStorage("background_ai_enabled") private var backgroundAIEnabled: Bool = true
     @AppStorage("auto_power_saver_enabled") private var autoPowerSaverEnabled: Bool = true
     
     // Text model settings
     @AppStorage("ai_provider") private var aiProvider: String = "local"
     @AppStorage("local_model_general") private var localModelGeneral: String = "qwen2.5-coder:14b"
-    @AppStorage("tailscale_host") private var tailscaleHost: String = "http://100.100.100.100:11434"
+    @AppStorage("tailscale_host") private var tailscaleHost: String = ""
     @AppStorage("tailscale_model_general") private var tailscaleModelGeneral: String = "qwen2.5-coder:14b"
     @AppStorage("cloud_api_key") private var cloudApiKey: String = ""
     @AppStorage("cloud_model_name") private var cloudModelName: String = ""
@@ -51,11 +51,14 @@ struct AISettingsView: View {
     @AppStorage("vision_provider") private var visionProvider: String = "local"
     @AppStorage("local_host") private var localHost: String = "http://localhost:11434"
     @AppStorage("local_model_vision") private var localModelVision: String = "qwen2.5vl:7b"
-    @AppStorage("vision_tailscale_host") private var visionTailscaleHost: String = "http://100.100.100.100:11434"
+    @AppStorage("vision_tailscale_host") private var visionTailscaleHost: String = ""
     @AppStorage("vision_tailscale_model") private var visionTailscaleModel: String = "qwen2.5vl:7b"
     @AppStorage("vision_api_key") private var visionApiKey: String = ""
     @AppStorage("vision_model_name") private var visionModelName: String = ""
     @AppStorage("vision_api_base_url") private var visionApiBaseUrl: String = ""
+    
+    // Device picker sheet state
+    @State private var showDevicePickerSheet = false
     
     // Models cache
     @State private var ollamaModels: [String] = []
@@ -135,15 +138,23 @@ struct AISettingsView: View {
                                     Text("Tailscale Host:")
                                         .bold()
                                         .gridCellAnchor(.trailing)
-                                    TextField("http://100.100.100.100:11434", text: $tailscaleHost)
-                                        .textFieldStyle(.roundedBorder)
-                                        .frame(width: 320)
+                                    HStack(spacing: 8) {
+                                        TextField("e.g. http://100.x.y.z:11434", text: $tailscaleHost)
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 210)
+                                        
+                                        Button(action: { showDevicePickerSheet = true }) {
+                                            Label("Scan Nodes", systemImage: "network")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .help("Scan Tailscale network for active Ollama nodes")
+                                    }
                                 }
                                 GridRow {
                                     Text("Model:")
                                         .bold()
                                         .gridCellAnchor(.trailing)
-                                    modelPicker(models: ollamaModels, selection: $tailscaleModelGeneral, placeholder: "e.g. qwen2.5-coder:7b")
+                                    modelPicker(models: ollamaModels, selection: $tailscaleModelGeneral, placeholder: "e.g. qwen2.5-coder:14b")
                                 }
                             } else {
                                 GridRow {
@@ -239,9 +250,17 @@ struct AISettingsView: View {
                                     Text("Tailscale Host:")
                                         .bold()
                                         .gridCellAnchor(.trailing)
-                                    TextField("http://100.100.100.100:11434", text: $visionTailscaleHost)
-                                        .textFieldStyle(.roundedBorder)
-                                        .frame(width: 320)
+                                    HStack(spacing: 8) {
+                                        TextField("e.g. http://100.x.y.z:11434", text: $visionTailscaleHost)
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 210)
+                                        
+                                        Button(action: { showDevicePickerSheet = true }) {
+                                            Label("Scan Nodes", systemImage: "network")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .help("Scan Tailscale network for active Ollama nodes")
+                                    }
                                 }
                                 GridRow {
                                     Text("Model:")
@@ -338,12 +357,21 @@ struct AISettingsView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+        .sheet(isPresented: $showDevicePickerSheet) {
+            AIDevicePickerView()
+        }
         .onAppear { refreshModels() }
         .onChange(of: aiProvider) { _, newValue in
+            if newValue == "tailscale" && tailscaleHost.isEmpty {
+                showDevicePickerSheet = true
+            }
             prefillTextDefaults(for: newValue)
             refreshModels()
         }
         .onChange(of: visionProvider) { _, newValue in
+            if newValue == "tailscale" && visionTailscaleHost.isEmpty {
+                showDevicePickerSheet = true
+            }
             prefillVisionDefaults(for: newValue)
             refreshModels()
         }
@@ -445,11 +473,11 @@ struct AISettingsView: View {
         var fetchedNames: [String] = []
         
         for rawHost in candidateHosts {
-            let clean = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-            guard !clean.isEmpty, let url = URL(string: "\(clean)/api/tags") else { continue }
+            guard let baseURL = AIHelper.normalizedOllamaURL(from: rawHost, defaultHost: "http://localhost:11434") else { continue }
+            let url = baseURL.appendingPathComponent("api/tags")
             
             var req = URLRequest(url: url)
-            req.timeoutInterval = 3.0
+            req.timeoutInterval = 6.0
             
             do {
                 let (data, _) = try await URLSession.shared.data(for: req)

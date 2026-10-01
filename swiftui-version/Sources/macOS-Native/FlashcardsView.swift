@@ -1537,7 +1537,7 @@ struct FlashcardsView: View {
                         .font(.title2)
                         .bold()
                     
-                    Text("Describe an equation in plain text or paste an image from your clipboard, and local AI (Qwen) will convert it into raw LaTeX code.")
+                    Text("Describe an equation in plain text or paste an image from your clipboard, and AI will convert it into clean LaTeX code.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                     
@@ -1603,7 +1603,7 @@ struct FlashcardsView: View {
                         if isTranslatingLaTeX {
                             HStack {
                                 ProgressView().controlSize(.small)
-                                Text("Translating via local Qwen model...")
+                                Text("Translating via AI model...")
                                     .foregroundColor(.secondary)
                             }
                         } else {
@@ -1616,7 +1616,7 @@ struct FlashcardsView: View {
                     }
                     
                     // Result Preview
-                    if !latexResult.isEmpty {
+                    if !latexResult.isEmpty && !latexResult.hasPrefix("Error:") && !latexResult.hasPrefix("No vision model") {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Equation Preview:").bold()
                             LaTeXView(latex: latexResult)
@@ -1647,7 +1647,7 @@ struct FlashcardsView: View {
                     pasteboard.setString(wrapped, forType: .string)
                 }
                 .buttonStyle(.bordered)
-                .disabled(latexResult.isEmpty)
+                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
                 
                 Button("Paste to Front Content") {
                     let wrapped = wrapInLaTeXDelimiters(latexResult)
@@ -1656,7 +1656,7 @@ struct FlashcardsView: View {
                     resetLatexHelper()
                 }
                 .buttonStyle(.bordered)
-                .disabled(latexResult.isEmpty)
+                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
                 
                 Button("Paste to Back Content") {
                     let wrapped = wrapInLaTeXDelimiters(latexResult)
@@ -1665,7 +1665,7 @@ struct FlashcardsView: View {
                     resetLatexHelper()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(latexResult.isEmpty)
+                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
             }
         }
         .padding(20)
@@ -1687,6 +1687,7 @@ struct FlashcardsView: View {
     
     private func translateTextToLatex() {
         self.isTranslatingLaTeX = true
+        self.latexResult = ""
         Task {
             let res = await AIHelper.shared.translateToLaTeX(rawEquation: latexInput)
             DispatchQueue.main.async {
@@ -1697,6 +1698,8 @@ struct FlashcardsView: View {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(wrapped, forType: .string)
+                } else {
+                    self.latexResult = "Error: Could not translate equation. Verify that your AI host (Local or Tailscale) is connected."
                 }
             }
         }
@@ -1704,13 +1707,14 @@ struct FlashcardsView: View {
     
     private func translateImageToLatex() {
         self.isTranslatingLaTeX = true
+        self.latexResult = ""
         Task {
             let res = await AIHelper.shared.translateImageToLaTeX(base64Image: latexImageBase64)
             DispatchQueue.main.async {
                 self.isTranslatingLaTeX = false
                 if let latex = res {
                     if latex == "MODEL_NOT_FOUND" {
-                        self.latexResult = "No local vision model found. Please pull qwen2.5vl."
+                        self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
                     } else {
                         let wrapped = self.wrapInLaTeXDelimiters(latex)
                         self.latexResult = wrapped
@@ -1718,6 +1722,8 @@ struct FlashcardsView: View {
                         pasteboard.clearContents()
                         pasteboard.setString(wrapped, forType: .string)
                     }
+                } else {
+                    self.latexResult = "Error: Could not transcribe equation image. Verify that your AI host (Local or Tailscale) is connected."
                 }
             }
         }
@@ -2067,7 +2073,7 @@ struct EditFlashcardSheetView: View {
                         }
                     }
                     
-                    if !latexResult.isEmpty {
+                    if !latexResult.isEmpty && !latexResult.hasPrefix("Error:") && !latexResult.hasPrefix("No vision model") {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Equation Preview:").bold()
                             LaTeXView(latex: latexResult)
@@ -2096,7 +2102,7 @@ struct EditFlashcardSheetView: View {
                     showLatexHelper = false
                 }
                 .buttonStyle(.bordered)
-                .disabled(latexResult.isEmpty)
+                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
                 
                 Button("Paste to Back Content") {
                     let wrapped = wrapInLaTeXDelimiters(latexResult)
@@ -2104,7 +2110,7 @@ struct EditFlashcardSheetView: View {
                     showLatexHelper = false
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(latexResult.isEmpty)
+                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
             }
         }
         .padding(20)
@@ -2125,6 +2131,7 @@ struct EditFlashcardSheetView: View {
     
     private func translateTextToLatex() {
         self.isTranslatingLaTeX = true
+        self.latexResult = ""
         Task {
             let res = await AIHelper.shared.translateToLaTeX(rawEquation: latexInput)
             DispatchQueue.main.async {
@@ -2132,6 +2139,8 @@ struct EditFlashcardSheetView: View {
                 if let latex = res {
                     let wrapped = self.wrapInLaTeXDelimiters(latex)
                     self.latexResult = wrapped
+                } else {
+                    self.latexResult = "Error: Could not translate equation. Verify that your AI host (Local or Tailscale) is connected."
                 }
             }
         }
@@ -2139,17 +2148,20 @@ struct EditFlashcardSheetView: View {
     
     private func translateImageToLatex() {
         self.isTranslatingLaTeX = true
+        self.latexResult = ""
         Task {
             let res = await AIHelper.shared.translateImageToLaTeX(base64Image: latexImageBase64)
             DispatchQueue.main.async {
                 self.isTranslatingLaTeX = false
                 if let latex = res {
                     if latex == "MODEL_NOT_FOUND" {
-                        self.latexResult = "No local vision model found."
+                        self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
                     } else {
                         let wrapped = self.wrapInLaTeXDelimiters(latex)
                         self.latexResult = wrapped
                     }
+                } else {
+                    self.latexResult = "Error: Could not transcribe equation image. Verify that your AI host (Local or Tailscale) is connected."
                 }
             }
         }

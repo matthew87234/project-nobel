@@ -2,6 +2,7 @@ import SwiftUI
 import Charts
 import WebKit
 import UniformTypeIdentifiers
+import Combine
 @preconcurrency import UserNotifications
 
 enum ActiveProblemChartPopup: String, Identifiable {

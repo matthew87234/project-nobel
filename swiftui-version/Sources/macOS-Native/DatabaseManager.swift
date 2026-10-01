@@ -128,6 +128,10 @@ struct FeynmanChat: Identifiable, Hashable {
 @MainActor class DatabaseManager {
     static let shared = DatabaseManager()
     
+    static var isDesktopApp: Bool {
+        return Bundle.main.bundlePath.contains("/Desktop") || ProcessInfo.processInfo.arguments.contains("--desktop-db")
+    }
+    
     private var db: OpaquePointer?
     
     private init() {
@@ -143,11 +147,11 @@ struct FeynmanChat: Identifiable, Hashable {
         
         try? fileManager.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
         
-        let isDesktopApp = Bundle.main.bundlePath.contains("/Desktop") || ProcessInfo.processInfo.arguments.contains("--desktop-db")
-        let dbFilename = isDesktopApp ? "physics_study_desktop.db" : "physics_study.db"
+        let isDesktop = DatabaseManager.isDesktopApp
+        let dbFilename = isDesktop ? "physics_study_desktop.db" : "physics_study.db"
         let dbURL = appSupportDir.appendingPathComponent(dbFilename)
         
-        if isDesktopApp && !fileManager.fileExists(atPath: dbURL.path) {
+        if isDesktop && !fileManager.fileExists(atPath: dbURL.path) {
             let prodURL = appSupportDir.appendingPathComponent("physics_study.db")
             if fileManager.fileExists(atPath: prodURL.path) {
                 try? fileManager.copyItem(at: prodURL, to: dbURL)
@@ -535,6 +539,12 @@ struct FeynmanChat: Identifiable, Hashable {
                 preLecturePrimer: row["pre_lecture_primer"] as? String
             )
         }
+    }
+    
+    func getModuleId(forTopicId topicId: Int) -> Int? {
+        let sql = "SELECT module_id FROM topics WHERE id = ?"
+        let rows = query(sql: sql, params: [topicId])
+        return rows.first?["module_id"] as? Int
     }
     
     func getTopics(forModuleId moduleId: Int) -> [Topic] {
