@@ -1596,6 +1596,34 @@ struct ExtractionGroup: Identifiable, Equatable {
             }
         }
         
+        // Automatic Fallback: If Tailscale was unreachable, check if Local Ollama is available
+        if effectiveProvider == "tailscale" && !forceLocal {
+            self.logToFile("[AI Helper LOG] Tailscale host unreachable, checking Local Ollama fallback...")
+            let localHost = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
+            if let localBaseURL = AIHelper.normalizedOllamaURL(from: localHost, defaultHost: "http://localhost:11434") {
+                let tagsUrl = localBaseURL.appendingPathComponent("api/tags")
+                var checkReq = URLRequest(url: tagsUrl)
+                checkReq.timeoutInterval = 1.5
+                if let (data, resp) = try? await session.data(for: checkReq),
+                   let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200,
+                   let tags = try? JSONDecoder().decode(TagsResponse.self, from: data),
+                   !tags.models.isEmpty {
+                    let fallbackModel: String
+                    if effectiveImages != nil {
+                        fallbackModel = await getOllamaVisionModel(forceLocal: true) ?? "qwen2.5vl:7b"
+                    } else {
+                        fallbackModel = await getOllamaModel(forceLocal: true)
+                    }
+                    self.logToFile("[AI Helper LOG] Seamlessly falling back to Local Ollama with model '\(fallbackModel)'...")
+                    if let localResult = await callAPIOnce(prompt: prompt, model: fallbackModel, images: effectiveImages, timeout: timeout, provider: "local") {
+                        if !hasRepetitiveGlitch(localResult) {
+                            return localResult
+                        }
+                    }
+                }
+            }
+        }
+        
         await MainActor.run {
             self.isAIDisconnected = true
             if effectiveProvider == "tailscale" {
@@ -2240,11 +2268,12 @@ struct ExtractionGroup: Identifiable, Equatable {
             """
             
             var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
-            // If local was forced but failed or was offline, fallback to active provider (e.g. Tailscale)
-            if res == nil && useLocal {
-                self.logToFile("[AI Helper LOG] Local LaTeX translation failed, falling back to configured provider...")
-                let fallbackModel = await getOllamaModel(forceLocal: false)
-                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            // Bidirectional fallback: if preferred provider failed, try the opposite (Local <-> Remote)
+            if res == nil {
+                let fallbackUseLocal = !useLocal
+                self.logToFile("[AI Helper LOG] LaTeX translation failed on preferred provider, trying fallback (forceLocal: \(fallbackUseLocal))...")
+                let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
             return cleanLaTeXOutput(res)
         }
@@ -2253,24 +2282,37 @@ struct ExtractionGroup: Identifiable, Equatable {
     func translateImageToLaTeX(base64Image: String) async -> String? {
         await withUserPriority {
             let useLocal = latexAlwaysLocal
-            guard let visionModel = await getOllamaVisionModel(forceLocal: useLocal) else {
-                return "MODEL_NOT_FOUND"
-            }
-            
             let prompt = """
             Transcribe the mathematical equation or expression in this image into valid LaTeX format. \
             Do NOT wrap the equation in any delimiters like $ or $$ or \\[ or \\]. \
             Return ONLY the raw LaTeX code itself. Do NOT include any conversational text, explanations, intro, or outro.
             """
             
-            var res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 300.0, forceLocal: useLocal)
-            // If local was forced but failed or was offline, fallback to configured vision provider (e.g. Tailscale)
-            if res == nil && useLocal {
-                self.logToFile("[AI Helper LOG] Local LaTeX image transcription failed, falling back to configured vision provider...")
-                if let fallbackVisionModel = await getOllamaVisionModel(forceLocal: false) {
-                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 300.0, forceLocal: false)
+            // 1. Initial attempt with preferred provider
+            var res: String? = nil
+            if let visionModel = await getOllamaVisionModel(forceLocal: useLocal) {
+                res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 120.0, forceLocal: useLocal)
+            }
+            
+            // 2. Bidirectional fallback (Local <-> Tailscale)
+            if res == nil {
+                let fallbackUseLocal = !useLocal
+                self.logToFile("[AI Helper LOG] LaTeX image transcription failed on preferred provider, trying fallback (forceLocal: \(fallbackUseLocal))...")
+                if let fallbackVisionModel = await getOllamaVisionModel(forceLocal: fallbackUseLocal) {
+                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 120.0, forceLocal: fallbackUseLocal)
                 }
             }
+            
+            // 3. Fallback to Cloud Vision if configured
+            if res == nil {
+                let visionProvider = UserDefaults.standard.string(forKey: "vision_provider") ?? "local"
+                let cloudKey = UserDefaults.standard.string(forKey: "vision_api_key") ?? ""
+                if visionProvider == "cloud" || !cloudKey.isEmpty {
+                    let cloudModel = UserDefaults.standard.string(forKey: "vision_model_name") ?? "gpt-4o"
+                    res = await callAPIOnce(prompt: prompt, model: cloudModel, images: [base64Image], timeout: 60.0, provider: "cloud_vision")
+                }
+            }
+            
             return cleanLaTeXOutput(res)
         }
     }
@@ -2528,9 +2570,10 @@ struct ExtractionGroup: Identifiable, Equatable {
             Do NOT include any conversational introduction or outro. Start directly with 'Rating:'.
             """
             var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
-            if res == nil && useLocal {
-                let fallbackModel = await getOllamaModel(forceLocal: false)
-                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            if res == nil {
+                let fallbackUseLocal = !useLocal
+                let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
             return res
         }
@@ -2565,9 +2608,10 @@ struct ExtractionGroup: Identifiable, Equatable {
             """
             
             var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
-            if res == nil && useLocal {
-                let fallbackModel = await getOllamaModel(forceLocal: false)
-                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            if res == nil {
+                let fallbackUseLocal = !useLocal
+                let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
             return res ?? "I'm having a bit of trouble formulating my thoughts right now. Could you please rephrase or expand on your previous explanation?"
         }
@@ -2591,9 +2635,10 @@ struct ExtractionGroup: Identifiable, Equatable {
             """
             
             var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
-            if res == nil && useLocal {
-                let fallbackModel = await getOllamaModel(forceLocal: false)
-                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: false)
+            if res == nil {
+                let fallbackUseLocal = !useLocal
+                let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
             return res ?? "Can you explain the main physical concepts and principles covered in the '\(noteTitle)' lecture?"
         }

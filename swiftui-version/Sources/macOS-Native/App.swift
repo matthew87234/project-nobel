@@ -620,6 +620,24 @@ struct PhysicsStudyApp: App {
                     
                     Spacer()
                     
+                    if UserDefaults.standard.string(forKey: "ai_provider") == "tailscale" {
+                        Button(action: {
+                            UserDefaults.standard.set("local", forKey: "ai_provider")
+                            UserDefaults.standard.set("local", forKey: "vision_provider")
+                            aiHelper.retryConnectionAndQueue()
+                        }) {
+                            Text("Use Local AI")
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(Color.secondary.opacity(0.12))
+                                .foregroundColor(.primary)
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Switch to local Ollama on this Mac")
+                    }
+                    
                     Button(action: {
                         aiHelper.retryConnectionAndQueue()
                     }) {
