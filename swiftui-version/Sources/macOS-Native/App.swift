@@ -124,6 +124,7 @@ struct PhysicsStudyApp: App {
                                 .foregroundColor(.primary)
                         }
                         .buttonStyle(.plain)
+                        .focusable(false)
                         .pointingHandCursor()
                         .padding(.horizontal)
                         .padding(.top, 20)
@@ -602,9 +603,14 @@ struct PhysicsStudyApp: App {
         if aiHelper.isAIDisconnected {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
-                    Image(systemName: "wifi.slash")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.blue)
+                    if aiHelper.isAutoReconnecting || aiHelper.isRetryingConnection {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "wifi.slash")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(.blue)
+                    }
                     
                     Text(aiHelper.disconnectionMessage.isEmpty ? "Tailscale Disconnected" : aiHelper.disconnectionMessage)
                         .font(.system(size: 11, weight: .bold, design: .rounded))
@@ -614,13 +620,13 @@ struct PhysicsStudyApp: App {
                 }
                 
                 HStack(spacing: 6) {
-                    Text("AI server unreachable.")
+                    Text(aiHelper.isAutoReconnecting ? "Auto-reconnecting..." : "AI server unreachable.")
                         .font(.system(size: 10, weight: .medium, design: .rounded))
                         .foregroundColor(.secondary)
                     
                     Spacer()
                     
-                    if UserDefaults.standard.string(forKey: "ai_provider") == "tailscale" {
+                    if (UserDefaults.standard.string(forKey: "ai_provider") ?? "local") != "local" {
                         Button(action: {
                             UserDefaults.standard.set("local", forKey: "ai_provider")
                             UserDefaults.standard.set("local", forKey: "vision_provider")
@@ -642,14 +648,14 @@ struct PhysicsStudyApp: App {
                         aiHelper.retryConnectionAndQueue()
                     }) {
                         HStack(spacing: 4) {
-                            if aiHelper.isRetryingConnection {
+                            if aiHelper.isRetryingConnection || aiHelper.isAutoReconnecting {
                                 ProgressView()
                                     .controlSize(.mini)
                             } else {
                                 Image(systemName: "arrow.clockwise")
                                     .font(.system(size: 9, weight: .bold))
                             }
-                            Text(aiHelper.isRetryingConnection ? "Checking..." : "Try Again")
+                            Text((aiHelper.isRetryingConnection || aiHelper.isAutoReconnecting) ? "Checking..." : "Reconnect Now")
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
                         }
                         .padding(.horizontal, 7)
@@ -659,7 +665,7 @@ struct PhysicsStudyApp: App {
                         .cornerRadius(5)
                     }
                     .buttonStyle(.plain)
-                    .disabled(aiHelper.isRetryingConnection)
+                    .disabled(aiHelper.isRetryingConnection || aiHelper.isAutoReconnecting)
                     .help("Check AI server connection and resume processing")
                 }
             }
@@ -673,8 +679,8 @@ struct PhysicsStudyApp: App {
             .padding(.horizontal, 10)
             .padding(.bottom, 15)
             .transition(.move(edge: .bottom).combined(with: .opacity))
-        } else if aiHelper.isAIBusy || aiHelper.isClassifyingProblems || aiHelper.isProcessing || !aiHelper.activeProcessingNoteIds.isEmpty {
-            let (isLocal, providerName) = aiHelper.activeAIProvider
+        } else if (aiHelper.isAIBusy && !aiHelper.currentAITaskDescription.isEmpty) || aiHelper.isClassifyingProblems || (aiHelper.isProcessing && aiHelper.activeJobDescription != "Idle" && aiHelper.activeJobDescription != "Background AI Disabled" && aiHelper.activeJobDescription != "Power Saving Mode" && aiHelper.activeJobDescription != "AI Server Offline") || !aiHelper.activeProcessingNoteIds.isEmpty {
+            let (isLocal, providerName) = (aiHelper.isAIBusy || aiHelper.isClassifyingProblems) ? (aiHelper.isCurrentAILocal, aiHelper.currentAIProviderName) : aiHelper.activeAIProvider
             let taskText: String = {
                 if !aiHelper.currentAITaskDescription.isEmpty {
                     return aiHelper.currentAITaskDescription
@@ -752,7 +758,7 @@ struct PhysicsStudyApp: App {
             .padding(.horizontal, 10)
             .padding(.bottom, 15)
             .transition(.move(edge: .bottom).combined(with: .opacity))
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: aiHelper.isAIBusy || !aiHelper.activeProcessingNoteIds.isEmpty || aiHelper.isProcessing)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: (aiHelper.isAIBusy && !aiHelper.currentAITaskDescription.isEmpty) || !aiHelper.activeProcessingNoteIds.isEmpty || (aiHelper.isProcessing && aiHelper.activeJobDescription != "Idle"))
         }
     }
     
@@ -887,6 +893,7 @@ struct SidebarNavButton: View {
             )
         }
         .buttonStyle(.plain)
+        .focusable(false)
         .pointingHandCursor()
         .onHover { hover in
             isHovered = hover

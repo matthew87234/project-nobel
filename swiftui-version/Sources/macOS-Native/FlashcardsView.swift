@@ -288,6 +288,8 @@ struct FlashcardsView: View {
     @State private var latexImageBase64: String = ""
     @State private var latexClipboardImage: NSImage? = nil
     @State private var isTranslatingLaTeX: Bool = false
+    @State private var isGeneratingFrontLatex: Bool = false
+    @State private var isGeneratingBackLatex: Bool = false
     
     enum FocusField: Hashable {
         case front
@@ -297,6 +299,7 @@ struct FlashcardsView: View {
     
     // Review State
     @State private var dueCards: [Flashcard] = []
+    @State private var sessionCards: [Flashcard] = []
     @State private var currentCardIdx: Int = 0
     @State private var isFlipped: Bool = false
     @State private var fcTimerSeconds: Int = 0
@@ -346,11 +349,11 @@ struct FlashcardsView: View {
             }
         }
         .onAppear {
-            if currentMode != .review || dueCards.isEmpty || isSessionComplete {
+            if currentMode != .review || sessionCards.isEmpty || isSessionComplete {
                 currentMode = mode
             }
             if isActive {
-                if currentMode == .review && !dueCards.isEmpty && !isSessionComplete {
+                if currentMode == .review && !sessionCards.isEmpty && !isSessionComplete {
                     startTimer()
                 } else {
                     loadInitialData()
@@ -362,7 +365,9 @@ struct FlashcardsView: View {
             }
         }
         .onChange(of: currentMode) { _, newMode in
-            loadInitialData()
+            if newMode != .review {
+                loadInitialData()
+            }
             if newMode == .add {
                 setupFlaggedCorrectionQueue()
             }
@@ -370,6 +375,7 @@ struct FlashcardsView: View {
         .onChange(of: activeModuleId) { oldValue, newValue in
             currentMode = mode
             dueCards.removeAll()
+            sessionCards.removeAll()
             isSessionComplete = false
             currentCardIdx = 0
             if isActive {
@@ -378,7 +384,7 @@ struct FlashcardsView: View {
         }
         .onChange(of: isActive) { oldValue, newValue in
             if newValue {
-                if currentMode == .review && !dueCards.isEmpty && !isSessionComplete {
+                if currentMode == .review && !sessionCards.isEmpty && !isSessionComplete {
                     startTimer()
                 } else {
                     loadInitialData()
@@ -391,6 +397,11 @@ struct FlashcardsView: View {
                 logActiveSeconds()
             }
         }
+        .onChange(of: sessionFocusFilter) { _, _ in
+            if currentMode == .start {
+                loadDueCards()
+            }
+        }
         .onDisappear {
             fcTimer?.invalidate()
             logActiveSeconds()
@@ -398,11 +409,13 @@ struct FlashcardsView: View {
     }
     
     private func loadInitialData() {
-        if currentMode == .review {
-            loadDueCards()
-            startTimer()
-        } else if currentMode == .manage {
+        if currentMode == .manage {
             loadAllCards()
+        } else if currentMode == .review {
+            // Already initialized in startNewSession; do not reload/wipe session cards
+            if sessionCards.isEmpty && !isSessionComplete {
+                loadDueCards()
+            }
         } else {
             loadAllCards()
             loadDueCards()
@@ -502,11 +515,35 @@ struct FlashcardsView: View {
         targetCardCount = cardCount
         targetSessionMinutes = estimatedMinutes(forCardCount: cardCount)
         
-        loadDueCards(limit: cardCount, studyAhead: studyAhead)
-        cardsReviewedInSession = 0
-        requeuedCount = 0
-        isSessionComplete = false
-        currentMode = .review
+        let targetModId = isExamMode ? activeModuleId : nil
+        let targetYear = isExamMode ? nil : activeYear
+        let today = formatDate(Date())
+        var pool: [Flashcard] = []
+        
+        switch sessionFocusFilter {
+        case .allDue:
+            if studyAhead {
+                pool = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId).shuffled()
+            } else {
+                pool = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today).shuffled()
+            }
+        case .lowEase:
+            let all = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
+            pool = all.filter { $0.easeFactor < 2.3 }.shuffled()
+        }
+        
+        if cardCount > 0 && pool.count > cardCount {
+            pool = Array(pool.prefix(cardCount))
+        }
+        
+        self.sessionCards = pool
+        self.currentCardIdx = 0
+        self.isFlipped = false
+        self.cardRequeueCounts.removeAll()
+        self.cardsReviewedInSession = 0
+        self.requeuedCount = 0
+        self.isSessionComplete = false
+        self.currentMode = .review
         startTimer()
     }
     
@@ -758,6 +795,7 @@ struct FlashcardsView: View {
                 Button(action: {
                     fcTimer?.invalidate()
                     logActiveSeconds()
+                    sessionCards.removeAll()
                     currentMode = .start
                 }) {
                     HStack(spacing: 4) {
@@ -778,7 +816,7 @@ struct FlashcardsView: View {
             
             if isSessionComplete {
                 sessionCompleteView
-            } else if dueCards.isEmpty {
+            } else if sessionCards.isEmpty {
                 VStack {
                     Spacer()
                     Image(systemName: "checkmark.circle.fill")
@@ -795,6 +833,7 @@ struct FlashcardsView: View {
                         .padding(.top, 4)
                     
                     Button("Return to Flashcard Centre") {
+                        sessionCards.removeAll()
                         currentMode = .start
                     }
                     .buttonStyle(.borderedProminent)
@@ -804,13 +843,13 @@ struct FlashcardsView: View {
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if currentCardIdx < dueCards.count {
-                let card = dueCards[currentCardIdx]
+            } else if currentCardIdx < sessionCards.count {
+                let card = sessionCards[currentCardIdx]
                 VStack(spacing: 16) {
                     HStack {
                         Spacer()
                         
-                        Text("Card \(currentCardIdx + 1) of \(dueCards.count)")
+                        Text("Card \(currentCardIdx + 1) of \(sessionCards.count)")
                             .font(.headline)
                             .foregroundColor(.secondary)
                         
@@ -940,7 +979,7 @@ struct FlashcardsView: View {
         }
         .background(
             ZStack {
-                if !dueCards.isEmpty && currentCardIdx < dueCards.count && !isSessionComplete {
+                if !sessionCards.isEmpty && currentCardIdx < sessionCards.count && !isSessionComplete {
                     Button("") {
                         withAnimation(.spring()) {
                             isFlipped.toggle()
@@ -993,6 +1032,7 @@ struct FlashcardsView: View {
                 fcTimer?.invalidate()
                 logActiveSeconds()
                 showIdlePrompt = false
+                sessionCards.removeAll()
                 currentMode = .start
             }
         } message: {
@@ -1048,6 +1088,7 @@ struct FlashcardsView: View {
             Button("Return to Flashcard Centre") {
                 fcTimer?.invalidate()
                 logActiveSeconds()
+                sessionCards.removeAll()
                 currentMode = .start
             }
             .buttonStyle(.borderedProminent)
@@ -1093,9 +1134,6 @@ struct FlashcardsView: View {
         }
         
         self.dueCards = cards
-        self.currentCardIdx = 0
-        self.isFlipped = false
-        self.cardRequeueCounts.removeAll()
     }
     
     private func calculateNextInterval(card: Flashcard, quality: Int) -> Int {
@@ -1128,8 +1166,8 @@ struct FlashcardsView: View {
     }
     
     private func rateRecall(quality: Int) {
-        guard currentCardIdx < dueCards.count else { return }
-        let card = dueCards[currentCardIdx]
+        guard currentCardIdx < sessionCards.count else { return }
+        let card = sessionCards[currentCardIdx]
         
         // SM-2 Spaced Repetition Algorithm
         let interval = calculateNextInterval(card: card, quality: quality)
@@ -1168,7 +1206,7 @@ struct FlashcardsView: View {
             let previousRequeues = cardRequeueCounts[card.id, default: 0]
             if previousRequeues < 2 {
                 cardRequeueCounts[card.id] = previousRequeues + 1
-                dueCards.append(card)
+                sessionCards.append(card)
                 requeuedCount += 1
             }
         }
@@ -1177,7 +1215,7 @@ struct FlashcardsView: View {
         withAnimation {
             isFlipped = false
             cardsReviewedInSession += 1
-            if currentCardIdx + 1 < dueCards.count {
+            if currentCardIdx + 1 < sessionCards.count {
                 currentCardIdx += 1
             } else {
                 isSessionComplete = true
@@ -1204,11 +1242,14 @@ struct FlashcardsView: View {
     }
     
     private func toggleCurrentCardFlag() {
-        guard currentCardIdx < dueCards.count else { return }
-        let card = dueCards[currentCardIdx]
+        guard currentCardIdx < sessionCards.count else { return }
+        let card = sessionCards[currentCardIdx]
         let newFlag = !card.isFlagged
         _ = DatabaseManager.shared.setFlashcardFlag(id: card.id, isFlagged: newFlag)
-        dueCards[currentCardIdx].isFlagged = newFlag
+        sessionCards[currentCardIdx].isFlagged = newFlag
+        if let idx = dueCards.firstIndex(where: { $0.id == card.id }) {
+            dueCards[idx].isFlagged = newFlag
+        }
     }
     
     private func setupFlaggedCorrectionQueue() {
@@ -1258,86 +1299,121 @@ struct FlashcardsView: View {
     // MARK: - Add Card Body
     
     private var addBody: some View {
-        Form {
-            if isCorrectingFlaggedCards && flaggedCardIdx < flaggedCorrectionQueue.count {
-                let card = flaggedCorrectionQueue[flaggedCardIdx]
-                Section(header: HStack {
-                    Image(systemName: "flag.fill").foregroundColor(.purple)
-                    Text("Correcting Flagged Card (\(flaggedCardIdx + 1) of \(flaggedCorrectionQueue.count))").font(.headline)
-                    Spacer()
-                    Button("Skip to Create New Cards") {
-                        isCorrectingFlaggedCards = false
-                        frontText = ""
-                        backText = ""
-                        focusedField = .front
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .pointingHandCursor()
-                }) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Question (Front):").bold()
-                        TextEditor(text: $frontText)
-                            .font(.body)
-                            .focused($focusedField, equals: .front)
-                            .onKeyPress(.tab) {
-                                focusedField = .back
-                                return .handled
-                            }
-                            .frame(height: 80)
-                            .padding(4)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(4)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(Color.purple.opacity(0.4), lineWidth: 1)
-                            )
-                        
-                        Text("Answer (Back):").bold()
-                        TextEditor(text: $backText)
-                            .font(.body)
-                            .focused($focusedField, equals: .back)
-                            .onKeyPress(.tab) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                if isCorrectingFlaggedCards && flaggedCardIdx < flaggedCorrectionQueue.count {
+                    let card = flaggedCorrectionQueue[flaggedCardIdx]
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Image(systemName: "flag.fill").foregroundColor(.purple)
+                            Text("Correcting Flagged Card (\(flaggedCardIdx + 1) of \(flaggedCorrectionQueue.count))").font(.headline)
+                            Spacer()
+                            Button("Skip to Create New Cards") {
+                                isCorrectingFlaggedCards = false
+                                frontText = ""
+                                backText = ""
                                 focusedField = .front
-                                return .handled
                             }
-                            .frame(height: 80)
-                            .padding(4)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(4)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(Color.purple.opacity(0.4), lineWidth: 1)
-                            )
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .pointingHandCursor()
+                        }
+                        .padding(.bottom, 4)
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Question (Front):").bold()
+                                if isGeneratingFrontLatex {
+                                    Spacer()
+                                    TypingIndicatorBubble()
+                                }
+                            }
+                            
+                            TextEditor(text: $frontText)
+                                .font(.body)
+                                .focused($focusedField, equals: .front)
+                                .onKeyPress(.tab) {
+                                    focusedField = .back
+                                    return .handled
+                                }
+                                .frame(height: 80)
+                                .padding(6)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(6)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.purple.opacity(0.4), lineWidth: 1)
+                                )
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Answer (Back):").bold()
+                                if isGeneratingBackLatex {
+                                    Spacer()
+                                    TypingIndicatorBubble()
+                                }
+                            }
+                            
+                            TextEditor(text: $backText)
+                                .font(.body)
+                                .focused($focusedField, equals: .back)
+                                .onKeyPress(.tab) {
+                                    focusedField = .front
+                                    return .handled
+                                }
+                                .frame(height: 80)
+                                .padding(6)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(6)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.purple.opacity(0.4), lineWidth: 1)
+                                )
+                        }
                         
                         // Live LaTeX Preview
-                        VStack(alignment: .leading, spacing: 4) {
+                        VStack(alignment: .leading, spacing: 6) {
                             Text("Live LaTeX Preview:").bold()
                             VStack(alignment: .leading, spacing: 8) {
-                                if !frontText.isEmpty || !backText.isEmpty {
-                                    if !frontText.isEmpty {
-                                        VStack(alignment: .leading, spacing: 2) {
+                                if !frontText.isEmpty || !backText.isEmpty || isGeneratingFrontLatex || isGeneratingBackLatex {
+                                    if !frontText.isEmpty || isGeneratingFrontLatex {
+                                        VStack(alignment: .leading, spacing: 4) {
                                             Text("Front:").font(.caption).foregroundColor(.secondary)
-                                            if isLaTeX(frontText) {
-                                                LaTeXView(latex: frontText)
-                                                    .frame(height: 60)
-                                            } else {
-                                                Text(frontText)
-                                                    .font(.body)
-                                                    .padding(.horizontal, 4)
+                                            let clean = AILatexPlaceholder.cleanText(frontText)
+                                            if !clean.isEmpty {
+                                                if isLaTeX(clean) {
+                                                    LaTeXView(latex: clean)
+                                                        .frame(height: 45)
+                                                } else {
+                                                    Text(clean)
+                                                        .font(.body)
+                                                        .padding(.horizontal, 4)
+                                                }
+                                            }
+                                            if isGeneratingFrontLatex || AILatexPlaceholder.hasPlaceholder(frontText) {
+                                                AILaTeXGeneratingView()
+                                                    .frame(height: 42)
                                             }
                                         }
                                     }
-                                    if !backText.isEmpty {
-                                        VStack(alignment: .leading, spacing: 2) {
+                                    if !backText.isEmpty || isGeneratingBackLatex {
+                                        VStack(alignment: .leading, spacing: 4) {
                                             Text("Back:").font(.caption).foregroundColor(.secondary)
-                                            if isLaTeX(backText) {
-                                                LaTeXView(latex: backText)
-                                                    .frame(height: 60)
-                                            } else {
-                                                Text(backText)
-                                                    .font(.body)
-                                                    .padding(.horizontal, 4)
+                                            let clean = AILatexPlaceholder.cleanText(backText)
+                                            if !clean.isEmpty {
+                                                if isLaTeX(clean) {
+                                                    LaTeXView(latex: clean)
+                                                        .frame(height: 45)
+                                                } else {
+                                                    Text(clean)
+                                                        .font(.body)
+                                                        .padding(.horizontal, 4)
+                                                }
+                                            }
+                                            if isGeneratingBackLatex || AILatexPlaceholder.hasPlaceholder(backText) {
+                                                AILaTeXGeneratingView()
+                                                    .frame(height: 42)
                                             }
                                         }
                                     }
@@ -1348,13 +1424,15 @@ struct FlashcardsView: View {
                                         .padding(.vertical, 5)
                                 }
                             }
-                            .padding(10)
+                            .padding(12)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(Color(NSColor.windowBackgroundColor))
                             .cornerRadius(6)
-                            .border(Color.secondary.opacity(0.15), width: 1)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                            )
                         }
-                        .padding(.vertical, 5)
                         
                         HStack {
                             Button(action: {
@@ -1379,92 +1457,126 @@ struct FlashcardsView: View {
                             .buttonStyle(.borderedProminent)
                             .tint(.purple)
                             .pointingHandCursor()
-                            .disabled(frontText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || backText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .disabled(frontText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || backText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isGeneratingFrontLatex || isGeneratingBackLatex)
                         }
                     }
-                    .padding(.vertical, 10)
-                }
-            } else {
-                Section(header: HStack {
-                    Text("Create Flashcard").font(.headline)
-                    Spacer()
-                    let flaggedRemaining = allCards.filter { $0.isFlagged }
-                    if !flaggedRemaining.isEmpty {
-                        Button("Review Flagged Cards (\(flaggedRemaining.count))") {
-                            setupFlaggedCorrectionQueue()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .pointingHandCursor()
-                    }
-                }) {
-                    if activeModuleId == nil {
-                        Text("Select a module in the sidebar first before adding cards.")
-                            .foregroundColor(.red)
-                    } else {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Front Content:").bold()
-                            TextEditor(text: $frontText)
-                                .font(.body)
-                                .focused($focusedField, equals: .front)
-                                .onKeyPress(.tab) {
-                                    focusedField = .back
-                                    return .handled
+                } else {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Text("Create Flashcard")
+                                .font(.title2)
+                                .bold()
+                            Spacer()
+                            let flaggedRemaining = allCards.filter { $0.isFlagged }
+                            if !flaggedRemaining.isEmpty {
+                                Button("Review Flagged Cards (\(flaggedRemaining.count))") {
+                                    setupFlaggedCorrectionQueue()
                                 }
-                                .frame(height: 80)
-                                .padding(4)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(4)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                                 )
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .pointingHandCursor()
+                            }
+                        }
+                        
+                        if activeModuleId == nil {
+                            Text("Select a module in the sidebar first before adding cards.")
+                                .foregroundColor(.red)
+                                .padding(.vertical, 8)
+                        } else {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Front Content:").bold()
+                                    if isGeneratingFrontLatex {
+                                        Spacer()
+                                        TypingIndicatorBubble()
+                                    }
+                                }
+                                
+                                TextEditor(text: $frontText)
+                                    .font(.body)
+                                    .focused($focusedField, equals: .front)
+                                    .onKeyPress(.tab) {
+                                        focusedField = .back
+                                        return .handled
+                                    }
+                                    .frame(height: 80)
+                                    .padding(6)
+                                    .background(Color(NSColor.controlBackgroundColor))
+                                    .cornerRadius(6)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                                     )
+                            }
                             
-                            Text("Back Content:").bold()
-                            TextEditor(text: $backText)
-                                .font(.body)
-                                .focused($focusedField, equals: .back)
-                                .onKeyPress(.tab) {
-                                    focusedField = .front
-                                    return .handled
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Back Content:").bold()
+                                    if isGeneratingBackLatex {
+                                        Spacer()
+                                        TypingIndicatorBubble()
+                                    }
                                 }
-                                .frame(height: 80)
-                                .padding(4)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(4)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
-                                )
+                                
+                                TextEditor(text: $backText)
+                                    .font(.body)
+                                    .focused($focusedField, equals: .back)
+                                    .onKeyPress(.tab) {
+                                        focusedField = .front
+                                        return .handled
+                                    }
+                                    .frame(height: 80)
+                                    .padding(6)
+                                    .background(Color(NSColor.controlBackgroundColor))
+                                    .cornerRadius(6)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                                     )
+                            }
                             
                             // Live LaTeX Preview
-                            VStack(alignment: .leading, spacing: 4) {
+                            VStack(alignment: .leading, spacing: 6) {
                                 Text("Live LaTeX Preview:").bold()
                                 VStack(alignment: .leading, spacing: 8) {
-                                    if !frontText.isEmpty || !backText.isEmpty {
-                                        if !frontText.isEmpty {
-                                            VStack(alignment: .leading, spacing: 2) {
+                                    if !frontText.isEmpty || !backText.isEmpty || isGeneratingFrontLatex || isGeneratingBackLatex {
+                                        if !frontText.isEmpty || isGeneratingFrontLatex {
+                                            VStack(alignment: .leading, spacing: 4) {
                                                 Text("Front:").font(.caption).foregroundColor(.secondary)
-                                                if isLaTeX(frontText) {
-                                                    LaTeXView(latex: frontText)
-                                                        .frame(height: 60)
-                                                } else {
-                                                    Text(frontText)
-                                                        .font(.body)
-                                                        .padding(.horizontal, 4)
+                                                let clean = AILatexPlaceholder.cleanText(frontText)
+                                                if !clean.isEmpty {
+                                                    if isLaTeX(clean) {
+                                                        LaTeXView(latex: clean)
+                                                            .frame(height: 45)
+                                                    } else {
+                                                        Text(clean)
+                                                            .font(.body)
+                                                            .padding(.horizontal, 4)
+                                                    }
+                                                }
+                                                if isGeneratingFrontLatex || AILatexPlaceholder.hasPlaceholder(frontText) {
+                                                    AILaTeXGeneratingView()
+                                                        .frame(height: 42)
                                                 }
                                             }
                                         }
-                                        if !backText.isEmpty {
-                                            VStack(alignment: .leading, spacing: 2) {
+                                        if !backText.isEmpty || isGeneratingBackLatex {
+                                            VStack(alignment: .leading, spacing: 4) {
                                                 Text("Back:").font(.caption).foregroundColor(.secondary)
-                                                if isLaTeX(backText) {
-                                                    LaTeXView(latex: backText)
-                                                        .frame(height: 60)
-                                                } else {
-                                                    Text(backText)
-                                                        .font(.body)
-                                                        .padding(.horizontal, 4)
+                                                let clean = AILatexPlaceholder.cleanText(backText)
+                                                if !clean.isEmpty {
+                                                    if isLaTeX(clean) {
+                                                        LaTeXView(latex: clean)
+                                                            .frame(height: 45)
+                                                    } else {
+                                                        Text(clean)
+                                                            .font(.body)
+                                                            .padding(.horizontal, 4)
+                                                    }
+                                                }
+                                                if isGeneratingBackLatex || AILatexPlaceholder.hasPlaceholder(backText) {
+                                                    AILaTeXGeneratingView()
+                                                        .frame(height: 42)
                                                 }
                                             }
                                         }
@@ -1475,13 +1587,15 @@ struct FlashcardsView: View {
                                             .padding(.vertical, 5)
                                     }
                                 }
-                                .padding(10)
+                                .padding(12)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(Color(NSColor.windowBackgroundColor))
                                 .cornerRadius(6)
-                                .border(Color.secondary.opacity(0.15), width: 1)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                                )
                             }
-                            .padding(.vertical, 5)
                             
                             HStack {
                                 Button(action: {
@@ -1502,15 +1616,15 @@ struct FlashcardsView: View {
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .pointingHandCursor()
-                                .disabled(frontText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || backText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .disabled(frontText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || backText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isGeneratingFrontLatex || isGeneratingBackLatex)
                             }
                         }
-                        .padding(.vertical, 10)
                     }
                 }
             }
+            .padding(28)
+            .frame(maxWidth: 800, alignment: .leading)
         }
-        .padding(25)
         .sheet(isPresented: $showLatexHelper) {
             latexHelperSheet
         }
@@ -1603,8 +1717,8 @@ struct FlashcardsView: View {
                         
                         if isTranslatingLaTeX {
                             HStack {
-                                ProgressView().controlSize(.small)
-                                Text("Translating via AI model...")
+                                TypingIndicatorBubble()
+                                Text("Translating equation via AI model...")
                                     .foregroundColor(.secondary)
                             }
                         } else {
@@ -1650,23 +1764,33 @@ struct FlashcardsView: View {
                 .buttonStyle(.bordered)
                 .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
                 
-                Button("Paste to Front Content") {
-                    let wrapped = wrapInLaTeXDelimiters(latexResult)
-                    frontText += (frontText.isEmpty ? "" : " ") + wrapped
-                    showLatexHelper = false
-                    resetLatexHelper()
+                Button(action: {
+                    pasteOrQueueLatex(target: .front)
+                }) {
+                    HStack(spacing: 5) {
+                        if isTranslatingLaTeX {
+                            Text("Paste to Front & Continue")
+                        } else {
+                            Text("Paste to Front Content")
+                        }
+                    }
                 }
                 .buttonStyle(.bordered)
-                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
+                .disabled(latexInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && latexClipboardImage == nil && latexResult.isEmpty)
                 
-                Button("Paste to Back Content") {
-                    let wrapped = wrapInLaTeXDelimiters(latexResult)
-                    backText += (backText.isEmpty ? "" : " ") + wrapped
-                    showLatexHelper = false
-                    resetLatexHelper()
+                Button(action: {
+                    pasteOrQueueLatex(target: .back)
+                }) {
+                    HStack(spacing: 5) {
+                        if isTranslatingLaTeX {
+                            Text("Paste to Back & Continue")
+                        } else {
+                            Text("Paste to Back Content")
+                        }
+                    }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
+                .disabled(latexInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && latexClipboardImage == nil && latexResult.isEmpty)
             }
         }
         .padding(20)
@@ -1678,53 +1802,121 @@ struct FlashcardsView: View {
             self.latexClipboardImage = image
             if let optimized = AIHelper.optimizeImageForOCR(image) {
                 self.latexImageBase64 = optimized
-                translateImageToLatex()
+                translateImageToLatex(base64: optimized)
             }
         }
     }
     
-    private func translateTextToLatex() {
-        self.isTranslatingLaTeX = true
-        self.latexResult = ""
-        Task {
-            let res = await AIHelper.shared.translateToLaTeX(rawEquation: latexInput)
-            DispatchQueue.main.async {
-                self.isTranslatingLaTeX = false
-                if let latex = res {
-                    let wrapped = self.wrapInLaTeXDelimiters(latex)
-                    self.latexResult = wrapped
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(wrapped, forType: .string)
-                } else {
-                    self.latexResult = "Error: Could not translate equation. Verify that your AI host (Local or Tailscale) is connected."
-                }
+    private func pasteOrQueueLatex(target: FocusField) {
+        if !latexResult.isEmpty && !latexResult.hasPrefix("Error:") && !latexResult.hasPrefix("No vision model") {
+            let wrapped = wrapInLaTeXDelimiters(latexResult)
+            if target == .front {
+                AILatexPlaceholder.replaceOrAppend(in: &frontText, with: wrapped)
+            } else {
+                AILatexPlaceholder.replaceOrAppend(in: &backText, with: wrapped)
+            }
+            showLatexHelper = false
+            resetLatexHelper()
+            return
+        }
+        
+        let pendingInput = latexInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingImg = latexClipboardImage
+        let pendingB64 = latexImageBase64
+        
+        if target == .front {
+            isGeneratingFrontLatex = true
+            focusedField = .front
+        } else {
+            isGeneratingBackLatex = true
+            focusedField = .back
+        }
+        
+        showLatexHelper = false
+        
+        if !isTranslatingLaTeX {
+            if !pendingInput.isEmpty {
+                translateTextToLatex(input: pendingInput, target: target)
+            } else if !pendingB64.isEmpty {
+                translateImageToLatex(base64: pendingB64, target: target)
+            } else if let img = pendingImg, let opt = AIHelper.optimizeImageForOCR(img) {
+                translateImageToLatex(base64: opt, target: target)
             }
         }
     }
     
-    private func translateImageToLatex() {
+    private func translateTextToLatex(input: String? = nil, target: FocusField? = nil) {
+        let textToTranslate = input ?? self.latexInput
+        guard !textToTranslate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        
         self.isTranslatingLaTeX = true
         self.latexResult = ""
         Task {
-            let res = await AIHelper.shared.translateImageToLaTeX(base64Image: latexImageBase64)
-            DispatchQueue.main.async {
-                self.isTranslatingLaTeX = false
-                if let latex = res {
-                    if latex == "MODEL_NOT_FOUND" {
-                        self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
-                    } else {
-                        let wrapped = self.wrapInLaTeXDelimiters(latex)
-                        self.latexResult = wrapped
-                        let pasteboard = NSPasteboard.general
-                        pasteboard.clearContents()
-                        pasteboard.setString(wrapped, forType: .string)
-                    }
-                } else {
-                    self.latexResult = "Error: Could not transcribe equation image. Verify that your AI host (Local or Tailscale) is connected."
-                }
+            let res = await AIHelper.shared.translateToLaTeX(rawEquation: textToTranslate)
+            await MainActor.run {
+                self.applyLatexTranslationResult(res, target: target)
             }
         }
+    }
+    
+    private func translateImageToLatex(base64: String? = nil, target: FocusField? = nil) {
+        let b64 = base64 ?? self.latexImageBase64
+        guard !b64.isEmpty else { return }
+        
+        self.isTranslatingLaTeX = true
+        self.latexResult = ""
+        Task {
+            let res = await AIHelper.shared.translateImageToLaTeX(base64Image: b64)
+            await MainActor.run {
+                self.applyLatexTranslationResult(res, target: target)
+            }
+        }
+    }
+    
+    private func applyLatexTranslationResult(_ res: String?, target: FocusField? = nil) {
+        self.isTranslatingLaTeX = false
+        if let latex = res, !latex.isEmpty {
+            if latex == "MODEL_NOT_FOUND" {
+                self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
+                cleanUpPendingPlaceholders()
+                sendAppNotification(title: "Vision Model Missing", body: "Please pull qwen2.5vl on your AI server.")
+            } else {
+                let wrapped = self.wrapInLaTeXDelimiters(latex)
+                self.latexResult = wrapped
+                
+                var inserted = false
+                if target == .front || isGeneratingFrontLatex || AILatexPlaceholder.hasPlaceholder(frontText) {
+                    AILatexPlaceholder.replaceOrAppend(in: &frontText, with: wrapped)
+                    self.isGeneratingFrontLatex = false
+                    inserted = true
+                }
+                
+                if target == .back || isGeneratingBackLatex || AILatexPlaceholder.hasPlaceholder(backText) {
+                    AILatexPlaceholder.replaceOrAppend(in: &backText, with: wrapped)
+                    self.isGeneratingBackLatex = false
+                    inserted = true
+                }
+                
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(wrapped, forType: .string)
+                
+                if inserted {
+                    sendAppNotification(title: "LaTeX Ready", body: "AI generated equation inserted into flashcard.")
+                }
+            }
+        } else {
+            self.latexResult = "Error: Could not translate equation. Verify that your AI host (Local or Tailscale) is connected."
+            cleanUpPendingPlaceholders()
+            sendAppNotification(title: "LaTeX Failed", body: "Could not translate equation. Check AI connection.")
+        }
+    }
+    
+    private func cleanUpPendingPlaceholders() {
+        self.isGeneratingFrontLatex = false
+        self.isGeneratingBackLatex = false
+        self.frontText = AILatexPlaceholder.cleanText(self.frontText)
+        self.backText = AILatexPlaceholder.cleanText(self.backText)
     }
     
     private func resetLatexHelper() {
@@ -1878,12 +2070,21 @@ struct EditFlashcardSheetView: View {
     @State private var frontText: String
     @State private var backText: String
     
+    @State private var isGeneratingFrontLatex: Bool = false
+    @State private var isGeneratingBackLatex: Bool = false
+    
     @State private var showLatexHelper: Bool = false
     @State private var latexInput: String = ""
     @State private var latexResult: String = ""
     @State private var latexClipboardImage: NSImage? = nil
     @State private var latexImageBase64: String = ""
     @State private var isTranslatingLaTeX: Bool = false
+    
+    enum EditFocusField: Hashable {
+        case front
+        case back
+    }
+    @FocusState private var focusedField: EditFocusField?
     
     init(card: Flashcard, onSave: @escaping (String, String) -> Void, onCancel: @escaping () -> Void) {
         self.card = card
@@ -1905,10 +2106,17 @@ struct EditFlashcardSheetView: View {
                 
                 // Front (Question) Section
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Front Content (Plain Text):")
-                        .bold()
+                    HStack {
+                        Text("Front Content (Plain Text):")
+                            .bold()
+                        if isGeneratingFrontLatex {
+                            Spacer()
+                            TypingIndicatorBubble()
+                        }
+                    }
                     TextEditor(text: $frontText)
                         .font(.system(.body, design: .monospaced))
+                        .focused($focusedField, equals: .front)
                         .frame(height: 75)
                         .padding(4)
                         .background(Color(NSColor.controlBackgroundColor))
@@ -1920,31 +2128,41 @@ struct EditFlashcardSheetView: View {
                     
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Front Rendered Preview:").font(.caption).bold().foregroundColor(.secondary)
-                        if isLaTeX(frontText) {
-                            LaTeXView(latex: frontText)
-                                .frame(height: 55)
-                                .padding(4)
-                                .background(Color(NSColor.windowBackgroundColor))
-                                .cornerRadius(6)
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
-                        } else {
-                            Text(frontText.isEmpty ? "No content" : frontText)
-                                .font(.body)
-                                .padding(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(NSColor.windowBackgroundColor))
-                                .cornerRadius(6)
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+                        let clean = AILatexPlaceholder.cleanText(frontText)
+                        if !clean.isEmpty {
+                            if isLaTeX(clean) {
+                                LaTeXView(latex: clean)
+                                    .frame(height: 45)
+                            } else {
+                                Text(clean)
+                                    .font(.body)
+                                    .padding(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color(NSColor.windowBackgroundColor))
+                                    .cornerRadius(6)
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+                            }
+                        }
+                        if isGeneratingFrontLatex || AILatexPlaceholder.hasPlaceholder(frontText) {
+                            AILaTeXGeneratingView()
+                                .frame(height: 42)
                         }
                     }
                 }
                 
                 // Back (Answer) Section
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Back Content (Plain Text):")
-                        .bold()
+                    HStack {
+                        Text("Back Content (Plain Text):")
+                            .bold()
+                        if isGeneratingBackLatex {
+                            Spacer()
+                            TypingIndicatorBubble()
+                        }
+                    }
                     TextEditor(text: $backText)
                         .font(.system(.body, design: .monospaced))
+                        .focused($focusedField, equals: .back)
                         .frame(height: 75)
                         .padding(4)
                         .background(Color(NSColor.controlBackgroundColor))
@@ -1956,21 +2174,24 @@ struct EditFlashcardSheetView: View {
                     
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Back Rendered Preview:").font(.caption).bold().foregroundColor(.secondary)
-                        if isLaTeX(backText) {
-                            LaTeXView(latex: backText)
-                                .frame(height: 55)
-                                .padding(4)
-                                .background(Color(NSColor.windowBackgroundColor))
-                                .cornerRadius(6)
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
-                        } else {
-                            Text(backText.isEmpty ? "No content" : backText)
-                                .font(.body)
-                                .padding(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(NSColor.windowBackgroundColor))
-                                .cornerRadius(6)
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+                        let clean = AILatexPlaceholder.cleanText(backText)
+                        if !clean.isEmpty {
+                            if isLaTeX(clean) {
+                                LaTeXView(latex: clean)
+                                    .frame(height: 45)
+                            } else {
+                                Text(clean)
+                                    .font(.body)
+                                    .padding(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color(NSColor.windowBackgroundColor))
+                                    .cornerRadius(6)
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+                            }
+                        }
+                        if isGeneratingBackLatex || AILatexPlaceholder.hasPlaceholder(backText) {
+                            AILaTeXGeneratingView()
+                                .frame(height: 42)
                         }
                     }
                 }
@@ -1994,7 +2215,7 @@ struct EditFlashcardSheetView: View {
                         onSave(trimmedFront, trimmedBack)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(frontText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || backText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(frontText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || backText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isGeneratingFrontLatex || isGeneratingBackLatex)
                 }
             }
             .padding(24)
@@ -2013,7 +2234,7 @@ struct EditFlashcardSheetView: View {
                         .font(.title2)
                         .bold()
                     
-                    Text("Describe an equation in plain text or paste an image from your clipboard, and local AI (Qwen) will convert it into raw LaTeX code.")
+                    Text("Describe an equation in plain text or paste an image from your clipboard, and AI will convert it into clean LaTeX code.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                     
@@ -2060,8 +2281,8 @@ struct EditFlashcardSheetView: View {
                         Text("Result LaTeX Code:").bold()
                         if isTranslatingLaTeX {
                             HStack {
-                                ProgressView().controlSize(.small)
-                                Text("Translating...").foregroundColor(.secondary)
+                                TypingIndicatorBubble()
+                                Text("Translating equation via AI model...").foregroundColor(.secondary)
                             }
                         } else {
                             TextEditor(text: $latexResult)
@@ -2090,26 +2311,39 @@ struct EditFlashcardSheetView: View {
             HStack {
                 Button("Close") {
                     showLatexHelper = false
+                    resetLatexHelper()
                 }
                 .buttonStyle(.bordered)
                 
                 Spacer()
                 
-                Button("Paste to Front Content") {
-                    let wrapped = wrapInLaTeXDelimiters(latexResult)
-                    frontText += (frontText.isEmpty ? "" : " ") + wrapped
-                    showLatexHelper = false
+                Button(action: {
+                    pasteOrQueueLatex(target: .front)
+                }) {
+                    HStack(spacing: 5) {
+                        if isTranslatingLaTeX {
+                            Text("Paste to Front & Continue")
+                        } else {
+                            Text("Paste to Front Content")
+                        }
+                    }
                 }
                 .buttonStyle(.bordered)
-                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
+                .disabled(latexInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && latexClipboardImage == nil && latexResult.isEmpty)
                 
-                Button("Paste to Back Content") {
-                    let wrapped = wrapInLaTeXDelimiters(latexResult)
-                    backText += (backText.isEmpty ? "" : " ") + wrapped
-                    showLatexHelper = false
+                Button(action: {
+                    pasteOrQueueLatex(target: .back)
+                }) {
+                    HStack(spacing: 5) {
+                        if isTranslatingLaTeX {
+                            Text("Paste to Back & Continue")
+                        } else {
+                            Text("Paste to Back Content")
+                        }
+                    }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(latexResult.isEmpty || latexResult.hasPrefix("Error:") || latexResult.hasPrefix("No vision model"))
+                .disabled(latexInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && latexClipboardImage == nil && latexResult.isEmpty)
             }
         }
         .padding(20)
@@ -2121,47 +2355,128 @@ struct EditFlashcardSheetView: View {
             self.latexClipboardImage = image
             if let optimized = AIHelper.optimizeImageForOCR(image) {
                 self.latexImageBase64 = optimized
-                translateImageToLatex()
+                translateImageToLatex(base64: optimized)
             }
         }
     }
     
-    private func translateTextToLatex() {
-        self.isTranslatingLaTeX = true
-        self.latexResult = ""
-        Task {
-            let res = await AIHelper.shared.translateToLaTeX(rawEquation: latexInput)
-            DispatchQueue.main.async {
-                self.isTranslatingLaTeX = false
-                if let latex = res {
-                    let wrapped = self.wrapInLaTeXDelimiters(latex)
-                    self.latexResult = wrapped
-                } else {
-                    self.latexResult = "Error: Could not translate equation. Verify that your AI host (Local or Tailscale) is connected."
-                }
+    private func pasteOrQueueLatex(target: EditFocusField) {
+        if !latexResult.isEmpty && !latexResult.hasPrefix("Error:") && !latexResult.hasPrefix("No vision model") {
+            let wrapped = wrapInLaTeXDelimiters(latexResult)
+            if target == .front {
+                AILatexPlaceholder.replaceOrAppend(in: &frontText, with: wrapped)
+            } else {
+                AILatexPlaceholder.replaceOrAppend(in: &backText, with: wrapped)
+            }
+            showLatexHelper = false
+            resetLatexHelper()
+            return
+        }
+        
+        let pendingInput = latexInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingImg = latexClipboardImage
+        let pendingB64 = latexImageBase64
+        
+        if target == .front {
+            isGeneratingFrontLatex = true
+            focusedField = .front
+        } else {
+            isGeneratingBackLatex = true
+            focusedField = .back
+        }
+        
+        showLatexHelper = false
+        
+        if !isTranslatingLaTeX {
+            if !pendingInput.isEmpty {
+                translateTextToLatex(input: pendingInput, target: target)
+            } else if !pendingB64.isEmpty {
+                translateImageToLatex(base64: pendingB64, target: target)
+            } else if let img = pendingImg, let opt = AIHelper.optimizeImageForOCR(img) {
+                translateImageToLatex(base64: opt, target: target)
             }
         }
     }
     
-    private func translateImageToLatex() {
+    private func translateTextToLatex(input: String? = nil, target: EditFocusField? = nil) {
+        let textToTranslate = input ?? self.latexInput
+        guard !textToTranslate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        
         self.isTranslatingLaTeX = true
         self.latexResult = ""
         Task {
-            let res = await AIHelper.shared.translateImageToLaTeX(base64Image: latexImageBase64)
-            DispatchQueue.main.async {
-                self.isTranslatingLaTeX = false
-                if let latex = res {
-                    if latex == "MODEL_NOT_FOUND" {
-                        self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
-                    } else {
-                        let wrapped = self.wrapInLaTeXDelimiters(latex)
-                        self.latexResult = wrapped
-                    }
-                } else {
-                    self.latexResult = "Error: Could not transcribe equation image. Verify that your AI host (Local or Tailscale) is connected."
-                }
+            let res = await AIHelper.shared.translateToLaTeX(rawEquation: textToTranslate)
+            await MainActor.run {
+                self.applyLatexTranslationResult(res, target: target)
             }
         }
+    }
+    
+    private func translateImageToLatex(base64: String? = nil, target: EditFocusField? = nil) {
+        let b64 = base64 ?? self.latexImageBase64
+        guard !b64.isEmpty else { return }
+        
+        self.isTranslatingLaTeX = true
+        self.latexResult = ""
+        Task {
+            let res = await AIHelper.shared.translateImageToLaTeX(base64Image: b64)
+            await MainActor.run {
+                self.applyLatexTranslationResult(res, target: target)
+            }
+        }
+    }
+    
+    private func applyLatexTranslationResult(_ res: String?, target: EditFocusField? = nil) {
+        self.isTranslatingLaTeX = false
+        if let latex = res, !latex.isEmpty {
+            if latex == "MODEL_NOT_FOUND" {
+                self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
+                cleanUpPendingPlaceholders()
+                sendAppNotification(title: "Vision Model Missing", body: "Please pull qwen2.5vl on your AI server.")
+            } else {
+                let wrapped = self.wrapInLaTeXDelimiters(latex)
+                self.latexResult = wrapped
+                
+                var inserted = false
+                if target == .front || isGeneratingFrontLatex || AILatexPlaceholder.hasPlaceholder(frontText) {
+                    AILatexPlaceholder.replaceOrAppend(in: &frontText, with: wrapped)
+                    self.isGeneratingFrontLatex = false
+                    inserted = true
+                }
+                if target == .back || isGeneratingBackLatex || AILatexPlaceholder.hasPlaceholder(backText) {
+                    AILatexPlaceholder.replaceOrAppend(in: &backText, with: wrapped)
+                    self.isGeneratingBackLatex = false
+                    inserted = true
+                }
+                
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(wrapped, forType: .string)
+                
+                if inserted {
+                    sendAppNotification(title: "LaTeX Ready", body: "AI generated equation inserted into flashcard.")
+                }
+            }
+        } else {
+            self.latexResult = "Error: Could not transcribe equation. Verify that your AI host (Local or Tailscale) is connected."
+            cleanUpPendingPlaceholders()
+            sendAppNotification(title: "LaTeX Failed", body: "Could not translate equation. Check AI connection.")
+        }
+    }
+    
+    private func cleanUpPendingPlaceholders() {
+        self.isGeneratingFrontLatex = false
+        self.isGeneratingBackLatex = false
+        self.frontText = AILatexPlaceholder.cleanText(self.frontText)
+        self.backText = AILatexPlaceholder.cleanText(self.backText)
+    }
+    
+    private func resetLatexHelper() {
+        latexInput = ""
+        latexResult = ""
+        latexClipboardImage = nil
+        latexImageBase64 = ""
+        isTranslatingLaTeX = false
     }
     
     private func wrapInLaTeXDelimiters(_ text: String) -> String {

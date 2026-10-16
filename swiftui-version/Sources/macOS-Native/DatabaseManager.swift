@@ -335,7 +335,7 @@ struct FeynmanChat: Identifiable, Hashable {
     func execute(sql: String, params: [Any] = []) -> Bool {
         var statement: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
-            let errmsg = String(cString: sqlite3_errmsg(db)!)
+            let errmsg = sqlite3_errmsg(db).map { String(cString: $0) } ?? "unknown sqlite error"
             print("error preparing statement: \(errmsg)")
             return false
         }
@@ -343,7 +343,7 @@ struct FeynmanChat: Identifiable, Hashable {
         bindParams(statement: statement, params: params)
         
         if sqlite3_step(statement) != SQLITE_DONE {
-            let errmsg = String(cString: sqlite3_errmsg(db)!)
+            let errmsg = sqlite3_errmsg(db).map { String(cString: $0) } ?? "unknown sqlite error"
             print("failure executing: \(errmsg)")
             sqlite3_finalize(statement)
             return false
@@ -358,7 +358,7 @@ struct FeynmanChat: Identifiable, Hashable {
         var result: [[String: Any]] = []
         
         if sqlite3_prepare_v2(db, sql, -1, &statement, nil) != SQLITE_OK {
-            let errmsg = String(cString: sqlite3_errmsg(db)!)
+            let errmsg = sqlite3_errmsg(db).map { String(cString: $0) } ?? "unknown sqlite error"
             print("error preparing query: \(errmsg)")
             return []
         }
@@ -1182,12 +1182,12 @@ struct FeynmanChat: Identifiable, Hashable {
             params.append(formatter.string(from: Date()))
         } else if timeframe == "This Week" {
             let calendar = Calendar.current
-            let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date()))!
+            let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date())) ?? Date()
             sql += " AND date >= ?"
             params.append(formatter.string(from: startOfWeek))
         } else if timeframe == "This Month" {
             let calendar = Calendar.current
-            let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: Date()))!
+            let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: Date())) ?? Date()
             sql += " AND date >= ?"
             params.append(formatter.string(from: startOfMonth))
         }
@@ -1217,14 +1217,14 @@ struct FeynmanChat: Identifiable, Hashable {
             pbParams.append(today)
         } else if timeframe == "This Week" {
             let calendar = Calendar.current
-            let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date()))!
+            let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date())) ?? Date()
             let startStr = formatter.string(from: startOfWeek)
             conditions.append("created_date >= ?")
             fcParams.append(startStr)
             pbParams.append(startStr)
         } else if timeframe == "This Month" {
             let calendar = Calendar.current
-            let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: Date()))!
+            let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: Date())) ?? Date()
             let startStr = formatter.string(from: startOfMonth)
             conditions.append("created_date >= ?")
             fcParams.append(startStr)
@@ -1271,7 +1271,7 @@ struct FeynmanChat: Identifiable, Hashable {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         let calendar = Calendar.current
-        let oneYearAgo = calendar.date(byAdding: .year, value: -1, to: Date())!
+        let oneYearAgo = calendar.date(byAdding: .year, value: -1, to: Date()) ?? Date()
         let oneYearAgoStr = formatter.string(from: oneYearAgo)
         
         let sql: String
@@ -1315,7 +1315,7 @@ struct FeynmanChat: Identifiable, Hashable {
         if timeframe == "Today" {
             // Last 7 days including today
             for i in (0..<7).reversed() {
-                let date = calendar.date(byAdding: .day, value: -i, to: Date())!
+                let date = calendar.date(byAdding: .day, value: -i, to: Date()) ?? Date()
                 let lblFormatter = DateFormatter()
                 lblFormatter.dateFormat = "E" // e.g. Mon
                 list.append((lblFormatter.string(from: date), formatter.string(from: date)))
@@ -1362,9 +1362,9 @@ struct FeynmanChat: Identifiable, Hashable {
                 params.append(item.date)
             } else if timeframe == "This Week" {
                 // Find start and end of that week
-                if let dateVal = formatter.date(from: item.date) {
-                    let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dateVal))!
-                    let endOfWeek = calendar.date(byAdding: .day, value: 6, to: startOfWeek)!
+                if let dateVal = formatter.date(from: item.date),
+                   let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dateVal)),
+                   let endOfWeek = calendar.date(byAdding: .day, value: 6, to: startOfWeek) {
                     fcSQL += "created_date >= ? AND created_date <= ?"
                     pbSQL += "created_date >= ? AND created_date <= ?"
                     params.append(formatter.string(from: startOfWeek))
@@ -1372,9 +1372,10 @@ struct FeynmanChat: Identifiable, Hashable {
                 }
             } else {
                 // Month grouping
-                if let dateVal = formatter.date(from: item.date) {
-                    let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: dateVal))!
-                    let endOfMonth = calendar.date(byAdding: .day, value: -1, to: calendar.date(byAdding: .month, value: 1, to: startOfMonth)!)!
+                if let dateVal = formatter.date(from: item.date),
+                   let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: dateVal)),
+                   let nextMonth = calendar.date(byAdding: .month, value: 1, to: startOfMonth),
+                   let endOfMonth = calendar.date(byAdding: .day, value: -1, to: nextMonth) {
                     fcSQL += "created_date >= ? AND created_date <= ?"
                     pbSQL += "created_date >= ? AND created_date <= ?"
                     params.append(formatter.string(from: startOfMonth))
@@ -1401,10 +1402,11 @@ struct FeynmanChat: Identifiable, Hashable {
         if timeframe == "Today" {
             // Last 7 days including today
             for i in (0..<7).reversed() {
-                let date = calendar.date(byAdding: .day, value: -i, to: Date())!
-                let lblFormatter = DateFormatter()
-                lblFormatter.dateFormat = "E" // e.g. Mon
-                list.append((lblFormatter.string(from: date), formatter.string(from: date)))
+                if let date = calendar.date(byAdding: .day, value: -i, to: Date()) {
+                    let lblFormatter = DateFormatter()
+                    lblFormatter.dateFormat = "E" // e.g. Mon
+                    list.append((lblFormatter.string(from: date), formatter.string(from: date)))
+                }
             }
         } else if timeframe == "This Week" {
             // Last 5 weeks
@@ -1452,17 +1454,18 @@ struct FeynmanChat: Identifiable, Hashable {
                 sql += "date = ?"
                 params.append(item.date)
             } else if timeframe == "This Week" {
-                if let dateVal = formatter.date(from: item.date) {
-                    let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dateVal))!
-                    let endOfWeek = calendar.date(byAdding: .day, value: 6, to: startOfWeek)!
+                if let dateVal = formatter.date(from: item.date),
+                   let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dateVal)),
+                   let endOfWeek = calendar.date(byAdding: .day, value: 6, to: startOfWeek) {
                     sql += "date >= ? AND date <= ?"
                     params.append(formatter.string(from: startOfWeek))
                     params.append(formatter.string(from: endOfWeek))
                 }
             } else {
-                if let dateVal = formatter.date(from: item.date) {
-                    let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: dateVal))!
-                    let endOfMonth = calendar.date(byAdding: .day, value: -1, to: calendar.date(byAdding: .month, value: 1, to: startOfMonth)!)!
+                if let dateVal = formatter.date(from: item.date),
+                   let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: dateVal)),
+                   let nextMonth = calendar.date(byAdding: .month, value: 1, to: startOfMonth),
+                   let endOfMonth = calendar.date(byAdding: .day, value: -1, to: nextMonth) {
                     sql += "date >= ? AND date <= ?"
                     params.append(formatter.string(from: startOfMonth))
                     params.append(formatter.string(from: endOfMonth))
@@ -1560,7 +1563,7 @@ struct FeynmanChat: Identifiable, Hashable {
         let todayStr = formatter.string(from: today)
         
         for i in 0..<7 {
-            let targetDate = calendar.date(byAdding: .day, value: i, to: today)!
+            let targetDate = calendar.date(byAdding: .day, value: i, to: today) ?? today
             let dateStr = formatter.string(from: targetDate)
             let dayLabel = (i == 0) ? "Today" : ((i == 1) ? "Tomorrow" : lblFormatter.string(from: targetDate))
             
@@ -1637,7 +1640,7 @@ struct FeynmanChat: Identifiable, Hashable {
     
     func getWeeklyTimeDistribution(moduleId: Int?) -> [(rangeLabel: String, count: Int)] {
         let calendar = Calendar.current
-        let sevenDaysAgo = calendar.date(byAdding: .day, value: -7, to: Date())!
+        let sevenDaysAgo = calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         let dateStr = formatter.string(from: sevenDaysAgo)

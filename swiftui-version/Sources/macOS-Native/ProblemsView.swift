@@ -28,11 +28,7 @@ private func sendAppNotification(title: String, body: String) {
 }
 
 private func calcLaTeXMinHeight(_ text: String) -> CGFloat {
-    let lines = text.components(separatedBy: .newlines).count
-    let hasDisplayMath = text.contains("$$") || text.contains("\\[")
-    let displayMathCount = max(0, text.components(separatedBy: "$$").count - 1)
-    let calculated = CGFloat(lines * 28 + (hasDisplayMath ? max(1, displayMathCount) * 55 : 25))
-    return max(60, min(800, calculated))
+    return 16
 }
 
 enum ReviewSubMode {
@@ -1344,10 +1340,10 @@ struct ProblemsView: View {
                         )
                     }
                     
-                    if isExtracting {
+                    if isExtracting || aiHelper.isClassifyingProblems {
                         VStack(spacing: 12) {
                             ProgressView()
-                            Text("Local Qwen model is analyzing and transcribing practice problems...")
+                            Text("\(aiHelper.activeAIProvider.name) is analyzing and transcribing practice problems...")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -1416,7 +1412,7 @@ struct ProblemsView: View {
                                     
                                     if isLaTeX(extractedProblems[currentExtractionIndex].content) {
                                         LaTeXView(latex: extractedProblems[currentExtractionIndex].content)
-                                            .frame(minHeight: 120)
+                                            .frame(minHeight: calcLaTeXMinHeight(extractedProblems[currentExtractionIndex].content))
                                             .padding(8)
                                             .background(Color(NSColor.controlBackgroundColor))
                                             .cornerRadius(8)
@@ -1559,9 +1555,10 @@ struct ProblemsView: View {
         if panel.runModal() == .OK {
             for url in panel.urls {
                 let ext = url.pathExtension.lowercased()
+                let isAnswerFile = isAnswer || aiHelper.isAnswerFilename(url.lastPathComponent)
                 if ext == "pdf" {
-                    let item = PendingExtractionItem(type: .pdf, pathOrName: url.path, imageBase64: nil, isAnswerSource: isAnswer, originalPdfPath: url.path)
-                    if isAnswer {
+                    let item = PendingExtractionItem(type: .pdf, pathOrName: url.path, imageBase64: nil, isAnswerSource: isAnswerFile, originalPdfPath: url.path)
+                    if isAnswerFile {
                         if !pendingAnswers.contains(where: { $0.pathOrName == url.path }) {
                             pendingAnswers.append(item)
                         }
@@ -1576,8 +1573,8 @@ struct ProblemsView: View {
                        let bitmap = NSBitmapImageRep(data: tiff),
                        let pngData = bitmap.representation(using: .png, properties: [:]) {
                         let base64Str = pngData.base64EncodedString()
-                        let item = PendingExtractionItem(type: .image, pathOrName: url.path, imageBase64: base64Str, isAnswerSource: isAnswer)
-                        if isAnswer {
+                        let item = PendingExtractionItem(type: .image, pathOrName: url.path, imageBase64: base64Str, isAnswerSource: isAnswerFile)
+                        if isAnswerFile {
                             if !pendingAnswers.contains(where: { $0.pathOrName == url.path }) {
                                 pendingAnswers.append(item)
                             }
@@ -1613,9 +1610,10 @@ struct ProblemsView: View {
     private func handleDroppedURLs(urls: [URL], isAnswer: Bool) {
         for url in urls {
             let ext = url.pathExtension.lowercased()
+            let isAnswerFile = isAnswer || aiHelper.isAnswerFilename(url.lastPathComponent)
             if ext == "pdf" {
-                let item = PendingExtractionItem(type: .pdf, pathOrName: url.path, isAnswerSource: isAnswer)
-                if isAnswer {
+                let item = PendingExtractionItem(type: .pdf, pathOrName: url.path, isAnswerSource: isAnswerFile)
+                if isAnswerFile {
                     if !pendingAnswers.contains(where: { $0.pathOrName == url.path }) {
                         pendingAnswers.append(item)
                     }
@@ -1630,8 +1628,8 @@ struct ProblemsView: View {
                    let bitmap = NSBitmapImageRep(data: tiff),
                    let pngData = bitmap.representation(using: .png, properties: [:]) {
                     let base64Str = pngData.base64EncodedString()
-                    let item = PendingExtractionItem(type: .image, pathOrName: url.path, imageBase64: base64Str, isAnswerSource: isAnswer)
-                    if isAnswer {
+                    let item = PendingExtractionItem(type: .image, pathOrName: url.path, imageBase64: base64Str, isAnswerSource: isAnswerFile)
+                    if isAnswerFile {
                         if !pendingAnswers.contains(where: { $0.pathOrName == url.path }) {
                             pendingAnswers.append(item)
                         }

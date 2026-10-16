@@ -192,8 +192,10 @@ struct ModuleManagerView: View {
         let yearVal: Int?
         if yearFilter == "All Years" {
             yearVal = nil
+        } else if let numStr = yearFilter.components(separatedBy: " ").dropFirst().first {
+            yearVal = Int(numStr)
         } else {
-            yearVal = Int(yearFilter.components(separatedBy: " ")[1])
+            yearVal = nil
         }
         self.modules = DatabaseManager.shared.getModules(forYear: yearVal)
         self.selectedModule = nil
@@ -207,7 +209,9 @@ struct ModuleManagerView: View {
         hasTestDate = false
         testDateEntry = Date()
         
-        if yearFilter != "All Years", let year = Int(yearFilter.components(separatedBy: " ")[1]) {
+        if yearFilter != "All Years",
+           let numStr = yearFilter.components(separatedBy: " ").dropFirst().first,
+           let year = Int(numStr) {
             yearEntry = year
         } else {
             yearEntry = 1

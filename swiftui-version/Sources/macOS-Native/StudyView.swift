@@ -222,6 +222,16 @@ struct StudyView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("NoteTitleUpdated"))) { notification in
+            if let modId = activeModuleId {
+                self.notes = DatabaseManager.shared.getNotes(forModuleId: modId)
+            }
+            if let noteId = notification.userInfo?["noteId"] as? Int, noteId == selectedNote?.id {
+                if let updated = DatabaseManager.shared.getNote(id: noteId) {
+                    self.selectedNote = updated
+                }
+            }
+        }
     }
     
     private func loadNotes() {
@@ -329,45 +339,40 @@ struct CondensedSummaryView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             let blocks = parseBlocks(summaryText)
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+            ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
                 switch block {
                 case .heading(let text):
                     HStack(spacing: 8) {
                         Rectangle()
                             .fill(Color.blue)
-                            .frame(width: 3, height: 15)
+                            .frame(width: 3.5, height: 16)
                             .cornerRadius(2)
                         
                         Text(text)
                             .font(.system(size: 15, weight: .bold, design: .rounded))
                             .foregroundColor(.primary)
                     }
-                    .padding(.top, 6)
+                    .padding(.top, index == 0 ? 4 : 18)
+                    .padding(.bottom, 6)
                     
                 case .paragraph(let text):
                     if isLaTeX(text) {
                         LaTeXView(latex: text)
                             .allowsHitTesting(false)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .frame(minHeight: 24, maxHeight: 120)
                     } else {
                         Text(LocalizedStringKey(text))
                             .font(.system(size: 13, weight: .regular))
-                            .lineSpacing(3)
+                            .lineSpacing(3.5)
                             .foregroundColor(.primary.opacity(0.9))
                     }
                     
                 case .equation(let eqText):
                     let formattedEq = cleanEquation(eqText)
-                    HStack {
-                        Spacer()
-                        LaTeXView(latex: "$$ " + formattedEq + " $$")
-                            .allowsHitTesting(false)
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: 48, idealHeight: 65, maxHeight: 140)
-                        Spacer()
-                    }
-                    .padding(.vertical, 2)
+                    LaTeXView(latex: "$$ " + formattedEq + " $$")
+                        .allowsHitTesting(false)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 6)
                     
                 case .bullet(let text):
                     HStack(alignment: .top, spacing: 6) {
@@ -378,7 +383,6 @@ struct CondensedSummaryView: View {
                             LaTeXView(latex: text)
                                 .allowsHitTesting(false)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .frame(minHeight: 24, maxHeight: 90)
                         } else {
                             Text(LocalizedStringKey(text))
                                 .font(.system(size: 13, weight: .regular))
@@ -523,7 +527,6 @@ struct CondensedSummaryView: View {
         if clean.hasSuffix("$$") { clean = String(clean.dropLast(2)) }
         if clean.hasPrefix("$") { clean = String(clean.dropFirst()) }
         if clean.hasSuffix("$") { clean = String(clean.dropLast()) }
-        clean = clean.replacingOccurrences(of: "\\\\", with: "\\")
         return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

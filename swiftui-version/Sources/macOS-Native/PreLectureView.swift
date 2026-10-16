@@ -42,19 +42,43 @@ struct PreLectureView: View {
             ScrollView {
                 if let note = selectedNote {
                     VStack(alignment: .leading, spacing: 20) {
-                        Text("Pre-Lecture Prep Primer")
-                            .font(.title2)
-                            .bold()
-                        
-                        Text("Review this primer to build cognitive anchors before entering your lecture for: \(note.title)")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Pre-Lecture Prep Primer")
+                                    .font(.title2)
+                                    .bold()
+                                
+                                Text("Review this primer to build cognitive anchors before entering your lecture for: \(note.title)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            
+                            Spacer()
+                            
+                            Button(action: {
+                                regeneratePrimer(for: note)
+                            }) {
+                                HStack(spacing: 5) {
+                                    if isGenerating {
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "arrow.clockwise")
+                                    }
+                                    Text("Redo")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isGenerating)
+                            .pointingHandCursor()
+                        }
                         
                         if isGenerating && primerText.isEmpty {
                             VStack(spacing: 15) {
                                 Spacer().frame(height: 50)
                                 ProgressView()
-                                Text("Qwen is generating pre-lecture primer...")
+                                Text("\(AIHelper.shared.activeAIProvider.name) is generating pre-lecture primer...")
                                     .foregroundColor(.secondary)
                             }
                             .frame(maxWidth: .infinity, alignment: .center)
@@ -78,7 +102,7 @@ struct PreLectureView: View {
                                     .foregroundColor(.secondary)
                                 
                                 Button(action: {
-                                    loadPrimer(for: selectedNote)
+                                    regeneratePrimer(for: selectedNote)
                                 }) {
                                     HStack(spacing: 6) {
                                         Image(systemName: "arrow.clockwise")
@@ -154,8 +178,13 @@ struct PreLectureView: View {
             self.selectedNote = nil
             return
         }
+        let currentSelectedId = selectedNote?.id
         self.notes = DatabaseManager.shared.getNotes(forModuleId: modId)
-        self.selectedNote = notes.first
+        if let curId = currentSelectedId, let matching = notes.first(where: { $0.id == curId }) {
+            self.selectedNote = matching
+        } else {
+            self.selectedNote = notes.first
+        }
     }
     
     private func loadPrimer(for note: Note?) {
@@ -183,12 +212,46 @@ struct PreLectureView: View {
                 let res = await AIHelper.shared.generatePreLecturePrimer(currentNoteId: note.id, prevNoteId: prevId)
                 
                 DispatchQueue.main.async {
+                    if let idx = self.notes.firstIndex(where: { $0.id == note.id }) {
+                        self.notes[idx].preLecturePrimer = res
+                        if self.selectedNote?.id == note.id {
+                            self.selectedNote?.preLecturePrimer = res
+                        }
+                    }
                     if self.selectedNote?.id == note.id {
                         self.isGenerating = false
                         if let primer = res {
                             self.primerText = primer
-                            self.parsedSections = parsePrimerSections(primer)
+                            self.parsedSections = self.parsePrimerSections(primer)
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    private func regeneratePrimer(for note: Note?) {
+        guard let note = note else { return }
+        self.primerText = ""
+        self.parsedSections = []
+        self.isGenerating = true
+        
+        Task {
+            let idx = notes.firstIndex(where: { $0.id == note.id }) ?? 0
+            let prevId = idx > 0 ? notes[idx - 1].id : nil
+            let res = await AIHelper.shared.generatePreLecturePrimer(currentNoteId: note.id, prevNoteId: prevId, forceRegenerate: true)
+            DispatchQueue.main.async {
+                if let idx = self.notes.firstIndex(where: { $0.id == note.id }) {
+                    self.notes[idx].preLecturePrimer = res
+                    if self.selectedNote?.id == note.id {
+                        self.selectedNote?.preLecturePrimer = res
+                    }
+                }
+                if self.selectedNote?.id == note.id {
+                    self.isGenerating = false
+                    if let primer = res {
+                        self.primerText = primer
+                        self.parsedSections = self.parsePrimerSections(primer)
                     }
                 }
             }

@@ -136,8 +136,8 @@ struct HeatmapView: View {
         
         let weekday = calendar.component(.weekday, from: today)
         let daysToSubtract = (weekday - 2 + 7) % 7
-        let nearestMonday = calendar.date(byAdding: .day, value: -daysToSubtract, to: today)!
-        let startDate = calendar.date(byAdding: .weekOfYear, value: -(weeksCount - 1), to: nearestMonday)!
+        let nearestMonday = calendar.date(byAdding: .day, value: -daysToSubtract, to: today) ?? today
+        let startDate = calendar.date(byAdding: .weekOfYear, value: -(weeksCount - 1), to: nearestMonday) ?? nearestMonday
         
         var grid: [[Date]] = Array(repeating: [], count: 7)
         for week in 0..<weeksCount {
@@ -761,10 +761,10 @@ struct DashboardView: View {
         if timeframe == "Today" {
             return formatter.string(from: today)
         } else if timeframe == "This Week" {
-            let start = calendar.date(byAdding: .day, value: -7, to: today)!
+            let start = calendar.date(byAdding: .day, value: -7, to: today) ?? today
             return formatter.string(from: start)
         } else if timeframe == "This Month" {
-            let start = calendar.date(byAdding: .day, value: -30, to: today)!
+            let start = calendar.date(byAdding: .day, value: -30, to: today) ?? today
             return formatter.string(from: start)
         } else {
             return "1970-01-01"

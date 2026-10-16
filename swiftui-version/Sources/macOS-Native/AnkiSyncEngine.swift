@@ -10,7 +10,7 @@ public class AnkiSyncEngine: ObservableObject {
     @Published public var lastSyncStatus: String = ""
     @Published public var lastSyncDate: Date? = nil
     
-    private let url = URL(string: "http://127.0.0.1:8765")!
+    private let url = URL(string: "http://127.0.0.1:8765") ?? URL(fileURLWithPath: "/")
     
     private init() {}
     
@@ -169,7 +169,7 @@ public class AnkiSyncEngine: ObservableObject {
                             let easeFactor = Double(factor) / 1000.0
                             
                             let calendar = Calendar.current
-                            let nextReviewDate = calendar.date(byAdding: .day, value: max(1, interval), to: Date())!
+                            let nextReviewDate = calendar.date(byAdding: .day, value: max(1, interval), to: Date()) ?? Date()
                             let formatter = DateFormatter()
                             formatter.dateFormat = "yyyy-MM-dd"
                             let nextReviewStr = formatter.string(from: nextReviewDate)

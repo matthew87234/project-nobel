@@ -78,7 +78,20 @@ Background jobs run sequentially with wake-lock assertions (`idleSystemSleepDisa
 2. **Pass 2 (Generic Titles)**: Renames default titles (`isDefaultTitle`) using `generateDescriptiveTitle` with regex stripping for `<think>.*?</think>` tags.
 3. **Pass 3 (Missing Primers)**: Synthesizes `generatePreLecturePrimer` linking preceding lectures into upcoming lectures.
 
-### C. Power-Saver Interlock
+### C. Compute Topology: Remote Tailscale PC vs Local M4 Laptop
+- **Primary Compute Engine (Dedicated Tailscale PC)**:
+  - All heavy AI workloads (document vision parsing, mathematical derivations, step breakdowns, flashcard generation, Feynman chats) are offloaded to the dedicated PC over Tailscale (`100.x.y.z:11434`).
+  - Key remote models: `qwen2.5vl:7b` (Vision & Diagram OCR), `qwen2.5-coder:14b` (Math/Physics Coding), `deepseek-r1:14b` (Reasoning).
+- **Client Machine (M4 Laptop)**:
+  - Kept lightweight to preserve battery and RAM.
+  - Zero heavy background model execution unless explicitly designated for lightweight local tasks (e.g. fast local translation, instantaneous UI text formatting).
+- **High-Fidelity Extraction Pipeline (PDFs & Practice Sheets)**:
+  - **No Lossy Text Scraping**: Raw linear PDFKit text extraction MUST NEVER be used as a bypass for mathematical documents (avoids destroying 2D fractions, partial derivatives, exponents, and integrals).
+  - **Vision-First OCR**: Problem and solution PDFs are converted to high-resolution page images and transcribed via `qwen2.5vl:7b` over Tailscale.
+  - **Delimiter Normalization**: `\[ ... \]` $\to$ `$$...$$` and `\( ... \)` $\to$ `$...$` for consistent KaTeX rendering across all SwiftUI views.
+  - **Intelligent Step Splitting**: `splitSolutionIntoSteps` partitions derivations by subparts (`(i)-(x)`, `(a)-(f)`, `• Path A:`) and explicitly ignores equation reference numbers (`(1)-(99)`).
+
+### D. Power-Saver Interlock
 - Power-saving mode automatically disengages whenever pending jobs exist in the queue.
 - Only powers down local Ollama when the queue is 100% idle and provider is local (`idleTime > 300s`). Remote Tailscale jobs run uninterrupted.
 
@@ -104,7 +117,24 @@ Background jobs run sequentially with wake-lock assertions (`idleSystemSleepDisa
 ### C. Flashcards Centre & Anki Sync (`FlashcardsView.swift`)
 - **SM-2 Spaced Repetition**: Updates `next_review_date`, `interval`, `ease_factor`, `repetitions`.
 - **Flag Queue (`is_flagged`)**: Dedicated **strictly for marking cards that need correction, verification, or editing** (e.g. typos, LaTeX fixes). Flag status does NOT indicate topic importance or exam priority.
-- **Preset Counts**: Selector for practice queue size (5, 10, 15, Custom).
+- **Preset Counts**: Selector for practice queue size (5, 10, 15, Custom) strictly enforces review batch limits.
+
+### D. Dynamic Variable-Height `LaTeXView` & Centered Typography (`LaTeXView.swift`, `StudyView.swift`)
+- **Architecture**: Native SwiftUI `View` with `@State private var dynamicHeight: CGFloat` and internal `_LaTeXWebViewRepresentable`.
+- **Zero Fixed Fit Lengths**: Live KaTeX DOM bounding rect measurements (`getBoundingClientRect()`) are posted via WebKit script messages (`heightHandler`), dynamically resizing the SwiftUI frame without arbitrary `minHeight` clutter.
+- **Auto-Reflow**: An integrated DOM `ResizeObserver` detects column/window width changes and instantly recalibrates height.
+- **Centered Math**: Display equations (`$$ ... $$` and `\[ ... \]`) render centered in the middle (`margin: 0.15em auto !important; text-align: center !important`).
+- **Airy Section Hierarchy**: Headers feature `18pt` top padding, `6pt` bottom padding, and a blue accent indicator (`3.5pt × 16pt`) to provide clean breathing room between topics.
+
+### E. Pre-Lecture Prep Primer & Redo Workflow (`PreLectureView.swift`, `AIHelper.swift`)
+- **Cognitive Anchoring**: Builds pre-lecture primers synthesizing upcoming lectures with preceding lecture takeaways.
+- **Forced Regeneration**: Header includes a `[↻ Redo]` button that clears cached primers via `DatabaseManager.shared.clearPreLecturePrimer(noteId:)` and invokes `generatePreLecturePrimer(..., forceRegenerate: true)`.
+- **Selection State Persistence**: Preserves active lecture note selection across background AI sync status changes.
+
+### F. Pipelined Problem Extraction & Numbering Standards (`ProblemsView.swift`, `AIHelper.swift`)
+- **Concurrent Ingestion**: Batch question uploads pipeline transcription immediately into answer/step extraction while visual OCR continues continuously in parallel.
+- **Source Numbering**: Strips artificial top-level question numbering to respect source exam/sheet numbering, preserving sub-question labels (`(a)`, `(b)`, `(c)`, `(i)`, `(ii)`).
+- **Step Synchronization**: Problems with answers wait for step breakdown generation before displaying.
 
 ---
 

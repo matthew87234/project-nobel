@@ -24,7 +24,7 @@ struct SettingsView: View {
                 }
                 .tag("General")
         }
-        .frame(width: 580, height: 480)
+        .frame(width: 620, height: 560)
         .padding()
     }
 }
@@ -32,7 +32,19 @@ struct SettingsView: View {
 // MARK: - AI Settings Tab
 @MainActor
 struct AISettingsView: View {
-    @State private var activeSection: String = "text"
+    @State private var activeSection: String = "workload"
+    
+    // Workload preset
+    @AppStorage("ai_compute_preset") private var aiComputePreset: String = "hybrid_twotier"
+    
+    // Task-specific granular routes ("local" or "tailscale")
+    @AppStorage("route_vision") private var routeVision: String = "local"
+    @AppStorage("route_math") private var routeMath: String = "tailscale"
+    @AppStorage("route_steps") private var routeSteps: String = "tailscale"
+    @AppStorage("route_matching") private var routeMatching: String = "tailscale"
+    @AppStorage("route_classification") private var routeClassification: String = "tailscale"
+    @AppStorage("route_translation") private var routeTranslation: String = "local"
+    @AppStorage("route_feynman") private var routeFeynman: String = "local"
     
     // Local routing overrides
     @AppStorage("latex_always_local") private var latexAlwaysLocal: Bool = false
@@ -41,8 +53,8 @@ struct AISettingsView: View {
     @AppStorage("auto_power_saver_enabled") private var autoPowerSaverEnabled: Bool = true
     
     // Text model settings
-    @AppStorage("ai_provider") private var aiProvider: String = "local"
-    @AppStorage("local_model_general") private var localModelGeneral: String = "qwen2.5-coder:14b"
+    @AppStorage("ai_provider") private var aiProvider: String = "tailscale"
+    @AppStorage("local_model_general") private var localModelGeneral: String = "qwen2.5-coder:7b"
     @AppStorage("tailscale_host") private var tailscaleHost: String = ""
     @AppStorage("tailscale_model_general") private var tailscaleModelGeneral: String = "qwen2.5-coder:14b"
     @AppStorage("cloud_api_key") private var cloudApiKey: String = ""
@@ -79,21 +91,139 @@ struct AISettingsView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // Top-level slider: Text Model ↔ Vision Model
+            // Top-level slider: Workload Routing ↔ Text Model ↔ Vision Model
             Picker("", selection: $activeSection) {
+                Text("Workload & Routing").tag("workload")
                 Text("Text Model").tag("text")
                 Text("Vision Model").tag("vision")
             }
             .pickerStyle(.segmented)
-            .frame(width: 320)
+            .frame(width: 440)
             .padding(.bottom, 4)
             
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    if activeSection == "text" {
+                VStack(alignment: .leading, spacing: 16) {
+                    if activeSection == "workload" {
+                        // ── WORKLOAD & ROUTING ──
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Compute Topology Presets", systemImage: "square.grid.2x2")
+                                .font(.headline)
+                            Text("1-click architectural presets optimized for hardware capabilities and VRAM budgets.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            HStack(spacing: 10) {
+                                presetCard(
+                                    id: "hybrid_twotier",
+                                    title: "Two-Tier Hybrid",
+                                    badge: "Recommended",
+                                    badgeColor: .green,
+                                    subtitle: "M4 Vision OCR + Remote GPU 14B Math. Zero VRAM thrashing."
+                                )
+                                presetCard(
+                                    id: "remote_only",
+                                    title: "Remote GPU Only",
+                                    badge: "12GB Mode",
+                                    badgeColor: .blue,
+                                    subtitle: "Offload 100% of compute to NVIDIA PC in single-model mode."
+                                )
+                                presetCard(
+                                    id: "local_only",
+                                    title: "100% On-Device",
+                                    badge: "M4 Metal",
+                                    badgeColor: .purple,
+                                    subtitle: "Run all text & vision on local Apple Silicon."
+                                )
+                            }
+                        }
+                        
+                        // Live Topology Summary Card
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Active Compute Distribution", systemImage: "point.3.filled.connected.trianglepath.dotted")
+                                .font(.subheadline)
+                                .bold()
+                            
+                            HStack(spacing: 12) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "laptopcomputer")
+                                            .foregroundColor(.purple)
+                                        Text("M4 Laptop (Local):")
+                                            .font(.caption)
+                                            .bold()
+                                    }
+                                    Text(localTasksSummary())
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                                .background(Color.secondary.opacity(0.08))
+                                .cornerRadius(8)
+                                
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "server.rack")
+                                            .foregroundColor(.blue)
+                                        Text("Remote GPU (Tailscale):")
+                                            .font(.caption)
+                                            .bold()
+                                    }
+                                    Text(remoteTasksSummary())
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                                .background(Color.secondary.opacity(0.08))
+                                .cornerRadius(8)
+                            }
+                        }
+                        
+                        Divider()
+                            .padding(.vertical, 2)
+                        
+                        // Granular Task Routing Matrix
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("Granular Task Routing Matrix", systemImage: "slider.horizontal.3")
+                                .font(.headline)
+                            Text("Direct individual AI workflows to your preferred compute machine.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 10) {
+                                taskRoutingRow(title: "Vision & PDF OCR", desc: "Page OCR and image problem extraction", binding: $routeVision)
+                                taskRoutingRow(title: "Math Derivation & Solving", desc: "Complete physics derivations and solutions", binding: $routeMath)
+                                taskRoutingRow(title: "Step-by-Step Breakdown", desc: "Derivation steps and scaffolding generation", binding: $routeSteps)
+                                taskRoutingRow(title: "Question-Answer Matching", desc: "Pairing problems with solution keys", binding: $routeMatching)
+                                taskRoutingRow(title: "Lecture Topic Classification", desc: "Week/module alignment for problems", binding: $routeClassification)
+                                taskRoutingRow(title: "Formula Translation (LaTeX)", desc: "Quick snip and text-to-LaTeX converter", binding: $routeTranslation)
+                                taskRoutingRow(title: "Feynman Technique Dialogue", desc: "Interactive oral exam & tutoring agent", binding: $routeFeynman)
+                            }
+                            .padding(12)
+                            .background(Color.secondary.opacity(0.06))
+                            .cornerRadius(10)
+                        }
+                        
+                        Divider()
+                            .padding(.vertical, 2)
+                        
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("Power & Energy Management", systemImage: "bolt.batteryblock")
+                                .font(.headline)
+                            
+                            Toggle("Auto Power Saver (Suspend AI after 5 mins idle)", isOn: $autoPowerSaverEnabled)
+                                .toggleStyle(.switch)
+                            
+                            Toggle("Enable Background AI Summary Generation", isOn: $backgroundAIEnabled)
+                                .toggleStyle(.switch)
+                        }
+                    } else if activeSection == "text" {
                         // ── TEXT MODEL ──
                         VStack(alignment: .leading, spacing: 8) {
-                            Label("Text Model", systemImage: "textformat")
+                            Label("Text Model Configuration", systemImage: "textformat")
                                 .font(.headline)
                             Text("Used for summaries, step generation, problem extraction, and Feynman dialogue.")
                                 .font(.caption)
@@ -195,9 +325,9 @@ struct AISettingsView: View {
                             }
                         }
                     } else {
-                        // ── VISION MODEL ── (same format as text model)
+                        // ── VISION MODEL ──
                         VStack(alignment: .leading, spacing: 8) {
-                            Label("Vision Model", systemImage: "eye")
+                            Label("Vision Model Configuration", systemImage: "eye")
                                 .font(.headline)
                             Text("Used for image-to-LaTeX, image problem extraction, and scanned PDF answers.")
                                 .font(.caption)
@@ -317,44 +447,8 @@ struct AISettingsView: View {
                         }
                         .padding(.top, 4)
                     }
-                    
-                    Divider()
-                        .padding(.vertical, 4)
-                    
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("Local Laptop Routing Overrides", systemImage: "macbook")
-                            .font(.headline)
-                        
-                        Text("Enforce local laptop model execution regardless of active network or provider settings.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        
-                        Toggle("Always Run LaTeX Translator Locally", isOn: $latexAlwaysLocal)
-                            .toggleStyle(.switch)
-                        
-                        Toggle("Always Run Feynman Dialogue Locally", isOn: $feynmanAlwaysLocal)
-                            .toggleStyle(.switch)
-                    }
-                    .padding(.bottom, 8)
-                    
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("Power & Performance Settings", systemImage: "bolt.batteryblock")
-                            .font(.headline)
-                        
-                        Text("Manage background CPU/GPU processing and energy efficiency.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        
-                        Toggle("Auto Power Saver (Suspend AI after 5 mins idle)", isOn: $autoPowerSaverEnabled)
-                            .toggleStyle(.switch)
-                        
-                        Toggle("Enable Background AI Summary Generation", isOn: $backgroundAIEnabled)
-                            .toggleStyle(.switch)
-                    }
-                    .padding(.bottom, 8)
                 }
+                .padding(.bottom, 8)
             }
         }
         .padding(.horizontal, 20)
@@ -385,6 +479,137 @@ struct AISettingsView: View {
         }
         .onChange(of: visionApiBaseUrl) { _, _ in
             if visionProvider == "hermes" { refreshModels() }
+        }
+    }
+    
+    @ViewBuilder
+    private func presetCard(id: String, title: String, badge: String, badgeColor: Color, subtitle: String) -> some View {
+        let isSelected = aiComputePreset == id
+        Button(action: {
+            applyPreset(id)
+        }) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(title)
+                        .font(.subheadline)
+                        .bold()
+                        .foregroundColor(.primary)
+                    Spacer()
+                    Text(badge)
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(badgeColor.opacity(0.2))
+                        .foregroundColor(badgeColor)
+                        .cornerRadius(4)
+                }
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, minHeight: 74, alignment: .topLeading)
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06))
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.2), lineWidth: isSelected ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+    
+    @ViewBuilder
+    private func taskRoutingRow(title: String, desc: String, binding: Binding<String>) -> some View {
+        GridRow {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(desc)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+            
+            Picker("", selection: binding) {
+                Text("M4 Laptop (Local)").tag("local")
+                Text("Remote GPU (Tailscale)").tag("tailscale")
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 175)
+            .onChange(of: binding.wrappedValue) { _, _ in
+                aiComputePreset = "custom"
+            }
+        }
+    }
+    
+    private func localTasksSummary() -> String {
+        var tasks: [String] = []
+        if routeVision == "local" { tasks.append("Vision/OCR") }
+        if routeMath == "local" { tasks.append("Math Derivations") }
+        if routeSteps == "local" { tasks.append("Step Breakdown") }
+        if routeMatching == "local" { tasks.append("Q&A Matching") }
+        if routeClassification == "local" { tasks.append("Classification") }
+        if routeTranslation == "local" { tasks.append("Translation") }
+        if routeFeynman == "local" { tasks.append("Feynman Dialogue") }
+        return tasks.isEmpty ? "None" : tasks.joined(separator: ", ")
+    }
+    
+    private func remoteTasksSummary() -> String {
+        var tasks: [String] = []
+        if routeVision == "tailscale" { tasks.append("Vision/OCR") }
+        if routeMath == "tailscale" { tasks.append("Math Derivations") }
+        if routeSteps == "tailscale" { tasks.append("Step Breakdown") }
+        if routeMatching == "tailscale" { tasks.append("Q&A Matching") }
+        if routeClassification == "tailscale" { tasks.append("Classification") }
+        if routeTranslation == "tailscale" { tasks.append("Translation") }
+        if routeFeynman == "tailscale" { tasks.append("Feynman Dialogue") }
+        return tasks.isEmpty ? "None" : tasks.joined(separator: ", ")
+    }
+    
+    private func applyPreset(_ preset: String) {
+        aiComputePreset = preset
+        switch preset {
+        case "hybrid_twotier":
+            aiProvider = "tailscale"
+            visionProvider = "local"
+            tailscaleModelGeneral = "qwen2.5-coder:14b"
+            localModelVision = "qwen2.5vl:7b"
+            routeVision = "local"
+            routeMath = "tailscale"
+            routeSteps = "tailscale"
+            routeMatching = "tailscale"
+            routeClassification = "tailscale"
+            routeTranslation = "local"
+            routeFeynman = "local"
+        case "remote_only":
+            aiProvider = "tailscale"
+            visionProvider = "tailscale"
+            tailscaleModelGeneral = "qwen2.5-coder:14b"
+            visionTailscaleModel = "qwen2.5-coder:14b"
+            routeVision = "tailscale"
+            routeMath = "tailscale"
+            routeSteps = "tailscale"
+            routeMatching = "tailscale"
+            routeClassification = "tailscale"
+            routeTranslation = "tailscale"
+            routeFeynman = "tailscale"
+        case "local_only":
+            aiProvider = "local"
+            visionProvider = "local"
+            localModelGeneral = "qwen2.5-coder:7b"
+            localModelVision = "qwen2.5vl:7b"
+            routeVision = "local"
+            routeMath = "local"
+            routeSteps = "local"
+            routeMatching = "local"
+            routeClassification = "local"
+            routeTranslation = "local"
+            routeFeynman = "local"
+        default:
+            break
         }
     }
     
