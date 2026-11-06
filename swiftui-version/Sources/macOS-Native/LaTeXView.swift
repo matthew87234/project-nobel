@@ -55,47 +55,53 @@ public enum AILatexPlaceholder {
 }
 
 public struct TypingIndicatorBubble: View {
-    public init() {}
+    private let title: String
+    
+    public init(title: String = "Generating LaTeX...") {
+        self.title = title
+    }
     
     public var body: some View {
-        TimelineView(.animation) { timeline in
-            let time = timeline.date.timeIntervalSinceReferenceDate
-            HStack(spacing: 5) {
-                ForEach(0..<3) { index in
-                    // Continuous sinusoidal wave bounce: 3 dots fluidly glide up and down
-                    let phase = (time * 4.5) - (Double(index) * 0.6)
-                    let yOffset = sin(phase) * 4.5
-                    
-                    Circle()
-                        .fill(Color(nsColor: .secondaryLabelColor))
-                        .frame(width: 7, height: 7)
-                        .offset(y: yOffset)
-                }
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+            if !title.isEmpty {
+                Text(title)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(
-                Capsule()
-                    .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.85))
-            )
-            .overlay(
-                Capsule()
-                    .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 0.5)
-            )
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.85))
+        )
+        .overlay(
+            Capsule()
+                .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 0.5)
+        )
     }
 }
 
 public struct AILaTeXGeneratingView: View {
-    public init(title: String = "") {}
+    private let title: String
+    
+    public init(title: String = "Generating LaTeX...") {
+        self.title = title.isEmpty ? "Generating LaTeX..." : title
+    }
     
     public var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             Spacer()
-            TypingIndicatorBubble()
+            ProgressView()
+                .controlSize(.small)
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
             Spacer()
         }
-        .frame(height: 52)
+        .frame(height: 44)
         .frame(maxWidth: .infinity)
         .background(Color(NSColor.windowBackgroundColor))
         .cornerRadius(6)
@@ -113,14 +119,91 @@ public func isLaTeX(_ text: String) -> Bool {
     if text.contains("{") && text.contains("}") { return true }
     if text.contains("_") || text.contains("^") { return true }
     if lower.contains("begin{") && lower.contains("end{") { return true }
+    if lower.contains("tabular") || lower.contains("array") { return true }
     return false
+}
+
+public func convertTabularToArray(_ rawText: String) -> String {
+    guard rawText.contains("\\begin{tabular}") else { return rawText }
+    
+    let pattern = #"(?s)\\begin\{tabular\}\s*(\{[^}]+\})(.*?)\\end\{tabular\}"#
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return rawText }
+    
+    let nsStr = rawText as NSString
+    let matches = regex.matches(in: rawText, options: [], range: NSRange(location: 0, length: nsStr.length))
+    var result = rawText
+    
+    for match in matches.reversed() {
+        let colSpec = nsStr.substring(with: match.range(at: 1))
+        let body = nsStr.substring(with: match.range(at: 2))
+        
+        let lines = body.components(separatedBy: "\\\\")
+        var convertedLines = [String]()
+        
+        for line in lines {
+            var trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            
+            var prefix = ""
+            if trimmed.hasPrefix("\\hline") {
+                prefix = "\\hline "
+                trimmed = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if trimmed.isEmpty {
+                convertedLines.append(prefix.trimmingCharacters(in: .whitespacesAndNewlines))
+                continue
+            }
+            
+            let cells = trimmed.components(separatedBy: "&")
+            var newCells = [String]()
+            for cell in cells {
+                var c = cell.trimmingCharacters(in: .whitespacesAndNewlines)
+                if c.hasPrefix("$") && c.hasSuffix("$") && c.count >= 2 {
+                    c = String(c.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if !c.isEmpty && !c.hasPrefix("\\text") && !c.hasPrefix("\\mathbf") {
+                    let hasLetters = c.rangeOfCharacter(from: .letters) != nil
+                    let isMath = c.contains("\\") || c.contains("^") || c.contains("_") || c.contains("{") || c.contains("}")
+                    if hasLetters && !isMath {
+                        c = "\\text{\(c)}"
+                    }
+                }
+                newCells.append(c)
+            }
+            convertedLines.append(prefix + newCells.joined(separator: " & "))
+        }
+        
+        let newBody = convertedLines.joined(separator: " \\\\\n")
+        let replacement = "\n$$\n\\begin{array}\(colSpec)\n\(newBody)\n\\end{array}\n$$\n"
+        result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+    }
+    
+    return result
 }
 
 public func sanitizeLaTeX(_ rawText: String) -> String {
     var text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.isEmpty { return "" }
     
-    // 1. Auto-balance unclosed curly braces '{' and '}'
+    // 1. Strip markdown bold **text** -> text, lingering asterisks, and code block fences (``` or ```latex)
+    text = text.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+    text = text.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+    text = text.replacingOccurrences(of: #"(?m)^```[a-zA-Z0-9_-]*\s*$"#, with: "", options: .regularExpression)
+    text = text.replacingOccurrences(of: "```", with: "")
+    text = text.replacingOccurrences(of: "'''", with: "")
+    
+    // 2. Clean \url{...} commands and unsupported TikZ drawing environments (unsupported by KaTeX)
+    text = text.replacingOccurrences(of: #"\\url\{([^}]+)\}"#, with: "$1", options: .regularExpression)
+    if text.contains("tikzpicture") {
+        text = text.replacingOccurrences(of: #"(?s)\\begin\{array\}\{[^}]*\}\s*\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}\s*\\end\{array\}"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"(?s)\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"(?s)\$\$\s*\$\$"#, with: "", options: .regularExpression)
+    }
+    
+    // 3. Convert LaTeX \begin{tabular} to KaTeX-compatible \begin{array}
+    text = convertTabularToArray(text)
+    
+    // 4. Auto-balance unclosed curly braces '{' and '}'
     var openBraces = 0
     var closeBraces = 0
     for char in text {
@@ -131,23 +214,44 @@ public func sanitizeLaTeX(_ rawText: String) -> String {
         text.append(String(repeating: "}", count: openBraces - closeBraces))
     }
     
-    // 2. Fix unescaped % and & outside math environments
+    // 5. Fix unescaped % and & outside math environments
     text = text.replacingOccurrences(of: " % ", with: " \\% ")
-    if !text.contains("\\begin") && !text.contains("\\matrix") {
+    if !text.contains("\\begin") && !text.contains("\\matrix") && !text.contains("\\array") {
         text = text.replacingOccurrences(of: " & ", with: " \\& ")
     }
     
-    // 3. Auto-wrap orphan LaTeX commands in $ math delimiters if missing
-    if !text.contains("$") && !text.contains("\\(") && !text.contains("\\[") {
-        let latexKeywords = ["\\times", "\\frac", "\\mathbf", "\\le", "\\ge", "\\in", "\\to", "\\cdot", "\\int", "\\sum", "\\infty", "\\varepsilon", "\\partial", "\\sqrt"]
-        if latexKeywords.contains(where: { text.contains($0) }) {
-            text = "$$ " + text + " $$"
+    // 6. Auto-convert align environments to aligned for KaTeX compatibility
+    text = text.replacingOccurrences(of: #"\begin\{align\*?\}"#, with: #"\begin{aligned}"#, options: .regularExpression)
+    text = text.replacingOccurrences(of: #"\end\{align\*?\}"#, with: #"\end{aligned}"#, options: .regularExpression)
+
+    // 7. Wrap orphan math environments (aligned, pmatrix, matrix, array, etc.) ONLY if not already inside $$ or $
+    let mathEnvs = ["aligned", "matrix", "pmatrix", "bmatrix", "cases", "gather", "array"]
+    for env in mathEnvs {
+        let pattern = #"(?s)\\begin\{"# + env + #"\}.*?\\end\{"# + env + #"\}"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+            let nsStr = text as NSString
+            let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsStr.length))
+            for match in matches.reversed() {
+                let prefix = nsStr.substring(to: match.range.location)
+                let doubleDollarCount = prefix.components(separatedBy: "$$").count - 1
+                let isInsideDoubleDollar = (doubleDollarCount % 2) == 1
+                
+                let withoutDouble = prefix.replacingOccurrences(of: "$$", with: "")
+                let singleDollarCount = withoutDouble.components(separatedBy: "$").count - 1
+                let isInsideSingleDollar = (singleDollarCount % 2) == 1
+                
+                if !isInsideDoubleDollar && !isInsideSingleDollar {
+                    let block = nsStr.substring(with: match.range)
+                    text = (text as NSString).replacingCharacters(in: match.range, with: "\n$$\n" + block + "\n$$\n")
+                }
+            }
         }
     }
     
-    // 4. Fix common AI math typos
+    // 8. Fix common AI math typos
     text = text.replacingOccurrences(of: "\\subgroup", with: "\\le")
-    text = text.replacingOccurrences(of: "\\\\", with: "\\")
+    // Only fix double backslashes before command letters (e.g. \\frac -> \frac), NEVER strip LaTeX line breaks (\\)
+    text = text.replacingOccurrences(of: #"\\\\([a-zA-Z])"#, with: #"\$1"#, options: .regularExpression)
     
     return text
 }
@@ -237,6 +341,16 @@ struct _LaTeXWebViewRepresentable: NSViewRepresentable {
         }
     }
     
+    private class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+        weak var delegate: WKScriptMessageHandler?
+        init(_ delegate: WKScriptMessageHandler) {
+            self.delegate = delegate
+        }
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            delegate?.userContentController(userContentController, didReceive: message)
+        }
+    }
+    
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
     }
@@ -244,7 +358,7 @@ struct _LaTeXWebViewRepresentable: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.suppressesIncrementalRendering = true
-        configuration.userContentController.add(context.coordinator, name: "heightHandler")
+        configuration.userContentController.add(WeakScriptMessageHandler(context.coordinator), name: "heightHandler")
         
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -275,29 +389,44 @@ struct _LaTeXWebViewRepresentable: NSViewRepresentable {
             return ""
         } else if sanitized.contains("$") || sanitized.contains("\\(") || sanitized.contains("\\[") {
             return sanitized
-        } else if sanitized.contains("\n") {
-            return "$$\n" + sanitized + "\n$$"
-        } else {
-            return "$" + sanitized + "$"
         }
+        // Only wrap in display math if it contains math commands and is NOT a sentence of English words
+        let hasMathCommand = sanitized.contains("\\")
+        let hasEnglishWords = sanitized.contains(" ") && (
+            sanitized.localizedCaseInsensitiveContains(" the ") ||
+            sanitized.localizedCaseInsensitiveContains(" is ") ||
+            sanitized.localizedCaseInsensitiveContains(" we ") ||
+            sanitized.localizedCaseInsensitiveContains(" of ") ||
+            sanitized.localizedCaseInsensitiveContains(" to ") ||
+            sanitized.localizedCaseInsensitiveContains(" that ")
+        )
+        if hasMathCommand && !hasEnglishWords {
+            return "$$\n" + sanitized + "\n$$"
+        }
+        return sanitized
     }
     
     private func generateHTML(initialText: String) -> String {
-        let escapedInitial = initialText
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "`", with: "\\`")
-            .replacingOccurrences(of: "'", with: "\\'")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+        let jsonData = (try? JSONSerialization.data(withJSONObject: [initialText], options: [])) ?? Data()
+        let safeJsonArray = String(data: jsonData, encoding: .utf8) ?? "[\"\"]"
+        
+        let bundle = Bundle.main
+        let localCSS = bundle.url(forResource: "katex.min", withExtension: "css")?.absoluteString
+        let localJS = bundle.url(forResource: "katex.min", withExtension: "js")?.absoluteString
+        let localAutoRender = bundle.url(forResource: "auto-render.min", withExtension: "js")?.absoluteString
+        
+        let cssURL = localCSS ?? "https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css"
+        let jsURL = localJS ?? "https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"
+        let autoRenderURL = localAutoRender ?? "https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"
         
         return """
         <!DOCTYPE html>
         <html>
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
-            <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
-            <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js"></script>
+            <link rel="stylesheet" href="\(cssURL)">
+            <script src="\(jsURL)"></script>
+            <script src="\(autoRenderURL)"></script>
             <style>
                 ::-webkit-scrollbar {
                     display: none !important;
@@ -393,7 +522,16 @@ struct _LaTeXWebViewRepresentable: NSViewRepresentable {
                                     {left: "$$", right: "$$", display: true},
                                     {left: "$", right: "$", display: false},
                                     {left: "\\\\(", right: "\\\\)", display: false},
-                                    {left: "\\\\[", right: "\\\\]", display: true}
+                                    {left: "\\\\[", right: "\\\\]", display: true},
+                                    {left: "\\\\begin{equation}", right: "\\\\end{equation}", display: true},
+                                    {left: "\\\\begin{align}", right: "\\\\end{align}", display: true},
+                                    {left: "\\\\begin{align*}", right: "\\\\end{align*}", display: true},
+                                    {left: "\\\\begin{aligned}", right: "\\\\end{aligned}", display: true},
+                                    {left: "\\\\begin{gather}", right: "\\\\end{gather}", display: true},
+                                    {left: "\\\\begin{pmatrix}", right: "\\\\end{pmatrix}", display: true},
+                                    {left: "\\\\begin{bmatrix}", right: "\\\\end{bmatrix}", display: true},
+                                    {left: "\\\\begin{matrix}", right: "\\\\end{matrix}", display: true},
+                                    {left: "\\\\begin{cases}", right: "\\\\end{cases}", display: true}
                                 ],
                                 throwOnError: false,
                                 errorColor: "currentColor"
@@ -409,7 +547,8 @@ struct _LaTeXWebViewRepresentable: NSViewRepresentable {
                 };
                 
                 document.addEventListener('DOMContentLoaded', function() {
-                    window.renderNewMath(`\(escapedInitial)`);
+                    let initialData = \(safeJsonArray);
+                    window.renderNewMath(initialData[0] || '');
                     setTimeout(reportHeight, 30);
                 });
 

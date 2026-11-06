@@ -83,7 +83,7 @@ struct Flashcard: Identifiable, Hashable {
     var front: String
     var back: String
     var nextReviewDate: String
-    var interval: Int
+    var interval: Double
     var easeFactor: Double
     var repetitions: Int
     var createdDate: String
@@ -140,6 +140,33 @@ struct FeynmanChat: Identifiable, Hashable {
     
 
     
+    private static func cloneDatabaseSafely(from sourceURL: URL, to destinationURL: URL) {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return }
+        
+        // Remove destination DB along with any stale WAL/SHM files that would corrupt the image
+        for suffix in ["", "-wal", "-shm"] {
+            let path = destinationURL.path + suffix
+            if fileManager.fileExists(atPath: path) {
+                try? fileManager.removeItem(atPath: path)
+            }
+        }
+        
+        var srcDb: OpaquePointer?
+        var dstDb: OpaquePointer?
+        if sqlite3_open_v2(sourceURL.path, &srcDb, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+           sqlite3_open(destinationURL.path, &dstDb) == SQLITE_OK {
+            if let backup = sqlite3_backup_init(dstDb, "main", srcDb, "main") {
+                sqlite3_backup_step(backup, -1)
+                sqlite3_backup_finish(backup)
+            }
+        } else {
+            try? fileManager.copyItem(at: sourceURL, to: destinationURL)
+        }
+        if let dstDb = dstDb { sqlite3_close(dstDb) }
+        if let srcDb = srcDb { sqlite3_close(srcDb) }
+    }
+    
     func setupDatabase() {
         let fileManager = FileManager.default
         let homeDirectory = fileManager.homeDirectoryForCurrentUser
@@ -150,18 +177,37 @@ struct FeynmanChat: Identifiable, Hashable {
         let isDesktop = DatabaseManager.isDesktopApp
         let dbFilename = isDesktop ? "physics_study_desktop.db" : "physics_study.db"
         let dbURL = appSupportDir.appendingPathComponent(dbFilename)
+        let prodURL = appSupportDir.appendingPathComponent("physics_study.db")
         
         if isDesktop && !fileManager.fileExists(atPath: dbURL.path) {
-            let prodURL = appSupportDir.appendingPathComponent("physics_study.db")
-            if fileManager.fileExists(atPath: prodURL.path) {
-                try? fileManager.copyItem(at: prodURL, to: dbURL)
-            }
+            Self.cloneDatabaseSafely(from: prodURL, to: dbURL)
         }
         
         if sqlite3_open(dbURL.path, &db) != SQLITE_OK {
             print("Error opening database")
             return
         }
+        
+        // If Desktop DB was corrupted by a stale WAL/SHM mismatch, automatically recover from production DB
+        if isDesktop {
+            var checkStmt: OpaquePointer?
+            let rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master;", -1, &checkStmt, nil)
+            sqlite3_finalize(checkStmt)
+            if rc != SQLITE_OK {
+                print("Detected malformed Desktop database (code \(rc)). Re-cloning cleanly from production DB...")
+                sqlite3_close(db)
+                db = nil
+                Self.cloneDatabaseSafely(from: prodURL, to: dbURL)
+                if sqlite3_open(dbURL.path, &db) != SQLITE_OK {
+                    print("Error reopening recovered desktop database")
+                    return
+                }
+            }
+        }
+        
+        sqlite3_busy_timeout(db, 5000)
+        execute(sql: "PRAGMA journal_mode = WAL;")
+        execute(sql: "PRAGMA foreign_keys = ON;")
         
         execute(sql: """
             CREATE TABLE IF NOT EXISTS modules (
@@ -299,6 +345,15 @@ struct FeynmanChat: Identifiable, Hashable {
                 value TEXT
             );
         """)
+        
+        // One-time repair for flashcards affected by the legacy 6-button SM-2 formula on the 5-button UI
+        if getSetting(key: "sm2_5button_repair_v1") != "done" {
+            // 1. Cards with interval > 0 have already been reviewed at least once; restore repetitions = 1 so "3. Good" advances to 8d instead of 2d
+            execute(sql: "UPDATE flashcards SET repetitions = 1 WHERE repetitions = 0 AND interval > 0;")
+            // 2. Restore the -0.14 ease penalty that was previously subtracted on every "3. Good" rating
+            execute(sql: "UPDATE flashcards SET ease_factor = MIN(2.5, ROUND(ease_factor + (0.14 * repetitions), 2)) WHERE repetitions >= 1 AND ease_factor < 2.5;")
+            setSetting(key: "sm2_5button_repair_v1", value: "done")
+        }
     }
     
     func getSetting(key: String, defaultValue: String? = nil) -> String? {
@@ -494,6 +549,12 @@ struct FeynmanChat: Identifiable, Hashable {
         // Cascade delete manual transactions
         execute(sql: "DELETE FROM flashcards WHERE module_id = ?", params: [id])
         execute(sql: """
+            DELETE FROM problems 
+            WHERE topic_id IN (
+                SELECT id FROM topics WHERE module_id = ?
+            )
+        """, params: [id])
+        execute(sql: """
             DELETE FROM feynman_chats 
             WHERE note_id IN (
                 SELECT n.id FROM notes n
@@ -510,6 +571,7 @@ struct FeynmanChat: Identifiable, Hashable {
         execute(sql: "DELETE FROM topics WHERE module_id = ?", params: [id])
         execute(sql: "DELETE FROM feynman_sessions WHERE module_id = ?", params: [id])
         execute(sql: "DELETE FROM module_study_time WHERE module_id = ?", params: [id])
+        execute(sql: "DELETE FROM activity_log WHERE module_id = ?", params: [id])
         return execute(sql: "DELETE FROM modules WHERE id = ?", params: [id])
     }
     
@@ -640,7 +702,17 @@ struct FeynmanChat: Identifiable, Hashable {
     func deleteNote(topicId: Int, noteId: Int) -> Bool {
         execute(sql: "DELETE FROM feynman_chats WHERE note_id = ?", params: [noteId])
         let nSuccess = execute(sql: "DELETE FROM notes WHERE id = ?", params: [noteId])
-        let tSuccess = execute(sql: "DELETE FROM topics WHERE id = ?", params: [topicId])
+        
+        // Only delete topic if no other notes or practice problems are associated with it
+        let remainingNotes = query(sql: "SELECT count(*) as c FROM notes WHERE topic_id = ?", params: [topicId])
+        let remainingProbs = query(sql: "SELECT count(*) as c FROM problems WHERE topic_id = ?", params: [topicId])
+        let nC = remainingNotes.first?["c"] as? Int ?? 0
+        let pC = remainingProbs.first?["c"] as? Int ?? 0
+        
+        var tSuccess = true
+        if nC == 0 && pC == 0 {
+            tSuccess = execute(sql: "DELETE FROM topics WHERE id = ?", params: [topicId])
+        }
         return nSuccess && tSuccess
     }
     
@@ -701,8 +773,8 @@ struct FeynmanChat: Identifiable, Hashable {
                 front: row["front"] as? String ?? "",
                 back: row["back"] as? String ?? "",
                 nextReviewDate: row["next_review_date"] as? String ?? "",
-                interval: row["interval"] as? Int ?? 0,
-                easeFactor: row["ease_factor"] as? Double ?? 2.5,
+                interval: (row["interval"] as? Double) ?? Double(row["interval"] as? Int ?? 0),
+                easeFactor: (row["ease_factor"] as? Double) ?? Double(row["ease_factor"] as? Int ?? 2),
                 repetitions: row["repetitions"] as? Int ?? 0,
                 createdDate: row["created_date"] as? String ?? "",
                 isFlagged: (row["is_flagged"] as? Int ?? 0) == 1
@@ -736,8 +808,8 @@ struct FeynmanChat: Identifiable, Hashable {
                 front: row["front"] as? String ?? "",
                 back: row["back"] as? String ?? "",
                 nextReviewDate: row["next_review_date"] as? String ?? "",
-                interval: row["interval"] as? Int ?? 0,
-                easeFactor: row["ease_factor"] as? Double ?? 2.5,
+                interval: (row["interval"] as? Double) ?? Double(row["interval"] as? Int ?? 0),
+                easeFactor: (row["ease_factor"] as? Double) ?? Double(row["ease_factor"] as? Int ?? 2),
                 repetitions: row["repetitions"] as? Int ?? 0,
                 createdDate: row["created_date"] as? String ?? "",
                 isFlagged: (row["is_flagged"] as? Int ?? 0) == 1
@@ -771,8 +843,8 @@ struct FeynmanChat: Identifiable, Hashable {
                 front: row["front"] as? String ?? "",
                 back: row["back"] as? String ?? "",
                 nextReviewDate: row["next_review_date"] as? String ?? "",
-                interval: row["interval"] as? Int ?? 0,
-                easeFactor: row["ease_factor"] as? Double ?? 2.5,
+                interval: (row["interval"] as? Double) ?? Double(row["interval"] as? Int ?? 0),
+                easeFactor: (row["ease_factor"] as? Double) ?? Double(row["ease_factor"] as? Int ?? 2),
                 repetitions: row["repetitions"] as? Int ?? 0,
                 createdDate: row["created_date"] as? String ?? "",
                 isFlagged: (row["is_flagged"] as? Int ?? 0) == 1
@@ -795,7 +867,7 @@ struct FeynmanChat: Identifiable, Hashable {
         )
     }
     
-    func updateFlashcardReview(id: Int, interval: Int, easeFactor: Double, repetitions: Int, nextReviewDate: String) -> Bool {
+    func updateFlashcardReview(id: Int, interval: Double, easeFactor: Double, repetitions: Int, nextReviewDate: String) -> Bool {
         return execute(
             sql: "UPDATE flashcards SET interval = ?, ease_factor = ?, repetitions = ?, next_review_date = ? WHERE id = ?",
             params: [interval, easeFactor, repetitions, nextReviewDate, id]
@@ -870,7 +942,7 @@ struct FeynmanChat: Identifiable, Hashable {
                 SELECT p.id, p.topic_id, p.content, p.solution_hint, p.created_date, p.solved_count, p.solution, p.steps, p.is_flagged, p.last_reviewed_date, p.next_review_date, p.last_failed_step, p.severity_level, p.interval, p.ease_factor, p.repetitions
                 FROM problems p
                 JOIN topics t ON p.topic_id = t.id
-                WHERE t.module_id = ? AND (p.next_review_date <= ? OR p.next_review_date IS NULL OR p.next_review_date = '')
+                WHERE t.module_id = ? AND (p.is_flagged = 0 OR p.is_flagged IS NULL) AND (p.next_review_date <= ? OR p.next_review_date IS NULL OR p.next_review_date = '')
             """
             params = [moduleId, today]
         } else if let year = forYear {
@@ -879,11 +951,11 @@ struct FeynmanChat: Identifiable, Hashable {
                 FROM problems p
                 JOIN topics t ON p.topic_id = t.id
                 JOIN modules m ON t.module_id = m.id
-                WHERE m.year = ? AND (p.next_review_date <= ? OR p.next_review_date IS NULL OR p.next_review_date = '')
+                WHERE m.year = ? AND (p.is_flagged = 0 OR p.is_flagged IS NULL) AND (p.next_review_date <= ? OR p.next_review_date IS NULL OR p.next_review_date = '')
             """
             params = [year, today]
         } else {
-            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps, is_flagged, last_reviewed_date, next_review_date, last_failed_step, severity_level, interval, ease_factor, repetitions FROM problems WHERE next_review_date <= ? OR next_review_date IS NULL OR next_review_date = ''"
+            sql = "SELECT id, topic_id, content, solution_hint, created_date, solved_count, solution, steps, is_flagged, last_reviewed_date, next_review_date, last_failed_step, severity_level, interval, ease_factor, repetitions FROM problems WHERE (is_flagged = 0 OR is_flagged IS NULL) AND (next_review_date <= ? OR next_review_date IS NULL OR next_review_date = '')"
             params = [today]
         }
         let rows = query(sql: sql, params: params)
@@ -1182,12 +1254,12 @@ struct FeynmanChat: Identifiable, Hashable {
             params.append(formatter.string(from: Date()))
         } else if timeframe == "This Week" {
             let calendar = Calendar.current
-            let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date())) ?? Date()
+            let startOfWeek = calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
             sql += " AND date >= ?"
             params.append(formatter.string(from: startOfWeek))
         } else if timeframe == "This Month" {
             let calendar = Calendar.current
-            let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: Date())) ?? Date()
+            let startOfMonth = calendar.date(byAdding: .day, value: -30, to: Date()) ?? Date()
             sql += " AND date >= ?"
             params.append(formatter.string(from: startOfMonth))
         }
@@ -1217,14 +1289,14 @@ struct FeynmanChat: Identifiable, Hashable {
             pbParams.append(today)
         } else if timeframe == "This Week" {
             let calendar = Calendar.current
-            let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date())) ?? Date()
+            let startOfWeek = calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
             let startStr = formatter.string(from: startOfWeek)
             conditions.append("created_date >= ?")
             fcParams.append(startStr)
             pbParams.append(startStr)
         } else if timeframe == "This Month" {
             let calendar = Calendar.current
-            let startOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: Date())) ?? Date()
+            let startOfMonth = calendar.date(byAdding: .day, value: -30, to: Date()) ?? Date()
             let startStr = formatter.string(from: startOfMonth)
             conditions.append("created_date >= ?")
             fcParams.append(startStr)

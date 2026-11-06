@@ -1,5 +1,6 @@
 import Foundation
 import PDFKit
+import CryptoKit
 
 struct OllamaOptions: Codable {
     let temperature: Double?
@@ -20,19 +21,24 @@ struct GenerateRequest: Codable {
     let images: [String]?
     let keep_alive: String?
     let options: OllamaOptions?
+    let think: Bool?
     
-    init(model: String, prompt: String, stream: Bool = false, images: [String]? = nil, keep_alive: String? = "60m", options: OllamaOptions? = nil) {
+    init(model: String, prompt: String, stream: Bool = false, images: [String]? = nil, keep_alive: String? = "60m", options: OllamaOptions? = nil, think: Bool? = nil) {
         self.model = model
         self.prompt = prompt
         self.stream = stream
         self.images = images
         self.keep_alive = keep_alive
         self.options = options
+        self.think = think
     }
 }
 
 struct GenerateResponse: Codable {
-    let response: String
+    let response: String?
+    let thinking: String?
+    let done: Bool?
+    let error: String?
 }
 
 struct PullRequest: Codable {
@@ -157,9 +163,18 @@ struct ExtractionGroup: Identifiable, Equatable {
         return URLSession(configuration: config)
     }()
     
+    private let probeSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 1.2
+        config.timeoutIntervalForResource = 1.2
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+    
     nonisolated static func normalizedOllamaURL(from rawHost: String?, defaultHost: String = "http://localhost:11434") -> URL? {
         let input = (rawHost ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         var host = input.isEmpty ? defaultHost : input
+        guard !host.isEmpty else { return nil }
         if !host.lowercased().hasPrefix("http://") && !host.lowercased().hasPrefix("https://") {
             host = "http://" + host
         }
@@ -236,11 +251,148 @@ struct ExtractionGroup: Identifiable, Equatable {
     @Published var isRetryingConnection: Bool = false
     @Published var isAutoReconnecting: Bool = false
     @Published var autoReconnectAttempts: Int = 0
+    private var lastTailscaleTimeoutTime: Date? = nil
+    private let tailscaleCooldownSeconds: TimeInterval = 180.0
     
     // Tailscale Network Discovery State
     @Published var discoveredHosts: [DiscoveredAIHost] = []
     @Published var isScanningTailscale: Bool = false
     @Published var showTailscaleSetupModal: Bool = false
+    
+    // Hardware Engine & Machine Pipeline Status
+    @Published var isRemoteOnline: Bool = false
+    @Published var remoteStatusMessage: String = "Not Connected"
+    var isPCOnline: Bool { isRemoteOnline }
+    var pcStatusMessage: String { remoteStatusMessage }
+    @Published var isLocalActive: Bool = false
+    @Published var isRemoteActive: Bool = false
+    
+    @Published var localPagesTotal: Int = 0
+    @Published var localPagesCompleted: Int = 0
+    @Published var localTaskStatus: String = "Idle"
+    
+    @Published var remoteProblemsTotal: Int = 0
+    @Published var remoteProblemsCompleted: Int = 0
+    @Published var remoteTaskStatus: String = "Idle"
+    
+    @Published var pipelineCurrentPhase: String = "Idle"
+    
+    // Batch Importer Live Telemetry & Events
+    @Published var batchTokensGenerated: Int = 0
+    @Published var lastStreamingActivityDate: Date? = nil
+    @Published var batchLiveEvents: [String] = []
+    @Published var batchActiveSubtask: String = ""
+    @Published var batchStartTime: Date? = nil
+    @Published var isBatchImportActive: Bool = false
+    @Published var cachedThinkingSupport: [String: Bool] = [:]
+    
+    private var currentExtractionTask: Task<Void, Never>? = nil
+    
+    var isTailscaleInCooldown: Bool {
+        guard let timeoutTime = lastTailscaleTimeoutTime else { return false }
+        return Date().timeIntervalSince(timeoutTime) < tailscaleCooldownSeconds
+    }
+    
+    var tailscaleCooldownRemainingSeconds: Int {
+        guard let timeoutTime = lastTailscaleTimeoutTime else { return 0 }
+        let remaining = Int(tailscaleCooldownSeconds - Date().timeIntervalSince(timeoutTime))
+        return max(0, remaining)
+    }
+    
+    func addBatchLiveEvent(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let timeStr = formatter.string(from: Date())
+        let entry = "[\(timeStr)] \(message)"
+        DispatchQueue.main.async {
+            self.batchLiveEvents.append(entry)
+            if self.batchLiveEvents.count > 40 {
+                self.batchLiveEvents.removeFirst(self.batchLiveEvents.count - 40)
+            }
+        }
+    }
+    
+    @MainActor
+    func cancelExtractionQueue() {
+        self.extractionQueue.removeAll()
+        self.currentExtractionTask?.cancel()
+        self.currentExtractionTask = nil
+        self.isProcessingExtractionQueue = false
+        self.isClassifyingProblems = false
+        self.isBatchImportActive = false
+        self.pipelineCurrentPhase = "Cancelled"
+        self.localTaskStatus = "Cancelled"
+        self.remoteTaskStatus = "Cancelled"
+        self.isLocalActive = false
+        self.isRemoteActive = false
+        self.addBatchLiveEvent("Batch extraction cancelled by user.")
+    }
+    
+    func isModelThinkingCapable(_ modelName: String) -> Bool {
+        let lower = modelName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lower.isEmpty { return false }
+        
+        // Vision models generally do not support thinking flags in Ollama
+        if lower.contains("-vl") || lower.contains("vision") || lower.contains("llava") || lower.contains("bakllava") || lower.contains("minicpm-v") {
+            return false
+        }
+        
+        // Check dynamic cache if probed via /api/show
+        if let cached = cachedThinkingSupport[lower] {
+            return cached
+        }
+        
+        // Known thinking / reasoning model families (DeepSeek-R1, QwQ, Qwen3 text)
+        if lower.contains("r1") || lower.contains("qwq") || lower.contains("qwen3") || lower.contains("think") || lower.contains("reason") {
+            return true
+        }
+        
+        return false
+    }
+    
+    func probeModelThinkingCapability(model: String, host: String) async {
+        let lower = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lower.isEmpty { return }
+        if lower.contains("-vl") || lower.contains("vision") {
+            await MainActor.run { self.cachedThinkingSupport[lower] = false }
+            return
+        }
+        guard let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") else { return }
+        let url = baseURL.appendingPathComponent("api/show")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 3.0
+        struct ShowReq: Codable { let name: String }
+        struct ShowResp: Codable { let template: String?; let parameters: String? }
+        do {
+            req.httpBody = try JSONEncoder().encode(ShowReq(name: model))
+            let (data, resp) = try await session.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                let showObj = try JSONDecoder().decode(ShowResp.self, from: data)
+                let tmpl = showObj.template ?? ""
+                let params = showObj.parameters ?? ""
+                let supports = tmpl.contains("<think>") || tmpl.contains(".Thinking") || tmpl.contains("thinking") || params.contains("think")
+                await MainActor.run {
+                    self.cachedThinkingSupport[lower] = supports || lower.contains("r1") || lower.contains("qwq") || lower.contains("qwen3")
+                }
+            }
+        } catch {
+            // Keep default heuristic
+        }
+    }
+    
+    var localPagesRemaining: Int {
+        max(0, localPagesTotal - localPagesCompleted)
+    }
+    
+    var remoteProblemsRemaining: Int {
+        max(0, remoteProblemsTotal - remoteProblemsCompleted)
+    }
+    
+    var isPipelineActive: Bool {
+        isLocalActive || isRemoteActive || (localPagesTotal > 0 && localPagesRemaining > 0) || (remoteProblemsTotal > 0 && remoteProblemsRemaining > 0)
+    }
     
     func isProcessingNote(id: Int) -> Bool {
         return activeProcessingNoteIds.contains(id)
@@ -281,11 +433,11 @@ struct ExtractionGroup: Identifiable, Equatable {
     var activeAIModel: String {
         let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
         if provider == "local" {
-            return UserDefaults.standard.string(forKey: "local_model_general") ?? "qwen2.5-coder:14b"
+            return UserDefaults.standard.string(forKey: "local_model_general") ?? ""
         } else if provider == "tailscale" {
-            return UserDefaults.standard.string(forKey: "tailscale_model_general") ?? "qwen2.5-coder:14b"
+            return UserDefaults.standard.string(forKey: "tailscale_model_general") ?? ""
         } else {
-            return UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud"
+            return UserDefaults.standard.string(forKey: "cloud_model_name") ?? ""
         }
     }
     
@@ -328,9 +480,11 @@ struct ExtractionGroup: Identifiable, Equatable {
         return providerInfo(for: provider, isVision: true)
     }
     
-    func startAITask(description: String, isVision: Bool = false, forceLocal: Bool = false, current: Int = 0, total: Int = 0) {
+    func startAITask(description: String, isVision: Bool = false, forceLocal: Bool = false, provider: String? = nil, current: Int = 0, total: Int = 0) {
         let info: (isLocal: Bool, name: String)
-        if forceLocal {
+        if let prov = provider, !prov.isEmpty {
+            info = providerInfo(for: prov, isVision: isVision)
+        } else if forceLocal {
             info = (true, "Local AI")
         } else if isVision {
             info = self.activeVisionProvider
@@ -343,6 +497,20 @@ struct ExtractionGroup: Identifiable, Equatable {
         self.currentAIProviderName = info.name
         self.activeProgressTotal = total > 0 ? max(self.activeProgressTotal, total) : 0
         self.activeProgressCurrent = current > 0 ? current : 0
+        
+        if info.isLocal {
+            self.isLocalActive = true
+            self.localTaskStatus = description
+            if self.pipelineCurrentPhase == "Idle" || self.pipelineCurrentPhase.isEmpty {
+                self.pipelineCurrentPhase = "Local AI Active"
+            }
+        } else {
+            self.isRemoteActive = true
+            self.remoteTaskStatus = description
+            if self.pipelineCurrentPhase == "Idle" || self.pipelineCurrentPhase.isEmpty {
+                self.pipelineCurrentPhase = "Tailscale AI Active"
+            }
+        }
     }
     
     func finishAITask(force: Bool = false) {
@@ -351,6 +519,13 @@ struct ExtractionGroup: Identifiable, Equatable {
             self.currentAITaskDescription = ""
             self.activeProgressCurrent = 0
             self.activeProgressTotal = 0
+            if !self.isProcessingExtractionQueue {
+                self.isLocalActive = false
+                self.isRemoteActive = false
+                if self.pipelineCurrentPhase.contains("AI Active") {
+                    self.pipelineCurrentPhase = "Idle"
+                }
+            }
         }
     }
     
@@ -398,7 +573,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         let answerItems: [ExtractionQueueItem]
     }
     private var extractionQueue: [ExtractionQueueGroupItem] = []
-    private var isProcessingExtractionQueue: Bool = false
+    @Published var isProcessingExtractionQueue: Bool = false
     
     @Published var sessionExtractedProblems: [ExtractedProblem] = []
     @Published var sessionExtractedAnswers: [ExtractedAnswer] = []
@@ -661,7 +836,47 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
         self.classificationQueueCount += uniqueItems
         
-        self.logToFile("[AI Batch Importer LOG] Queued \(groups.count) extraction groups. Clear session state completed.")
+        // Calculate total pages for local OCR processing
+        var totalPages = 0
+        for g in groups {
+            if g.questionItem.type == .pdf {
+                if let pdf = PDFDocument(url: URL(fileURLWithPath: g.questionItem.pathOrName)) {
+                    totalPages += pdf.pageCount
+                } else {
+                    totalPages += 1
+                }
+            } else {
+                totalPages += 1
+            }
+            for a in g.answerItems {
+                if a.pathOrName != g.questionItem.pathOrName {
+                    if a.type == .pdf {
+                        if let pdf = PDFDocument(url: URL(fileURLWithPath: a.pathOrName)) {
+                            totalPages += pdf.pageCount
+                        } else {
+                            totalPages += 1
+                        }
+                    } else {
+                        totalPages += 1
+                    }
+                }
+            }
+        }
+        self.localPagesTotal = max(1, totalPages)
+        self.localPagesCompleted = 0
+        self.localTaskStatus = "Starting OCR (\(self.localPagesTotal) pages)..."
+        self.remoteProblemsTotal = 0
+        self.remoteProblemsCompleted = 0
+        self.remoteTaskStatus = "Queued (waiting for OCR)"
+        self.pipelineCurrentPhase = "Phase 1/2: Local OCR"
+        self.isLocalActive = true
+        self.isRemoteActive = false
+        self.batchTokensGenerated = 0
+        self.batchStartTime = Date()
+        self.isBatchImportActive = true
+        self.addBatchLiveEvent("Batch import started: \(groups.count) document groups queued (\(self.localPagesTotal) pages).")
+        
+        self.logToFile("[AI Batch Importer LOG] Queued \(groups.count) extraction groups (\(self.localPagesTotal) total pages). Clear session state completed.")
         for g in groups {
             let qType: ExtractionQueueItem.ItemType = (g.questionItem.type == .pdf) ? .pdf : .image
             let qItem = ExtractionQueueItem(type: qType, pathOrName: g.questionItem.pathOrName, imageBase64: g.questionItem.imageBase64, isAnswerSource: false, originalPdfPath: g.questionItem.originalPdfPath)
@@ -686,14 +901,23 @@ struct ExtractionGroup: Identifiable, Equatable {
     private func processNextExtractionQueueItem() {
         guard !isProcessingExtractionQueue else { return }
         guard !extractionQueue.isEmpty else {
-            // Check if both queues are empty to clear progress bar
             if classificationCompletedCount >= classificationQueueCount {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
                     if self.extractionQueue.isEmpty && self.classificationQueue.isEmpty {
                         self.isClassifyingProblems = false
+                        self.isBatchImportActive = false
                         self.classificationQueueCount = 0
                         self.classificationCompletedCount = 0
                         self.queueStatusText = "Assigning Problems"
+                        self.localPagesTotal = 0
+                        self.localPagesCompleted = 0
+                        self.remoteProblemsTotal = 0
+                        self.remoteProblemsCompleted = 0
+                        self.localTaskStatus = "Idle"
+                        self.remoteTaskStatus = "Idle"
+                        self.pipelineCurrentPhase = "Idle"
+                        self.isLocalActive = false
+                        self.isRemoteActive = false
                     }
                 }
             }
@@ -703,13 +927,14 @@ struct ExtractionGroup: Identifiable, Equatable {
         isProcessingExtractionQueue = true
         let group = extractionQueue.removeFirst()
         
-        Task {
+        self.currentExtractionTask = Task {
             let startGroupTime = Date()
             var extractedQuestions = [ExtractedProblem]()
             var extractedAnswers = [ExtractedAnswer]()
             
-            // 1. Extract Questions via visual transcription on Laptop
+            // 1. Extract Questions via local visual transcription
             let qItem = group.questionItem
+            self.addBatchLiveEvent("Starting extraction for question document: \(qItem.pathOrName.components(separatedBy: "/").last ?? qItem.pathOrName)")
             self.logToFile("[AI Batch Importer LOG] --------------------------------------------------")
             self.logToFile("[AI Batch Importer LOG] Starting extraction for group question item: \(qItem.pathOrName)")
             
@@ -720,7 +945,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             
             self.classificationCompletedCount += 1 // Increment for question task
             
-            // 2. Extract Answers (if any)
+            // 2. Extract Answers (if any) via local visual transcription
             var endAExtract: TimeInterval = 0.0
             var endMatch: TimeInterval = 0.0
             
@@ -735,50 +960,244 @@ struct ExtractionGroup: Identifiable, Equatable {
                     self.sessionExtractedAnswers.append(contentsOf: fileAnswers)
                     self.classificationCompletedCount += 1
                 }
+                extractedAnswers = self.deduplicateExtractedAnswers(extractedAnswers)
+                self.sessionExtractedAnswers = self.deduplicateExtractedAnswers(self.sessionExtractedAnswers)
                 
                 endAExtract = Date().timeIntervalSince(startAExtract)
-                self.logToFile("[AI Batch Importer LOG] Answer extraction completed. Parsed \(extractedAnswers.count) total answers. (Took \(String(format: "%.2f", endAExtract))s)")
-                
-                // 3. Fast match answers to questions and attach steps BEFORE displaying on screen
-                let startMatch = Date()
-                if !extractedAnswers.isEmpty && !extractedQuestions.isEmpty {
-                    // Match by label/number heuristic first
-                    for i in 0..<extractedQuestions.count {
-                        if extractedQuestions[i].solution.isEmpty {
-                            let qTargetNum = i + 1
-                            if let matchAns = extractedAnswers.first(where: { ans in
-                                let digits = ans.label.filter { $0.isNumber }
-                                return Int(digits) == qTargetNum
-                            }) {
-                                extractedQuestions[i].solution = matchAns.content
-                                let steps = self.splitSolutionIntoSteps(matchAns.content)
-                                extractedQuestions[i].steps = !steps.isEmpty ? steps : [matchAns.content]
-                                self.logToFile("[AI Batch Importer LOG] Attached answer for Question \(i + 1) [\(matchAns.label)] (\(extractedQuestions[i].steps.count) steps)")
+                self.logToFile("[AI Batch Importer LOG] Answer extraction completed. Parsed \(extractedAnswers.count) deduplicated answers. (Took \(String(format: "%.2f", endAExtract))s)")
+            }
+            
+            // Phase 1 (Local Visual OCR) is now 100% complete for all documents in this group
+            await MainActor.run {
+                self.localPagesCompleted = self.localPagesTotal
+                self.localTaskStatus = "Done (\(self.localPagesTotal) pages OCR'd)"
+                self.isLocalActive = false
+                self.remoteProblemsTotal = max(self.remoteProblemsTotal, extractedQuestions.count)
+                self.remoteProblemsCompleted = 0
+                self.remoteTaskStatus = "Queued (\(extractedQuestions.count) problems)"
+                self.pipelineCurrentPhase = "Phase 2/2: Tailscale Derivations"
+                self.isRemoteActive = true
+            }
+            
+            // 3. Fast match answers to questions and attach steps on Remote Engine BEFORE displaying on screen
+            let startMatch = Date()
+            if !extractedAnswers.isEmpty && !extractedQuestions.isEmpty {
+                var solvedCount = 0
+                // Match by sequential monotonic partitioning heuristic (preserving order and subpart hierarchy)
+                var assignedAnswers: [Int: [ExtractedAnswer]] = [:]
+                var currentProblemNum = 1
+                var seenSubparts: [String] = []
+
+                let p1Pattern = #"^\s*(?:Problem|Question|Exercise|Task|Part)?\s*(?:\(?1\)?|\(?a\)?|1a)(?:\b|[:.\)\-]|$)"#
+                let lateSubpartPattern = #"(?:\(?[cd]\)?|\b[34]\b|Problem\s+d)"#
+
+                func expectedMaxSubpart(for questionContent: String) -> String? {
+                    let subs = self.extractQuestionSubparts(questionContent)
+                    if let last = subs.last?.subpart {
+                        return last.trimmingCharacters(in: CharacterSet(charactersIn: "() \t")).lowercased()
+                    }
+                    return nil
+                }
+
+                func extractSubpartFromLabel(_ label: String) -> String? {
+                    let p = #"(?:^|\s|\(|\d+)([a-j])(?:\)|\.|\s|$)"#
+                    guard let reg = try? NSRegularExpression(pattern: p, options: [.caseInsensitive]) else { return nil }
+                    let ns = label as NSString
+                    if let m = reg.firstMatch(in: label, options: [], range: NSRange(location: 0, length: ns.length)), m.numberOfRanges > 1 {
+                        return ns.substring(with: m.range(at: 1)).lowercased()
+                    }
+                    return nil
+                }
+
+                let maxSubparts = extractedQuestions.map { expectedMaxSubpart(for: $0.content) }
+
+                for (ansIdx, ans) in extractedAnswers.enumerated() {
+                    var rawNum = self.extractProblemNumberFromLabel(ans.label)
+                    
+                    // Don't let a generic "Problem 1" header pull us back if we have already progressed past Problem 1
+                    if rawNum == 1 && currentProblemNum > 1 {
+                        rawNum = nil
+                    }
+                    
+                    // Guard against handwritten '(c)' misread as 'Problem 3' right before the actual 'Problem 3 (a)'
+                    if let num = rawNum, num == currentProblemNum + 1, extractSubpartFromLabel(ans.label) == nil, ansIdx + 1 < extractedAnswers.count {
+                        let nextAns = extractedAnswers[ansIdx + 1]
+                        if self.extractProblemNumberFromLabel(nextAns.label) == num && extractSubpartFromLabel(nextAns.label) == "a" {
+                            rawNum = nil
+                        }
+                    }
+
+                    if let num = rawNum, num > currentProblemNum && num <= extractedQuestions.count {
+                        currentProblemNum = num
+                        seenSubparts = [ans.label]
+                    } else {
+                        let maxExpected = (currentProblemNum <= maxSubparts.count) ? maxSubparts[currentProblemNum - 1] : nil
+                        var hasSeenMax = false
+                        if let maxExp = maxExpected {
+                            for s in seenSubparts {
+                                if let sp = extractSubpartFromLabel(s), sp >= maxExp {
+                                    hasSeenMax = true
+                                    break
+                                }
+                            }
+                        }
+
+                        if hasSeenMax && (rawNum == nil || rawNum != currentProblemNum) && (currentProblemNum + 1) <= extractedQuestions.count {
+                            // Before advancing on an unnumbered continuation block after maxExpected, check if it still belongs to the final subpart of currentProblemNum
+                            var staysWithCurrent = false
+                            if rawNum == nil && extractSubpartFromLabel(ans.label) == nil {
+                                let curOverlap = self.answerOverlapScore(ans, withQuestion: extractedQuestions[currentProblemNum - 1].content)
+                                let nextOverlap = self.answerOverlapScore(ans, withQuestion: extractedQuestions[currentProblemNum].content)
+                                if curOverlap > nextOverlap && curOverlap >= 2 {
+                                    staysWithCurrent = true
+                                }
+                            }
+                            if staysWithCurrent {
+                                seenSubparts.append(ans.label)
+                            } else {
+                                currentProblemNum += 1
+                                seenSubparts = [ans.label]
+                            }
+                        } else {
+                            let isPart1 = ans.label.range(of: p1Pattern, options: [.regularExpression, .caseInsensitive]) != nil
+                            let hasLateSubpart = seenSubparts.contains { prev in
+                                prev.range(of: lateSubpartPattern, options: [.regularExpression, .caseInsensitive]) != nil
+                            }
+                            
+                            if isPart1 && hasLateSubpart && (currentProblemNum + 1) <= extractedQuestions.count {
+                                currentProblemNum += 1
+                                seenSubparts = [ans.label]
+                            } else {
+                                seenSubparts.append(ans.label)
                             }
                         }
                     }
                     
-                    // Fallback to semantic matching for any remaining unassigned questions
-                    let stillUnassigned = extractedQuestions.enumerated().filter { $0.element.solution.isEmpty }
-                    if !stillUnassigned.isEmpty {
-                        let unassignedQs = stillUnassigned.map { $0.element }
-                        let matched = await self.matchQuestionsAndAnswers(questions: unassignedQs, answers: extractedAnswers)
-                        for matchedQ in matched {
-                            if let idx = extractedQuestions.firstIndex(where: { $0.id == matchedQ.id || $0.content == matchedQ.content }) {
-                                if !matchedQ.solution.isEmpty {
-                                    extractedQuestions[idx].solution = matchedQ.solution
-                                    extractedQuestions[idx].steps = matchedQ.steps
+                    let targetQ = min(max(currentProblemNum, 1), extractedQuestions.count)
+                    assignedAnswers[targetQ, default: []].append(ans)
+                }
+
+                for i in 0..<extractedQuestions.count {
+                    if extractedQuestions[i].solution.isEmpty {
+                        let qTargetNum = i + 1
+                        let matchingAnswers = self.deduplicateExtractedAnswers(assignedAnswers[qTargetNum] ?? [])
+                        
+                        if !matchingAnswers.isEmpty {
+                            await MainActor.run {
+                                self.isRemoteActive = true
+                                self.remoteTaskStatus = "Deriving Question \(i + 1) of \(extractedQuestions.count)"
+                                self.pipelineCurrentPhase = "Phase 2/2: Deriving Solutions"
+                            }
+                            let combinedSolution = matchingAnswers.map { ans in
+                                if matchingAnswers.count > 1 {
+                                    return "### \(ans.label)\n\(ans.content)"
+                                } else {
+                                    return ans.content
+                                }
+                            }.joined(separator: "\n\n")
+                            
+                            extractedQuestions[i].solution = sanitizeLaTeX(combinedSolution)
+                            self.logToFile("[AI Batch Importer LOG] Generating pedagogical multi-step solution for Question \(i + 1) [matched \(matchingAnswers.count) segments for Problem \(qTargetNum)]...")
+                            let aiSteps = await self.generateStepsFromAnswer(question: extractedQuestions[i].content, answer: combinedSolution, problemNumber: qTargetNum)
+                            if !aiSteps.isEmpty {
+                                extractedQuestions[i].steps = aiSteps
+                            } else {
+                                let fallbackSteps = self.splitSolutionIntoSteps(combinedSolution)
+                                extractedQuestions[i].steps = !fallbackSteps.isEmpty ? fallbackSteps : [combinedSolution]
+                            }
+                            solvedCount += 1
+                            await MainActor.run {
+                                self.remoteProblemsCompleted = solvedCount
+                            }
+                            self.logToFile("[AI Batch Importer LOG] Attached answer for Question \(i + 1) (\(extractedQuestions[i].steps.count) steps)")
+                        }
+                    }
+                }
+                
+                // Fallback to semantic matching for any remaining unassigned questions
+                let stillUnassigned = extractedQuestions.enumerated().filter { $0.element.solution.isEmpty }
+                if !stillUnassigned.isEmpty {
+                    await MainActor.run {
+                        self.isRemoteActive = true
+                        self.remoteTaskStatus = "Matching \(stillUnassigned.count) questions..."
+                        self.pipelineCurrentPhase = "Phase 2/2: Semantic Matching"
+                    }
+                    let unassignedQs = stillUnassigned.map { $0.element }
+                    let matched = await self.matchQuestionsAndAnswers(questions: unassignedQs, answers: extractedAnswers)
+                    for matchedQ in matched {
+                        if let idx = extractedQuestions.firstIndex(where: { $0.id == matchedQ.id || $0.content == matchedQ.content }) {
+                            if !matchedQ.solution.isEmpty {
+                                await MainActor.run {
+                                    self.isRemoteActive = true
+                                    self.remoteTaskStatus = "Deriving Question \(idx + 1) of \(extractedQuestions.count)"
+                                }
+                                extractedQuestions[idx].solution = matchedQ.solution
+                                let aiSteps = await self.generateStepsFromAnswer(question: extractedQuestions[idx].content, answer: matchedQ.solution, problemNumber: idx + 1)
+                                if !aiSteps.isEmpty {
+                                    extractedQuestions[idx].steps = aiSteps
+                                } else {
+                                    extractedQuestions[idx].steps = !matchedQ.steps.isEmpty ? matchedQ.steps : [matchedQ.solution]
+                                }
+                                solvedCount += 1
+                                await MainActor.run {
+                                    self.remoteProblemsCompleted = solvedCount
                                 }
                             }
                         }
                     }
                 }
+                
+                // For any questions that still have NO matching solution in the answer key:
+                // Derive complete pedagogical solution and steps directly from first principles!
+                for i in 0..<extractedQuestions.count {
+                    if extractedQuestions[i].solution.isEmpty {
+                        await MainActor.run {
+                            self.isRemoteActive = true
+                            self.remoteTaskStatus = "Deriving Question \(i + 1) from first principles..."
+                            self.pipelineCurrentPhase = "Phase 2/2: Deriving Solutions"
+                        }
+                        self.logToFile("[AI Batch Importer LOG] Question \(i + 1) has no answer key in solution document. Deriving complete solution and steps from first principles...")
+                        let (derivedSol, derivedSteps) = await self.deriveSolutionAndSteps(question: extractedQuestions[i].content)
+                        if !derivedSol.isEmpty {
+                            extractedQuestions[i].solution = derivedSol
+                            extractedQuestions[i].steps = derivedSteps
+                            solvedCount += 1
+                            await MainActor.run {
+                                self.remoteProblemsCompleted = solvedCount
+                            }
+                            self.logToFile("[AI Batch Importer LOG] Successfully derived first-principles solution for Question \(i + 1) (\(derivedSteps.count) steps).")
+                        }
+                    }
+                }
+                
                 endMatch = Date().timeIntervalSince(startMatch)
             }
             
             // 4. Output questions to screen (with their steps already populated if solutions exist)
+            for i in 0..<extractedQuestions.count {
+                extractedQuestions[i].content = sanitizeLaTeX(extractedQuestions[i].content)
+                extractedQuestions[i].solutionHint = sanitizeLaTeX(extractedQuestions[i].solutionHint)
+                extractedQuestions[i].solution = sanitizeLaTeX(extractedQuestions[i].solution)
+                extractedQuestions[i].steps = extractedQuestions[i].steps.map { s in
+                    var cleaned = s.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+                    cleaned = cleaned.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+                    return sanitizeLaTeX(cleaned)
+                }
+            }
             self.sessionExtractedProblems.append(contentsOf: extractedQuestions)
+            self.sanitizeSessionExtractedProblems()
             self.logToFile("[AI Batch Importer LOG] Appended \(extractedQuestions.count) questions (with steps if available) to session list.")
+            self.addBatchLiveEvent("Successfully processed \(extractedQuestions.count) practice problems with step-by-step breakdowns.")
+            
+            await MainActor.run {
+                self.isRemoteActive = false
+                self.remoteProblemsCompleted = extractedQuestions.count
+                self.remoteTaskStatus = "Done (\(extractedQuestions.count) problems)"
+                self.pipelineCurrentPhase = "All Problems Ready"
+                if self.extractionQueue.isEmpty {
+                    self.isBatchImportActive = false
+                }
+            }
             
             let totalGroupTime = Date().timeIntervalSince(startGroupTime)
             self.logToFile("[AI Batch Importer LOG] ==================================================")
@@ -796,13 +1215,13 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     // MARK: - Answer extraction and matching helpers
     
-    struct ExtractedAnswer {
+    struct ExtractedAnswer: Codable {
         let label: String
         let content: String
     }
     
-    func normalizeLaTeXDelimiters(_ text: String) -> String {
-        var result = text
+    nonisolated func normalizeLaTeXDelimiters(_ text: String) -> String {
+        var result = convertTabularToArray(text)
         result = result.replacingOccurrences(of: "\\[", with: "$$")
         result = result.replacingOccurrences(of: "\\]", with: "$$")
         result = result.replacingOccurrences(of: "\\(", with: "$")
@@ -810,17 +1229,55 @@ struct ExtractionGroup: Identifiable, Equatable {
         return result
     }
 
-    func isTaskLocal(_ key: String, defaultLocal: Bool = false) -> Bool {
-        if let val = UserDefaults.standard.string(forKey: key) {
-            return val == "local"
+    func sanitizeSessionExtractedProblems() {
+        for i in 0..<sessionExtractedProblems.count {
+            sessionExtractedProblems[i].content = sanitizeLaTeX(sessionExtractedProblems[i].content)
+            sessionExtractedProblems[i].solutionHint = sanitizeLaTeX(sessionExtractedProblems[i].solutionHint)
+            sessionExtractedProblems[i].solution = sanitizeLaTeX(sessionExtractedProblems[i].solution)
+            sessionExtractedProblems[i].steps = sessionExtractedProblems[i].steps.map { s in
+                var cleaned = s.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+                cleaned = cleaned.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+                return sanitizeLaTeX(cleaned)
+            }
         }
-        return defaultLocal
+    }
+
+    func taskProvider(for key: String, isVision: Bool = false, defaultProvider: String? = nil) -> String {
+        let globalActive = isVision ?
+            (UserDefaults.standard.string(forKey: "vision_provider") ?? UserDefaults.standard.string(forKey: "ai_provider") ?? "local") :
+            (UserDefaults.standard.string(forKey: "ai_provider") ?? "tailscale")
+        
+        let isCloud = ["openai", "anthropic", "gemini", "groq", "hermes", "cloud"].contains(globalActive)
+
+        if let val = UserDefaults.standard.string(forKey: key), !val.isEmpty {
+            if val == "cloud" {
+                return globalActive
+            }
+            if isCloud && val == "tailscale" {
+                return globalActive
+            }
+            return val
+        }
+        
+        if isCloud {
+            return globalActive
+        }
+        
+        if let def = defaultProvider {
+            return def
+        }
+        return globalActive
+    }
+
+    func isTaskLocal(_ key: String, defaultLocal: Bool = false) -> Bool {
+        let prov = taskProvider(for: key, defaultProvider: defaultLocal ? "local" : "tailscale")
+        return prov == "local"
     }
 
     func extractAnswers(fromText text: String) async -> String? {
         await withUserPriority {
-            let useLocal = isTaskLocal("route_math", defaultLocal: false)
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let provider = taskProvider(for: "route_math", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
             let prompt = """
             You are a physics teaching assistant. Analyze the following text containing worked physics solutions or an answer key:
             ---
@@ -841,36 +1298,79 @@ struct ExtractionGroup: Identifiable, Equatable {
             
             Output ONLY the [ANSWER] blocks with no introductory text or conversational filler.
             """
-            return await callOllama(prompt: prompt, model: model, timeout: 120.0, forceLocal: useLocal)
+            return await callOllama(prompt: prompt, model: model, timeout: 120.0, overrideProvider: provider)
         }
     }
     
     func extractAnswersFromImage(base64Image: String) async -> String? {
         await withUserPriority {
-            let useLocal = isTaskLocal("route_vision", defaultLocal: true)
-            guard let visionModel = await getOllamaVisionModel(forceLocal: useLocal) else { return "MODEL_NOT_FOUND" }
+            let provider = taskProvider(for: "route_vision", isVision: true, defaultProvider: "local")
+            guard let visionModel = await getOllamaVisionModel(forceLocal: provider == "local") else { return "MODEL_NOT_FOUND" }
             let prompt = """
             You are a physics teaching assistant. Analyze this image containing solutions, answers, or an answer key.
             Extract and list all individual answers or solutions from the image.
             For each answer/solution:
             1. Keep the full mathematical derivations, calculations, intermediate steps, and final formulas intact.
             2. ALWAYS wrap all math formulas, variables, and math symbols in standard single dollar signs (e.g. $x_i$, $\\theta$) for inline math, and double dollar signs (e.g. $$E = mc^2$$) on separate lines for block equations.
+            3. CRITICAL: If the top of the page starts with a continuation of an earlier problem or an unlabelled subpart (e.g. '(c)', 'c)', '(d)', or a formula continuing from a previous page before a new problem header begins), you MUST extract it as its own separate [ANSWER] block. Label it with the subpart or continuation (e.g. 'Part (c)' or 'Problem Continuation'). Never ignore or drop calculations at the top of a page.
             
             Format the output strictly as follows:
             [ANSWER]
-            Label: <e.g. 'Problem 1', 'Question 2 (i)', or briefly summarize what the answer is about if no label exists>
+            Label: <e.g. 'Problem 1', 'Question 2 (i)', 'Part (c)', or briefly summarize what the answer is about if no label exists>
             Content: <the full answer text, steps, or final answer code, with equations wrapped in dollar signs>
             [ANSWER]
             
             Do NOT include any introduction, explanations, or conversational filler. Output only the structured list.
             """
-            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 180.0, forceLocal: useLocal)
+            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 180.0, overrideProvider: provider)
         }
     }
     
-    func parseExtractedAnswers(_ text: String) -> [ExtractedAnswer] {
+    nonisolated func deduplicateExtractedAnswers(_ answers: [ExtractedAnswer]) -> [ExtractedAnswer] {
+        var uniqueAnswers = [ExtractedAnswer]()
+        var seenFingerprints = Set<String>()
+        
+        for ans in answers {
+            let norm = ans.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if norm.isEmpty { continue }
+            
+            // Build invariant fingerprint by stripping whitespace and non-alphanumeric math
+            let fingerprint = norm.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
+            if seenFingerprints.contains(fingerprint) {
+                continue
+            }
+            
+            // Check for near-identical duplicate against the last added answer (e.g. repeated OCR loops)
+            if let last = uniqueAnswers.last {
+                let lastNorm = last.content.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
+                if lastNorm == fingerprint || (fingerprint.count > 40 && lastNorm.contains(fingerprint.prefix(80))) {
+                    continue
+                }
+            }
+            
+            seenFingerprints.insert(fingerprint)
+            uniqueAnswers.append(ans)
+        }
+        return uniqueAnswers
+    }
+    
+    nonisolated func answerOverlapScore(_ answer: ExtractedAnswer, withQuestion question: String) -> Int {
+        let qTokens = Set(question.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 3 })
+        let aTokens = answer.content.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 3 }
+        var score = 0
+        for token in aTokens {
+            if qTokens.contains(token) {
+                score += 1
+            }
+        }
+        return score
+    }
+
+    nonisolated func parseExtractedAnswers(_ text: String) -> [ExtractedAnswer] {
         var answers: [ExtractedAnswer] = []
-        let normalizedText = normalizeLaTeXDelimiters(text)
+        var strippedText = text.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression)
+        strippedText = strippedText.replacingOccurrences(of: #"(?i)\[/ANSWER\]"#, with: "[ANSWER]", options: .regularExpression)
+        let normalizedText = normalizeLaTeXDelimiters(strippedText)
         let blocks = normalizedText.components(separatedBy: "[ANSWER]")
         
         for block in blocks {
@@ -914,62 +1414,362 @@ struct ExtractionGroup: Identifiable, Equatable {
                 answers.append(ExtractedAnswer(label: finalLabel, content: normalizeLaTeXDelimiters(finalContent)))
             }
         }
-        return answers
+        return deduplicateExtractedAnswers(answers)
     }
     
-    func generateStepsFromAnswer(question: String, answer: String) async -> [String] {
-        await withUserPriority {
-            let useLocal = isTaskLocal("route_steps", defaultLocal: false)
-            let model = await getOllamaModel(forceLocal: useLocal)
-            self.logToFile("[AI Helper LOG] generateStepsFromAnswer called for question: '\(question.prefix(60))...'")
-            let prompt = """
-            You are an expert physics teaching assistant. Break down the following worked physics solution into 2 to 6 clear, numbered, pedagogical derivation steps.
+    nonisolated func extractQuestionSubparts(_ question: String) -> [(subpart: String, content: String)] {
+        let normalized = normalizeLaTeXDelimiters(question).trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty { return [] }
+        
+        // Strict line-start pattern for question subparts: (a), a), (i), i)
+        // Must be preceded by start of line and followed by space + letter/number/math
+        let pattern = #"(?m)^[ \t]*(?:(?:Part|Subpart)\s*)?(?:\(([a-jA-J]|i{1,4}|iv|v|vi{1,3})\)|([a-jA-J]|i{1,4}|iv|v|vi{1,3})[\).])(?=[ \t]+[A-Za-z0-9\$\\]|[ \t]*\n)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return []
+        }
+        
+        let ns = normalized as NSString
+        let matches = regex.matches(in: normalized, options: [], range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return [] }
+        
+        var subparts: [(subpart: String, content: String)] = []
+        let firstMatchLocation = matches[0].range.location
+        
+        // If the first explicit match is (b) or (ii), and there is substantial preamble text before it, infer (a) or (i)
+        let firstLetter: String = {
+            let m = matches[0]
+            if m.range(at: 1).location != NSNotFound { return ns.substring(with: m.range(at: 1)).lowercased() }
+            if m.range(at: 2).location != NSNotFound { return ns.substring(with: m.range(at: 2)).lowercased() }
+            return ""
+        }()
+        
+        if (firstLetter == "b" || firstLetter == "ii") && firstMatchLocation > 25 {
+            let preamble = ns.substring(to: firstMatchLocation).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !preamble.isEmpty {
+                let inferredLabel = (firstLetter == "b") ? "(a)" : "(i)"
+                subparts.append((subpart: inferredLabel, content: preamble))
+            }
+        }
+        
+        for (idx, m) in matches.enumerated() {
+            var letter = ""
+            if m.range(at: 1).location != NSNotFound {
+                letter = ns.substring(with: m.range(at: 1)).lowercased()
+            } else if m.range(at: 2).location != NSNotFound {
+                letter = ns.substring(with: m.range(at: 2)).lowercased()
+            }
+            guard !letter.isEmpty else { continue }
             
+            let contentStart = m.range.location + m.range.length
+            let contentEnd = (idx + 1 < matches.count) ? matches[idx + 1].range.location : ns.length
+            if contentEnd > contentStart {
+                let text = ns.substring(with: NSRange(location: contentStart, length: contentEnd - contentStart)).trimmingCharacters(in: .whitespacesAndNewlines)
+                subparts.append((subpart: "(\(letter))", content: text))
+            }
+        }
+        
+        return subparts.count >= 2 ? subparts : []
+    }
+    
+    nonisolated func questionHasSubparts(_ question: String) -> Bool {
+        return extractQuestionSubparts(question).count >= 2
+    }
+    
+    nonisolated func splitSolutionIntoSubparts(_ solution: String, expectedSubparts: [String] = []) -> [(subpart: String, content: String)] {
+        let normalized = normalizeLaTeXDelimiters(solution).trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty { return [] }
+        
+        var results = [(subpart: String, content: String)]()
+        let subRegex = #"(?i)(?:^|\s|\(|\b(?:Part|Subpart|Question|Problem)\s*\d*\s*\(?)([a-jA-J]|i{1,4}|iv|v|vi{1,3}|ix|x)(?:\)|\.|\s|$)"#
+        let compiledSubRegex = try? NSRegularExpression(pattern: subRegex, options: [])
+        
+        // 1. Check if the solution is structured with markdown section headers (### ...)
+        if normalized.contains("###") {
+            let blocks = normalized.components(separatedBy: "\n###")
+            
+            for b in blocks {
+                let trimmedBlock = b.replacingOccurrences(of: #"^\s*###\s*"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmedBlock.isEmpty { continue }
+                
+                let lines = trimmedBlock.components(separatedBy: .newlines)
+                let header = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                let body = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                let isContinuation = header.lowercased().contains("continuation")
+                let nsHeader = header as NSString
+                let match = compiledSubRegex?.firstMatch(in: header, options: [], range: NSRange(location: 0, length: nsHeader.length))
+                
+                if let m = match, !isContinuation, m.numberOfRanges > 1 {
+                    let letter = nsHeader.substring(with: m.range(at: 1)).lowercased()
+                    let subLabel = "(\(letter))"
+                    let blockContent = body.isEmpty ? header : body
+                    
+                    if let existingIdx = results.firstIndex(where: { $0.subpart == subLabel }) {
+                        results[existingIdx].content += "\n\n" + blockContent
+                    } else {
+                        results.append((subpart: subLabel, content: blockContent))
+                    }
+                } else {
+                    // Check if the body or continuation block contains an explicit inline subpart marker (e.g. "d) what if instead...")
+                    let inlinePattern = #"(?m)^[ \t]*(?:\(([a-jA-J]|i{1,4}|iv|v|vi{1,3})\)|([a-jA-J]|i{1,4}|iv|v|vi{1,3})\))[ \t]+"#
+                    if let inlineRegex = try? NSRegularExpression(pattern: inlinePattern, options: []),
+                       let inlineMatch = inlineRegex.firstMatch(in: body, options: [], range: NSRange(location: 0, length: (body as NSString).length)) {
+                        let nsBody = body as NSString
+                        let splitLoc = inlineMatch.range.location
+                        let prePart = nsBody.substring(to: splitLoc).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let postPart = nsBody.substring(from: splitLoc).trimmingCharacters(in: .whitespacesAndNewlines)
+                        
+                        if !prePart.isEmpty {
+                            if !results.isEmpty {
+                                results[results.count - 1].content += "\n\n" + prePart
+                            } else {
+                                results.append((subpart: "(a)", content: prePart))
+                            }
+                        }
+                        
+                        var letter = ""
+                        if inlineMatch.range(at: 1).location != NSNotFound { letter = nsBody.substring(with: inlineMatch.range(at: 1)).lowercased() }
+                        else if inlineMatch.range(at: 2).location != NSNotFound { letter = nsBody.substring(with: inlineMatch.range(at: 2)).lowercased() }
+                        let subLabel = !letter.isEmpty ? "(\(letter))" : "(d)"
+                        results.append((subpart: subLabel, content: postPart))
+                    } else if !results.isEmpty {
+                        results[results.count - 1].content += "\n\n" + trimmedBlock
+                    } else {
+                        results.append((subpart: "(a)", content: trimmedBlock))
+                    }
+                }
+            }
+            
+            if results.count >= 2 {
+                return results
+            }
+        }
+        
+        // 2. Standard inline / plain-text subpart regex matching (e.g. (a), Part (b), 1. (a))
+        let pattern = "(?m)^\\s*(?:###\\s*)?(?:(?:Part|Subpart|Question|Problem)\\s*\\d*\\s*)?\\(?([a-jA-J]|i{1,4}|iv|v|vi{1,3}|ix|x)\\)?[\\.:\\s]+(.*?)(?=(?:^\\s*(?:###\\s*)?(?:(?:Part|Subpart|Question|Problem)\\s*\\d*\\s*)?\\(?(?:[a-jA-J]|i{1,4}|iv|v|vi{1,3}|ix|x)\\)?[\\.:\\s]+)|\\z)"
+        if let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) {
+            let nsStr = normalized as NSString
+            let matches = regex.matches(in: normalized, options: [], range: NSRange(location: 0, length: nsStr.length))
+            
+            var inlineResults = [(subpart: String, content: String)]()
+            for match in matches {
+                if match.numberOfRanges > 2 {
+                    let labelRange = match.range(at: 1)
+                    let contentRange = match.range(at: 2)
+                    let label = nsStr.substring(with: labelRange).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    let content = nsStr.substring(with: contentRange).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !content.isEmpty {
+                        inlineResults.append((subpart: "(\(label))", content: content))
+                    }
+                }
+            }
+            
+            if inlineResults.count >= 2 {
+                return inlineResults
+            }
+        }
+        
+        return [("Full", normalized)]
+    }
+    
+    func generateStepsFromAnswer(question: String, answer: String, problemNumber: Int? = nil) async -> [String] {
+        await withUserPriority {
+            let provider = taskProvider(for: "route_steps", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
+            let qPrefix = question.prefix(60).replacingOccurrences(of: "\n", with: " ")
+            self.logToFile("[AI Helper LOG] generateStepsFromAnswer called with model '\(model)' (provider: \(provider)) for question: '\(qPrefix)...'")
+            
+            let qSubparts = self.extractQuestionSubparts(question)
+            let hasSubparts = qSubparts.count >= 2
+            
+            // 1. If the question has multiple distinct subparts, decompose by subpart
+            if hasSubparts {
+                let solSubparts = self.splitSolutionIntoSubparts(answer, expectedSubparts: qSubparts.map { $0.subpart })
+                self.logToFile("[AI Helper LOG] Question has \(qSubparts.count) subparts: \(qSubparts.map { $0.subpart }.joined(separator: ", ")). Solution yielded \(solSubparts.count) segments.")
+                
+                var reassembledSteps = [String]()
+                for qSub in qSubparts {
+                    let matchingSol = solSubparts.first(where: { $0.subpart.lowercased() == qSub.subpart.lowercased() })?.content ?? answer
+                    self.logToFile("[AI Helper LOG] Generating steps for subpart \(qSub.subpart) on \(provider)...")
+                    
+                    let subPrompt = """
+                    You are an expert university physics educator. Break down subpart \(qSub.subpart) into 2 to 4 numbered pedagogical derivation steps.
+
+                    Context Question for \(qSub.subpart):
+                    ---
+                    \(qSub.content)
+                    ---
+
+                    Full Question Context:
+                    ---
+                    \(question)
+                    ---
+
+                    Worked Solution for \(qSub.subpart):
+                    ---
+                    \(matchingSol)
+                    ---
+
+                    Pedagogical Structure:
+                    - Step 1: Conceptual Setup & Physical Principles (State laws, definitions - Severity Level 1 diagnostic).
+                    - Step 2: Governing Formulation (Governing equations, substitutions - Severity Level 2 diagnostic).
+                    - Step 3+: Mathematical Derivations & Final Evaluation.
+
+                    Critical OCR Notation Reconciliation:
+                    The solution was transcribed from handwritten notes and may contain visual OCR misreadings (such as '|4>' or '|u>' instead of '|\\psi>', '\\rho' instead of 'p', 'A' instead of 'x', '\\text{thmco}' instead of '\\hbar m \\omega'). You MUST actively correct all symbols and notations to match the variables defined in the Question statement.
+
+                    Formatting Instructions:
+                    - Wrap every step strictly inside [STEP] and [/STEP] tags.
+                    - Always include:
+                      [STEP]
+                      Tier: <Conceptual Setup | Governing Formulation | Algebraic Derivation>
+                      Subpart: \(qSub.subpart)
+                      Content: <clear explanation followed by display math in $$...$$ on separate lines>
+                      [/STEP]
+                    - Wrap all inline variables in $...$.
+                    - NO emojis. NO conversational filler. NO markdown code fences.
+                    - CRITICAL: Do NOT use markdown bold asterisks (**) anywhere. Write plain text for headers and explanations.
+
+                    Output ONLY the [STEP] blocks.
+                    """
+                    
+                    if let res = await callOllama(prompt: subPrompt, model: model, timeout: 240.0, overrideProvider: provider) {
+                        let partSteps = self.parseStepsFromLLMResponse(res, hasSubparts: true)
+                        reassembledSteps.append(contentsOf: partSteps)
+                        self.logToFile("[AI Helper LOG] Subpart \(qSub.subpart) generated \(partSteps.count) steps.")
+                    }
+                }
+                
+                if !reassembledSteps.isEmpty {
+                    self.logToFile("[AI Helper LOG] Successfully reassembled \(reassembledSteps.count) total steps across \(qSubparts.count) subparts for the unified question.")
+                    return reassembledSteps
+                }
+            }
+            
+            // 2. Single-pass generation for unified questions (or when subparts decomposition isn't needed)
+            let prompt = hasSubparts ? """
+            You are an expert university physics educator. Break down the following worked physics solution into 2 to 6 numbered pedagogical derivation steps.
+
             Question:
             ---
             \(question)
             ---
-            
-            Solution:
+
+            Worked Solution:
             ---
             \(answer)
             ---
-            
-            Rules:
-            1. Each step MUST represent one clear derivation stage, equation manipulation, physical principle, or mathematical substitution.
-            2. If the solution contains subparts (e.g. (i), (ii), (a), (b)), break each subpart and its main derivation stages into distinct steps.
-            3. Preserve ALL mathematical derivations, formulas, integrals, boundary conditions, and final answers exactly.
-            4. Wrap all math formulas, variables, and math symbols in standard single dollar signs ($...$) for inline math, and double dollar signs ($$...$$) on separate lines for display equations.
-            5. Provide concise explanatory text before or alongside equations (e.g., 'Differentiate the Helmholtz free energy $F$ w.r.t. $V_1$:', 'Apply the thermodynamic definition for $P_i$:', etc.).
-            6. Prefix each step with 'STEP:'. For example:
-               STEP: State the differential form $$dG = \\alpha dx + \\beta \\frac{x}{y} dy$$.
-               STEP: Compute the partial derivatives $$\\left(\\frac{\\partial A}{\\partial y}\\right)_x = 0 \\quad \\text{and} \\quad \\left(\\frac{\\partial B}{\\partial x}\\right)_y = \\frac{\\beta}{y}$$.
-               STEP: Check for exactness. Since $$\\left(\\frac{\\partial A}{\\partial y}\\right)_x \\neq \\left(\\frac{\\partial B}{\\partial x}\\right)_y$$, the differential form is inexact.
-            
-            Output ONLY the list of steps starting with 'STEP:'. Do NOT include any conversation, markdown code fences, or introductory filler.
+
+            Pedagogical Structure:
+            - Step 1: Conceptual Setup & Physical Principles (State laws, definitions, boundary conditions - Severity Level 1 diagnostic).
+            - Step 2: Governing Equations & Formulation (Set up differential forms, state equations, substitutions - Severity Level 2 diagnostic).
+            - Step 3+: Algebraic Derivations, Integration & Final Result (Step 3+ Calculation slips).
+            - Clearly label each step with its subpart (e.g. (a), (b) or (i), (ii)).
+            - Tabular Problems: If the problem is a table or data sheet, do NOT make up artificial differential equations. Step 1 should present the conceptual principles, rules, and definitions. Step 2 should present the completed table in standard LaTeX $$ \\begin{array}{...} ... \\end{array} $$ format.
+
+            Critical OCR Notation Reconciliation:
+            The solution was transcribed from handwritten notes and may contain visual OCR misreadings (such as '|4>' or '|u>' instead of '|\\psi>', '\\rho' instead of 'p', 'A' instead of 'x', '\\text{thmco}' instead of '\\hbar m \\omega'). You MUST actively correct all symbols and notations to match the variables defined in the Question statement.
+
+            Formatting Instructions:
+            - Wrap every step strictly inside [STEP] and [/STEP] tags.
+            - Inside each block, provide clear explanations followed by centered display math ($$...$$) on separate lines.
+            - Wrap all inline variables in $...$.
+            - NO emojis. NO conversational filler. NO markdown code fences.
+            - CRITICAL: Do NOT use markdown bold asterisks (**) anywhere. Write plain text headers and text.
+
+            Example format:
+            [STEP]
+            Tier: Conceptual Setup
+            Subpart: (a)
+            Content: State the fundamental physical principles and conditions...
+            [/STEP]
+            [STEP]
+            Tier: Governing Formulation
+            Subpart: (a)
+            Content: Set up the governing equations:
+            $$
+            ...
+            $$
+            [/STEP]
+            [STEP]
+            Tier: Algebraic Derivation
+            Subpart: (a)
+            Content: Carry out the derivation and evaluate...
+            [/STEP]
+
+            Output ONLY the [STEP] blocks.
+            """ : """
+            You are an expert university physics educator. Break down the following worked physics solution into 2 to 6 numbered pedagogical derivation steps.
+
+            Question:
+            ---
+            \(question)
+            ---
+
+            Worked Solution:
+            ---
+            \(answer)
+            ---
+
+            Pedagogical Structure:
+            - Step 1: Conceptual Setup & Physical Principles (State laws, definitions, boundary conditions - Severity Level 1 diagnostic).
+            - Step 2: Governing Equations & Formulation (Set up differential forms, state equations, substitutions - Severity Level 2 diagnostic).
+            - Step 3+: Algebraic Derivations, Integration & Final Result (Step 3+ Calculation slips).
+            - CRITICAL: This question is a unified problem with NO subparts (no part a, b, etc.). Do NOT output any 'Subpart:' line. Do NOT label steps with (a), (b), or (i).
+            - Tabular Problems: If the problem is a table or data sheet, do NOT make up artificial differential equations. Step 1 should present the conceptual principles, rules, and definitions. Step 2 should present the completed table in standard LaTeX $$ \\begin{array}{...} ... \\end{array} $$ format.
+
+            Critical OCR Notation Reconciliation:
+            The solution was transcribed from handwritten notes and may contain visual OCR misreadings (such as '|4>' or '|u>' instead of '|\\psi>', '\\rho' instead of 'p', 'A' instead of 'x', '\\text{thmco}' instead of '\\hbar m \\omega'). You MUST actively correct all symbols and notations to match the variables defined in the Question statement.
+
+            Formatting Instructions:
+            - Wrap every step strictly inside [STEP] and [/STEP] tags.
+            - Inside each block, provide clear explanations followed by centered display math ($$...$$) on separate lines.
+            - Wrap all inline variables in $...$.
+            - NO emojis. NO conversational filler. NO markdown code fences.
+            - CRITICAL: Do NOT use markdown bold asterisks (**) anywhere. Write plain text headers and text.
+
+            Example format:
+            [STEP]
+            Tier: Conceptual Setup
+            Content: State the fundamental physical principles and conditions...
+            [/STEP]
+            [STEP]
+            Tier: Governing Formulation
+            Content: Set up the governing equations:
+            $$
+            ...
+            $$
+            [/STEP]
+            [STEP]
+            Tier: Algebraic Derivation
+            Content: Carry out the derivation and evaluate...
+            [/STEP]
+
+            Output ONLY the [STEP] blocks.
             """
             
-            guard let res = await callOllama(prompt: prompt, model: model, timeout: 120.0, forceLocal: useLocal) else {
+            guard let res = await callOllama(prompt: prompt, model: model, timeout: 180.0, overrideProvider: provider) else {
                 return []
             }
-            let steps = self.parseStepsFromLLMResponse(res)
+            let steps = self.parseStepsFromLLMResponse(res, hasSubparts: hasSubparts)
             return steps
         }
     }
     
-    func isStepHeader(_ line: String) -> Bool {
+    nonisolated func isStepHeader(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return false }
         
-        // 1. Check for "step" pattern (e.g. "Step 1:", "STEP:", "Step:")
+        let lower = trimmed.lowercased()
+        if lower.contains("step-by-step") || lower.contains("steps:") || lower.contains("steps to") || lower.contains("following steps") {
+            return false
+        }
+        
+        // 1. Check for "step" pattern (e.g. "Step 1:", "STEP:", "Step:", "### Step 3.")
         let stepPattern = "^[\\*#_\\s\\-]*step[s\\s\\-]*(\\d+|:|\\s+)"
         if let regex = try? NSRegularExpression(pattern: stepPattern, options: [.caseInsensitive]) {
             let range = NSRange(location: 0, length: trimmed.utf16.count)
             if regex.firstMatch(in: trimmed, options: [], range: range) != nil {
-                let lower = trimmed.lowercased()
-                if lower.contains("step-by-step") || lower.contains("steps:") || lower.contains("steps to") || lower.contains("following steps") {
-                    return false
-                }
                 return true
             }
         }
@@ -983,9 +1783,18 @@ struct ExtractionGroup: Identifiable, Equatable {
             }
         }
         
-        // 3. Check for numbered list pattern (e.g. "1. ", "1) ") followed by words (not just an isolated equation number)
+        // 3. Check for numbered list pattern (e.g. "1. ", "1) ") followed by words
         let numberPattern = "^[\\*#_\\s]*\\d+[\\.\\):]\\s+[A-Za-z\\$]"
         if let regex = try? NSRegularExpression(pattern: numberPattern, options: []) {
+            let range = NSRange(location: 0, length: trimmed.utf16.count)
+            if regex.firstMatch(in: trimmed, options: [], range: range) != nil {
+                return true
+            }
+        }
+        
+        // 4. Check for bullet list pattern (e.g. "- First", "* Compute", "• Step")
+        let bulletPattern = "^[\\*#_\\s]*[-*•]\\s+[A-Za-z\\$]"
+        if let regex = try? NSRegularExpression(pattern: bulletPattern, options: []) {
             let range = NSRange(location: 0, length: trimmed.utf16.count)
             if regex.firstMatch(in: trimmed, options: [], range: range) != nil {
                 return true
@@ -995,36 +1804,217 @@ struct ExtractionGroup: Identifiable, Equatable {
         return false
     }
     
-    func cleanStepText(_ line: String) -> String {
+    nonisolated func cleanStepText(_ line: String) -> String {
         var text = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = text.lowercased()
+        
+        // Strip markdown bold **text** -> text and lingering asterisks
+        text = text.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+        
+        // Strip markdown headers: ### etc.
+        text = text.replacingOccurrences(of: "^#+\\s*", with: "", options: .regularExpression)
         
         // If it starts with Step X:, clean the prefix
-        if let stepRange = lower.range(of: "step") {
-            let sub = lower[stepRange.upperBound...]
-            var charsToSkip = 0
-            for char in sub {
-                if char.isNumber || char == " " || char == ":" || char == "." || char == "-" || char == "*" || char == "_" || char == "#" || char == "•" || char == "+" || char == ")" {
-                    charsToSkip += 1
-                } else {
-                    break
-                }
-            }
-            let prefixLength = text.distance(from: text.startIndex, to: stepRange.upperBound) + charsToSkip
-            if prefixLength > 0 && prefixLength < text.count {
-                text = String(text.dropFirst(prefixLength))
-            }
+        let lower = text.lowercased()
+        if lower.contains("step") {
+            let stepPrefixPattern = "^[\\*#_\\s\\-]*step[s\\s\\-]*\\d*[:.]*[\\*_]*\\s*"
+            text = text.replacingOccurrences(of: stepPrefixPattern, with: "", options: [.regularExpression, .caseInsensitive])
         }
+        
+        // Strip leading numbering: e.g. "1. ", "2) "
+        text = text.replacingOccurrences(of: "^\\d+[\\.\\):]\\s*", with: "", options: .regularExpression)
+        
+        // Strip leading bullets: e.g. "- ", "* ", "• "
+        text = text.replacingOccurrences(of: "^[-*•]\\s*", with: "", options: .regularExpression)
+        
+        // Strip remaining leading bold/italic markers or colons
+        text = text.replacingOccurrences(of: "^[:\\*_\\s]+", with: "", options: .regularExpression)
         
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
-    func parseStepsFromLLMResponse(_ res: String) -> [String] {
+    nonisolated func cleanDiagnosticTier(_ raw: String) -> String {
+        var unstarred = raw.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+        unstarred = unstarred.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+        let lower = unstarred.lowercased()
+        if lower.contains("concept") || lower.contains("principle") || lower.contains("setup") {
+            return "Conceptual Setup"
+        } else if lower.contains("govern") || lower.contains("formulat") || lower.contains("equation") {
+            return "Governing Formulation"
+        } else if lower.contains("algebra") || lower.contains("derivat") || lower.contains("calculat") || lower.contains("integrat") {
+            return "Algebraic Derivation"
+        } else if lower.contains("interpret") || lower.contains("analys") || lower.contains("meaning") {
+            return "Interpretation & Analysis"
+        } else if lower.contains("verif") || lower.contains("evaluat") || lower.contains("result") || lower.contains("complet") {
+            return "Verification & Result"
+        }
+        var cleaned = unstarred.replacingOccurrences(of: #"[\$\\][a-zA-Z0-9_\{\}\\]*"#, with: "", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: #"[\[\]\(\)\*#]"#, with: "", options: .regularExpression)
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    nonisolated func parseStepsFromLLMResponse(_ res: String, hasSubparts: Bool = true) -> [String] {
         self.logToFile("[AI Helper LOG] Parsing LLM response into steps. Raw response length: \(res.count)")
         
-        var steps = [String]()
-        let lines = res.components(separatedBy: .newlines)
+        var strippedRes = res.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression)
+        strippedRes = strippedRes.replacingOccurrences(of: #"(?i)\[/?think\]"#, with: "", options: .regularExpression)
+        let normalizedRes = normalizeLaTeXDelimiters(strippedRes)
         
+        // 1. Check for explicit [STEP] blocks (supporting unclosed final [/STEP] tag)
+        if normalizedRes.contains("[STEP]") {
+            var extractedBlocks = [String]()
+            let rawParts = normalizedRes.components(separatedBy: "[STEP]")
+            
+            for part in rawParts.dropFirst() {
+                var blockContent = part
+                if let closeRange = blockContent.range(of: "[/STEP]") {
+                    blockContent = String(blockContent[..<closeRange.lowerBound])
+                }
+                blockContent = blockContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                if blockContent.isEmpty { continue }
+                
+                // Strip markdown bold **text** -> text and lingering asterisks
+                blockContent = blockContent.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+                blockContent = blockContent.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+                
+                // Parse structured Tier: / Subpart: / Content:
+                if blockContent.localizedCaseInsensitiveContains("Content:") {
+                    var tierStr = ""
+                    var subpartStr = ""
+                    var contentStr = ""
+                    let lines = blockContent.components(separatedBy: .newlines)
+                    var readingContent = false
+                    for line in lines {
+                        let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let lower = trimmedLine.lowercased()
+                        if lower.starts(with: "tier:") {
+                            tierStr = trimmedLine.replacingOccurrences(of: "(?i)^tier:\\s*", with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+                        } else if lower.starts(with: "subpart:") {
+                            subpartStr = trimmedLine.replacingOccurrences(of: "(?i)^subpart:\\s*", with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+                        } else if lower.starts(with: "content:") {
+                            readingContent = true
+                            let c = trimmedLine.replacingOccurrences(of: "(?i)^content:\\s*", with: "", options: .regularExpression)
+                            if !c.isEmpty { contentStr = c }
+                        } else if readingContent {
+                            contentStr += (contentStr.isEmpty ? "" : "\n") + line
+                        }
+                    }
+                    if !contentStr.isEmpty {
+                        var formatted = ""
+                        let cleanTier = cleanDiagnosticTier(tierStr)
+                        if !cleanTier.isEmpty {
+                            formatted += "[\(cleanTier)] "
+                        }
+                        if hasSubparts && !subpartStr.isEmpty && subpartStr.lowercased() != "full" && subpartStr.lowercased() != "none" {
+                            formatted += "\(subpartStr) "
+                        }
+                        if !formatted.isEmpty {
+                            formatted += "\n\n"
+                        }
+                        formatted += contentStr.trimmingCharacters(in: .whitespacesAndNewlines)
+                        blockContent = formatted
+                    }
+                } else {
+                    // If the LLM omitted "Content:" but outputted a Tier heading like "Tier: ...", "Conceptual Setup...", or "Step 1: ..."
+                    let lines = blockContent.components(separatedBy: .newlines)
+                    var tierStr = ""
+                    var contentLines = [String]()
+                    for (idx, line) in lines.enumerated() {
+                        let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let lower = trimmedLine.lowercased()
+                        if idx == 0 || (idx == 1 && tierStr.isEmpty) {
+                            if lower.starts(with: "tier:") {
+                                tierStr = trimmedLine.replacingOccurrences(of: "(?i)^tier:\\s*", with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+                                continue
+                            } else if lower.contains("conceptual") || lower.contains("governing") || lower.contains("algebraic") || lower.contains("identification") || lower.contains("data collection") || lower.contains("principle") {
+                                tierStr = cleanDiagnosticTier(trimmedLine)
+                                continue
+                            }
+                        }
+                        contentLines.append(line)
+                    }
+                    let remainingContent = contentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !remainingContent.isEmpty {
+                        var formatted = ""
+                        let cleanTier = cleanDiagnosticTier(tierStr)
+                        if !cleanTier.isEmpty {
+                            formatted += "[\(cleanTier)]\n\n"
+                        }
+                        formatted += remainingContent
+                        blockContent = formatted
+                    }
+                }
+                
+                // Strip raw leftover tag markers
+                blockContent = blockContent.replacingOccurrences(of: #"(?i)\[/?step\]"#, with: "", options: .regularExpression)
+                blockContent = blockContent.replacingOccurrences(of: #"(?m)^(?i)content:\s*"#, with: "", options: .regularExpression)
+                blockContent = blockContent.replacingOccurrences(of: #"(?m)^(?i)tier:\s*[^\n]*\n?"#, with: "", options: .regularExpression)
+                
+                if !hasSubparts {
+                    blockContent = blockContent.replacingOccurrences(of: #"(?m)^(?i)subpart:\s*[^\n]*\n?"#, with: "", options: .regularExpression)
+                }
+                
+                let cleanedBlock = blockContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleanedBlock.isEmpty {
+                    extractedBlocks.append(normalizeLaTeXDelimiters(cleanedBlock))
+                }
+            }
+            
+            if !extractedBlocks.isEmpty {
+                self.logToFile("[AI Helper LOG] Parsed \(extractedBlocks.count) explicit [STEP] blocks.")
+                for (i, step) in extractedBlocks.enumerated() {
+                    self.logToFile("[AI Helper LOG] Step \(i+1): '\(step.prefix(80))...'")
+                }
+                return extractedBlocks
+            }
+        }
+        
+        let lines = normalizedRes.components(separatedBy: .newlines)
+        
+        // 2. Fallback to step headers (e.g. Step 1:, (a), 1., etc.)
+        let hasStepHeader = lines.contains { isStepHeader($0) }
+        if !hasStepHeader {
+            // Group paragraphs: consolidate short equation-only paragraphs with preceding description
+            let rawParagraphs = normalizedRes.components(separatedBy: "\n\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            
+            var consolidated = [String]()
+            for p in rawParagraphs {
+                let cleanP = p.replacingOccurrences(of: #"(?i)\[/?step\]"#, with: "", options: .regularExpression)
+                              .replacingOccurrences(of: #"(?m)^(?i)content:\s*"#, with: "", options: .regularExpression)
+                              .trimmingCharacters(in: .whitespacesAndNewlines)
+                if cleanP.isEmpty { continue }
+                
+                let isFormulaOnly = (cleanP.starts(with: "$$") && cleanP.hasSuffix("$$")) ||
+                                   (cleanP.starts(with: "\\[") && cleanP.hasSuffix("\\]")) ||
+                                   (cleanP.count < 75 && cleanP.contains("="))
+                
+                if isFormulaOnly && !consolidated.isEmpty {
+                    consolidated[consolidated.count - 1] += "\n\n" + cleanP
+                } else {
+                    consolidated.append(cleanP)
+                }
+            }
+            
+            if consolidated.count > 1 {
+                // Tier untagged paragraphs so they don't look untiered
+                var tieredSteps = [String]()
+                let tierLabels = ["Conceptual Setup", "Governing Formulation", "Algebraic Derivation", "Verification & Result"]
+                for (idx, p) in consolidated.enumerated() {
+                    let tier = (idx < tierLabels.count) ? tierLabels[idx] : "Algebraic Derivation"
+                    if !p.starts(with: "[") {
+                        tieredSteps.append("[\(tier)]\n\n\(p)")
+                    } else {
+                        tieredSteps.append(p)
+                    }
+                }
+                self.logToFile("[AI Helper LOG] Consolidated untagged text into \(tieredSteps.count) tiered steps.")
+                return tieredSteps
+            }
+        }
+        
+        var steps = [String]()
         var currentStepText = ""
         
         for line in lines {
@@ -1037,19 +2027,26 @@ struct ExtractionGroup: Identifiable, Equatable {
                 continue
             }
             
+            // Skip introductory conversational line before the first step header
+            if steps.isEmpty && currentStepText.isEmpty {
+                if lower.hasPrefix("here is") || lower.hasPrefix("here's") || lower.hasPrefix("here are") ||
+                   lower.contains("step-by-step") || lower.contains("steps to") || lower.contains("following steps") ||
+                   lower.hasPrefix("below is") || lower.hasPrefix("sure") {
+                    self.logToFile("[AI Helper LOG] Skipping intro line: '\(trimmed)'")
+                    continue
+                }
+            }
+            
             if isStepHeader(trimmed) {
                 if !currentStepText.isEmpty {
                     steps.append(normalizeLaTeXDelimiters(currentStepText.trimmingCharacters(in: .whitespacesAndNewlines)))
                 }
                 currentStepText = cleanStepText(trimmed)
-                self.logToFile("[AI Helper LOG] Found new step header. Initial text: '\(currentStepText.prefix(60))...'")
             } else {
                 if !currentStepText.isEmpty {
                     currentStepText += "\n" + trimmed
                 } else {
-                    // Do NOT drop initial math derivation lines
                     currentStepText = trimmed
-                    self.logToFile("[AI Helper LOG] Starting initial step with: '\(trimmed.prefix(60))...'")
                 }
             }
         }
@@ -1070,25 +2067,29 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
         
         self.logToFile("[AI Helper LOG] Parsed \(steps.count) steps.")
-        for (i, step) in steps.enumerated() {
-            self.logToFile("[AI Helper LOG] Step \(i+1): '\(step.prefix(80))...'")
-        }
-        
         return steps
     }
     
-    func splitSolutionIntoSteps(_ solution: String) -> [String] {
+    nonisolated func splitSolutionIntoSteps(_ solution: String) -> [String] {
         let normalized = normalizeLaTeXDelimiters(solution).trimmingCharacters(in: .whitespacesAndNewlines)
         if normalized.isEmpty { return [] }
         
-        // 1. Check for explicit step headers (e.g. STEP:, Step 1:, etc.)
+        // 1. Check for explicit step headers (e.g. [STEP], STEP:, Step 1:, etc.)
         let parsed = parseStepsFromLLMResponse(normalized)
         if parsed.count > 1 {
             return parsed
         }
         
-        // 2. Check for subpart labels: (a), (b), (c), (i), (ii), (iii), Part 1:, • Path A:, ①-⑩
-        let subpartPattern = "(?m)(?:^|\\n\\s*)(?:\\(([a-fA-F]|i{1,4}|iv|v|vi{1,3}|ix|x)\\)|([a-fA-F]|i{1,4}|iv|v|vi{1,3}|ix|x)\\.|•\\s*Path\\s+[A-Z]\\s*:|[①-⑩]|(?:Part|Phase|Stage)\\s+[A-Z0-9]+:)"
+        // 2. Check for subparts (including markdown ### headers like "### Problem 8 (a)", "### Part (c)")
+        let subparts = splitSolutionIntoSubparts(normalized)
+        if subparts.count > 1 {
+            return subparts.map { sub in
+                "### Part \(sub.subpart)\n\n\(sub.content)"
+            }
+        }
+        
+        // 3. Check for subpart labels: (a), (b), (c), (i), (ii), (iii), Part 1:, • Path A:, ①-⑩
+        let subpartPattern = "(?m)(?:^|\\n\\s*)(?:###\\s*)?(?:(?:Part|Subpart|Question|Problem)\\s*\\d*\\s*)?(?:\\(([a-jA-J]|i{1,4}|iv|v|vi{1,3}|ix|x)\\)|([a-jA-J]|i{1,4}|iv|v|vi{1,3}|ix|x)\\.|•\\s*Path\\s+[A-Z]\\s*:|[①-⑩]|(?:Part|Phase|Stage)\\s+[A-Z0-9]+:)"
         if let regex = try? NSRegularExpression(pattern: subpartPattern, options: []) {
             let nsString = normalized as NSString
             let matches = regex.matches(in: normalized, options: [], range: NSRange(location: 0, length: nsString.length))
@@ -1110,7 +2111,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             }
         }
         
-        // 3. Split by double-newlines (paragraphs)
+        // 4. Split by double-newlines (paragraphs)
         let paragraphs = normalized.components(separatedBy: "\n\n")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && $0.count > 10 }
@@ -1124,8 +2125,8 @@ struct ExtractionGroup: Identifiable, Equatable {
     func matchQuestionsAndAnswers(questions: [ExtractedProblem], answers: [ExtractedAnswer]) async -> [ExtractedProblem] {
         guard !answers.isEmpty else { return questions }
         
-        let useLocal = isTaskLocal("route_matching", defaultLocal: false)
-        let model = await getOllamaModel(forceLocal: useLocal)
+        let provider = taskProvider(for: "route_matching", defaultProvider: "tailscale")
+        let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
         
         var qList = ""
         for i in 0..<questions.count {
@@ -1140,7 +2141,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
         
         let prompt = """
-        You are a physics teaching assistant. Match each extracted question with its corresponding worked answer/solution from the lists below.
+        You are an expert physics teaching assistant. Match each extracted question with its corresponding worked answer/solution from the lists below.
         
         Questions:
         ===
@@ -1152,16 +2153,21 @@ struct ExtractionGroup: Identifiable, Equatable {
         \(aList)
         ===
         
-        For each match, output strictly:
+        Instructions:
+        For each question, determine if there is a matching worked answer that genuinely solves it:
+        - If a genuine match exists, output:
         MATCH: Question ID X -> Answer ID Y
+        - If NO corresponding answer exists in the answers list (for example, if the answer sheet does not contain solutions for this question), output:
+        MATCH: Question ID X -> NONE
         
-        Rules:
-        1. Match based on question numbers, mathematical equations, variables, and physical concepts.
+        Strict Rules:
+        1. Match based on physics concepts, variables, equations, and problem context.
         2. A question can match at most one answer.
-        3. Output ONLY the MATCH lines with no extra text.
+        3. CRITICAL: NEVER pair a question with an unrelated answer. If you are not confident that an answer genuinely belongs to the question, you MUST output NONE.
+        4. Output ONLY the MATCH lines with no extra text.
         """
         
-        guard let res = await callOllama(prompt: prompt, model: model, timeout: 120.0, forceLocal: useLocal) else { return questions }
+        guard let res = await callOllama(prompt: prompt, model: model, timeout: 60.0, overrideProvider: provider) else { return questions }
         
         var updatedQuestions = questions
         let lines = res.components(separatedBy: .newlines)
@@ -1171,30 +2177,23 @@ struct ExtractionGroup: Identifiable, Equatable {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.contains("->") else { continue }
             
-            let cleanLine = trimmed.lowercased()
-                .replacingOccurrences(of: "match:", with: "")
-                .replacingOccurrences(of: "question id", with: "")
-                .replacingOccurrences(of: "question", with: "")
-                .replacingOccurrences(of: "answer id", with: "")
-                .replacingOccurrences(of: "answer", with: "")
-                .trimmingCharacters(in: .whitespaces)
-                
-            let parts = cleanLine.components(separatedBy: "->")
+            let parts = trimmed.components(separatedBy: "->")
             if parts.count == 2 {
-                let qNum = String(parts[0].filter { $0.isNumber })
-                let aNum = String(parts[1].filter { $0.isNumber })
+                let qPart = parts[0].lowercased().replacingOccurrences(of: "match:", with: "").replacingOccurrences(of: "question id", with: "").replacingOccurrences(of: "question", with: "").trimmingCharacters(in: .whitespaces)
+                let aPart = parts[1].lowercased().replacingOccurrences(of: "answer id", with: "").replacingOccurrences(of: "answer", with: "").trimmingCharacters(in: .whitespaces)
                 
-                if let qIdx = Int(qNum), let aIdx = Int(aNum) {
+                if aPart.contains("none") {
+                    continue
+                }
+                
+                let qDigits = qPart.filter { $0.isNumber }
+                let aDigits = aPart.filter { $0.isNumber }
+                
+                if let qIdx = Int(qDigits), let aIdx = Int(aDigits) {
                     if qIdx >= 0 && qIdx < updatedQuestions.count && aIdx >= 0 && aIdx < answers.count {
                         matches.append((qIdx, aIdx))
                     }
                 }
-            }
-        }
-        
-        if matches.isEmpty && questions.count == answers.count {
-            for i in 0..<questions.count {
-                matches.append((i, i))
             }
         }
         
@@ -1205,7 +2204,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                 
                 updatedQuestions[qIdx].solution = ansContent
                 updatedQuestions[qIdx].steps = !steps.isEmpty ? steps : [ansContent]
-                self.logToFile("[AI Batch Importer LOG] Matched Question \(qIdx) -> Answer \(aIdx). Prepared \(updatedQuestions[qIdx].steps.count) steps.")
+                self.logToFile("[AI Batch Importer LOG] Matched Question \(qIdx) -> Answer \(aIdx) [\(answers[aIdx].label)]. Prepared \(updatedQuestions[qIdx].steps.count) steps.")
             }
         }
         
@@ -1228,6 +2227,11 @@ struct ExtractionGroup: Identifiable, Equatable {
     public func cleanQuestionContent(_ raw: String) -> String {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         
+        // Strip code block fences (e.g. ```, ```markdown, ```latex) and raw triple backticks/single quotes
+        text = text.replacingOccurrences(of: #"(?m)^```[a-zA-Z0-9_-]*\s*$"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: "```", with: "")
+        text = text.replacingOccurrences(of: "'''", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        
         // Strip top-level question prefixes like "1)", "1.", "Problem 1:", "Question 2.", "Q1:", "**1.**", etc.
         // But PRESERVE sub-questions like "(a)", "(b)", "(i)", "(ii)", "a)", "i)"
         let patterns = [
@@ -1249,9 +2253,95 @@ struct ExtractionGroup: Identifiable, Equatable {
         return text
     }
     
+    /// Extracts a genuine problem/question number from label headers like "Problem 1a", "Question 2 (a)", "Problem 7 (i)"
+    /// while ignoring inline math subscripts like "$A_2$".
+    nonisolated public func extractProblemNumberFromLabel(_ label: String) -> Int? {
+        let pattern = #"(?:Problem|Question|Exercise|Task|Q)\s*(\d+)"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+            let ns = label as NSString
+            if let match = regex.firstMatch(in: label, options: [], range: NSRange(location: 0, length: ns.length)) {
+                let numRange = match.range(at: 1)
+                if numRange.location != NSNotFound {
+                    return Int(ns.substring(with: numRange))
+                }
+            }
+        }
+        return nil
+    }
+    
+    /// Derives a complete worked solution and pedagogical step breakdown directly from a question statement
+    /// when no solution is provided in the answer key document.
+    public func deriveSolutionAndSteps(question: String) async -> (solution: String, steps: [String]) {
+        await withUserPriority {
+            let provider = taskProvider(for: "route_steps", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
+            self.logToFile("[AI Helper LOG] deriveSolutionAndSteps called with model '\(model)' (\(provider)) for question: '\(question.prefix(60))...'")
+            
+            let hasSubparts = questionHasSubparts(question)
+            
+            let prompt = """
+            You are an expert university physics educator and professor.
+            Provide a complete, rigorous worked solution and structured pedagogical derivation steps for the following physics problem:
+
+            Question:
+            ---
+            \(question)
+            ---
+
+            Pedagogical Structure:
+            - Step 1: Conceptual Setup & Physical Principles (State laws, definitions, boundary conditions - Severity Level 1 diagnostic).
+            - Step 2: Governing Equations & Formulation (Set up differential forms, state equations, substitutions - Severity Level 2 diagnostic).
+            - Step 3+: Algebraic Derivations, Integration & Final Result.
+            \(hasSubparts ? "- Clearly label each step with its subpart (e.g. Subpart: (a), Subpart: (b))." : "- This question has NO subparts. Do NOT output a Subpart line.")
+
+            Formatting Instructions:
+            - Wrap every step strictly inside [STEP] and [/STEP] tags.
+            - Inside each block, provide:
+              Tier: <Conceptual Setup | Governing Formulation | Algebraic Derivation>
+              \(hasSubparts ? "Subpart: <e.g. (a) or (b)>\n" : "")Content: <explanation with equations in $$...$$>
+            - Wrap all inline variables in $...$.
+            - NO emojis. NO conversational filler. NO markdown code fences.
+            - CRITICAL: Do NOT use markdown bold asterisks (**) anywhere. Write plain text headers and text.
+
+            Format your response strictly as:
+            [WORKED_SOLUTION]
+            <full comprehensive worked solution with equations>
+            [/WORKED_SOLUTION]
+
+            [STEPS]
+            [STEP]
+            Tier: Conceptual Setup
+            \(hasSubparts ? "Subpart: (a)\n" : "")Content: State the fundamental physical principles...
+            [/STEP]
+            ...
+            [/STEPS]
+            """
+            
+            guard let res = await callOllama(prompt: prompt, model: model, timeout: 120.0, overrideProvider: provider) else {
+                return ("", [])
+            }
+            
+            var workedSolution = ""
+            if let solStart = res.range(of: "[WORKED_SOLUTION]"),
+               let solEnd = res.range(of: "[/WORKED_SOLUTION]") {
+                workedSolution = String(res[solStart.upperBound..<solEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            
+            let parsedSteps = self.parseStepsFromLLMResponse(res, hasSubparts: hasSubparts)
+            
+            if workedSolution.isEmpty && !parsedSteps.isEmpty {
+                workedSolution = parsedSteps.joined(separator: "\n\n")
+            }
+            
+            return (workedSolution, parsedSteps)
+        }
+    }
+    
     public func parseExtractedProblems(_ text: String) -> [ExtractedProblem] {
         var problems: [ExtractedProblem] = []
-        let normalizedText = normalizeLaTeXDelimiters(text)
+        var strippedText = text.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression)
+        strippedText = strippedText.replacingOccurrences(of: #"(?i)\[/PROBLEM\]"#, with: "[PROBLEM]", options: .regularExpression)
+        let normalizedText = normalizeLaTeXDelimiters(strippedText)
         let blocks = normalizedText.components(separatedBy: "[PROBLEM]")
         
         for block in blocks {
@@ -1334,7 +2424,8 @@ struct ExtractionGroup: Identifiable, Equatable {
             
             var q = normalizeLaTeXDelimiters(questionText.trimmingCharacters(in: .whitespacesAndNewlines))
             q = cleanQuestionContent(q)
-            let h = normalizeLaTeXDelimiters(hintText.trimmingCharacters(in: .whitespacesAndNewlines))
+            var h = normalizeLaTeXDelimiters(hintText.trimmingCharacters(in: .whitespacesAndNewlines))
+            h = cleanQuestionContent(h)
             let sol = normalizeLaTeXDelimiters(solutionText.trimmingCharacters(in: .whitespacesAndNewlines))
             
             if !q.isEmpty {
@@ -1349,9 +2440,12 @@ struct ExtractionGroup: Identifiable, Equatable {
         return problems
     }
     
-    func logToFile(_ message: String) {
+    nonisolated func logToFile(_ message: String) {
         print(message)
-        let logPath = "/Users/matthewt/Projects/PhysicsStudyApp/batch_importer_run.log"
+        let appDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".physics_study_app")
+        try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        let logURL = appDir.appendingPathComponent("batch_importer_run.log")
+        let logPath = logURL.path
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestamp = formatter.string(from: Date())
@@ -1359,19 +2453,24 @@ struct ExtractionGroup: Identifiable, Equatable {
         
         if let data = logLine.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: logPath) {
-                if let fileHandle = FileHandle(forWritingAtPath: logPath) {
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+                   let fileSize = attrs[.size] as? UInt64,
+                   fileSize > 5_000_000 {
+                    try? data.write(to: logURL)
+                } else if let fileHandle = FileHandle(forWritingAtPath: logPath) {
                     fileHandle.seekToEndOfFile()
                     fileHandle.write(data)
                     fileHandle.closeFile()
                 }
             } else {
-                try? data.write(to: URL(fileURLWithPath: logPath))
+                try? data.write(to: logURL)
             }
         }
     }
     
     private init() {
         startAutoReconnectMonitor()
+        startEngineStatusMonitor()
     }
     
     private func withUserPriority<T>(_ block: () async -> T) async -> T {
@@ -1477,7 +2576,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             guard let tags = try? JSONDecoder().decode(TagsResponse.self, from: data) else { return nil }
             
             let allModels = tags.models.map { $0.name }
-            let visionKeywords = ["vl", "vision", "llava", "minicpm", "moondream"]
+            let visionKeywords = ["vl", "vision", "llava", "minicpm", "moondream", "gemma3", "pixtral"]
             let visionModels = allModels.filter { name in
                 let lower = name.lowercased()
                 return visionKeywords.contains { lower.contains($0) }
@@ -1525,8 +2624,8 @@ struct ExtractionGroup: Identifiable, Equatable {
             
             do {
                 try process.run()
-                process.waitUntilExit()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     if let selfObj = json["Self"] as? [String: Any],
                        let hostName = selfObj["HostName"] as? String,
@@ -1702,23 +2801,86 @@ struct ExtractionGroup: Identifiable, Equatable {
             }
         }
     }
+    
+    func probeTailscaleHost() async -> Bool {
+        var host = UserDefaults.standard.string(forKey: "tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if host.isEmpty {
+            host = UserDefaults.standard.string(forKey: "vision_tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "") else {
+            return false
+        }
+        let url = baseURL.appendingPathComponent("api/version")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        do {
+            let (_, response) = try await probeSession.data(for: request)
+            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                return true
+            }
+            return false
+        } catch {
+            return false
+        }
+    }
+    
+    func startEngineStatusMonitor() {
+        Task {
+            print("[AI Helper] Remote engine connectivity monitor running.")
+            var probeCounter = 0
+            var remoteIsOnline = false
+            
+            while true {
+                do {
+                    // Actively probe remote reachability every ~2.4s (every 2 cycles)
+                    probeCounter += 1
+                    if probeCounter >= 2 || !remoteIsOnline {
+                        probeCounter = 0
+                        remoteIsOnline = await self.probeTailscaleHost()
+                    }
+                    
+                    let onlineNow = remoteIsOnline
+                    await MainActor.run {
+                        self.isRemoteOnline = onlineNow
+                        self.remoteStatusMessage = onlineNow ? "Connected" : "Not Connected"
+                    }
+                    
+                    try await Task.sleep(nanoseconds: 1_200_000_000)
+                } catch {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+            }
+        }
+    }
 
     // MARK: - API communication helpers
     
+    nonisolated func isVisionModelName(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        let visionKeywords = ["vl", "vision", "llava", "minicpm", "moondream", "pixtral", "gemma3"]
+        return visionKeywords.contains { lower.contains($0) }
+    }
+
     func fetchAvailableOllamaModels(host: String? = nil, forceLocal: Bool = false) async -> [String] {
         let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
         let targetHost: String
         if let h = host, !h.isEmpty {
             targetHost = h
         } else {
-            targetHost = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
+            if provider == "tailscale" {
+                let tHost = UserDefaults.standard.string(forKey: "tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let vHost = UserDefaults.standard.string(forKey: "vision_tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                targetHost = !tHost.isEmpty ? tHost : vHost
+            } else {
+                targetHost = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
+            }
         }
         
         guard !targetHost.isEmpty else { return [] }
-        guard let baseURL = AIHelper.normalizedOllamaURL(from: targetHost, defaultHost: "http://localhost:11434") else { return [] }
+        guard let baseURL = AIHelper.normalizedOllamaURL(from: targetHost, defaultHost: "") else { return [] }
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = 1.5
+        request.timeoutInterval = 2.0
         
         do {
             let (data, _) = try await session.data(for: request)
@@ -1730,41 +2892,35 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
     }
 
-    func getOllamaModel(forceLocal: Bool = false) async -> String {
-        // If using a cloud provider, return the configured cloud model name
-        let provider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
-        if provider != "local" && provider != "tailscale" {
-            let cloudModel = UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud"
+    func getOllamaModel(forProvider provider: String? = nil, forceLocal: Bool = false) async -> String {
+        let effProvider = forceLocal ? "local" : (provider ?? UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
+        if effProvider != "local" && effProvider != "tailscale" {
+            let cloudModel = UserDefaults.standard.string(forKey: "cloud_model_name") ?? "gpt-4o-mini"
             return cloudModel
         }
         
-        let preferredKey = provider == "tailscale" ? "tailscale_model_general" : "local_model_general"
+        let preferredKey = effProvider == "tailscale" ? "tailscale_model_general" : "local_model_general"
         let preferred = UserDefaults.standard.string(forKey: preferredKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         
-        // Dynamically fetch installed models from Ollama server
-        let installed = await fetchAvailableOllamaModels(forceLocal: forceLocal)
+        let installed = await fetchAvailableOllamaModels(forceLocal: effProvider == "local")
         if !installed.isEmpty {
-            // 1. If preferred model is in installed models list, return it
             if !preferred.isEmpty && installed.contains(preferred) {
                 return preferred
             }
-            // 2. If preferred substring matches an installed model (e.g. qwen2.5-coder:14b or deepseek-r1)
             if !preferred.isEmpty, let match = installed.first(where: { $0.lowercased().contains(preferred.lowercased()) }) {
                 return match
             }
-            // 3. Prefer non-vision general/coder models (e.g. qwen2.5-coder, deepseek, llama)
-            if let targetText = installed.first(where: { !$0.lowercased().contains("vl") && !$0.lowercased().contains("vision") && ($0.lowercased().contains("coder") || $0.lowercased().contains("qwen") || $0.lowercased().contains("deepseek") || $0.lowercased().contains("llama")) }) {
-                return targetText
-            }
-            // 4. Any non-vision model
-            if let nonVision = installed.first(where: { !$0.lowercased().contains("vl") && !$0.lowercased().contains("vision") }) {
+            if let nonVision = installed.first(where: { !self.isVisionModelName($0) }) {
+                UserDefaults.standard.set(nonVision, forKey: preferredKey)
                 return nonVision
             }
-            // 5. Fallback
-            return installed.first ?? (provider == "tailscale" ? "qwen2.5-coder:14b" : "qwen2.5-coder:7b")
+            if let firstModel = installed.first {
+                UserDefaults.standard.set(firstModel, forKey: preferredKey)
+                return firstModel
+            }
         }
         
-        return preferred.isEmpty ? (provider == "tailscale" ? "qwen2.5-coder:14b" : "qwen2.5-coder:7b") : preferred
+        return preferred
     }
     
     func getOllamaVisionModel(forceLocal: Bool = false) async -> String? {
@@ -1773,19 +2929,9 @@ struct ExtractionGroup: Identifiable, Equatable {
             let cloudModel = UserDefaults.standard.string(forKey: "vision_model_name") ?? "gpt-4o"
             return cloudModel
         }
-        if provider == "tailscale" {
-            let preferred = UserDefaults.standard.string(forKey: "vision_tailscale_model")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !preferred.isEmpty {
-                return preferred
-            }
-        } else {
-            let preferred = UserDefaults.standard.string(forKey: "local_model_vision")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !preferred.isEmpty {
-                return preferred
-            }
-        }
+        let preferredKey = provider == "tailscale" ? "vision_tailscale_model" : "local_model_vision"
+        let preferred = UserDefaults.standard.string(forKey: preferredKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         
-        let defaultVisionModel = "qwen2.5vl:7b"
         let host: String
         if provider == "tailscale" {
             let vHost = UserDefaults.standard.string(forKey: "vision_tailscale_host")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1795,48 +2941,44 @@ struct ExtractionGroup: Identifiable, Equatable {
             host = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
         }
         
-        guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "http://localhost:11434") else { return defaultVisionModel }
+        guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "") else {
+            return !preferred.isEmpty ? preferred : nil
+        }
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = 1.5
+        request.timeoutInterval = 2.0
         
         do {
             let (data, _) = try await session.data(for: request)
             let tags = try JSONDecoder().decode(TagsResponse.self, from: data)
+            let availableNames = tags.models.map { $0.name }
             
-            // 1. Prioritize explicit Qwen VL (Vision Language) models
+            if !preferred.isEmpty, availableNames.contains(preferred) {
+                return preferred
+            }
+            if !preferred.isEmpty, let match = availableNames.first(where: { $0.lowercased() == preferred.lowercased() }) {
+                return match
+            }
+            
             for m in tags.models {
-                let name = m.name.lowercased()
-                if name.contains("qwen") && (name.contains("vl") || name.contains("vision")) {
+                if isVisionModelName(m.name) {
+                    UserDefaults.standard.set(m.name, forKey: preferredKey)
                     return m.name
                 }
             }
             
-            // 2. Fallback to other VL models
-            for m in tags.models {
-                let name = m.name.lowercased()
-                if name.contains("vl") || name.contains("vision") || name.contains("llava") || name.contains("minicpm") || name.contains("moondream") {
-                    return m.name
-                }
-            }
-            
-            // 3. Last fallback (excluding known coder/text models)
-            let keywords = ["qwen", "llava", "minicpm", "moondream"]
-            for kw in keywords {
-                for m in tags.models {
-                    let name = m.name.lowercased()
-                    if name.contains(kw) && !name.contains("coder") && !name.contains("text") {
-                        return m.name
-                    }
-                }
+            if let first = availableNames.first {
+                UserDefaults.standard.set(first, forKey: preferredKey)
+                return first
             }
         } catch {
             print("[AI Helper] Warning: Error checking for vision model: \(error)")
         }
-        return defaultVisionModel
+        
+        return !preferred.isEmpty ? preferred : nil
     }
     
-    private func hasRepetitiveGlitch(_ text: String) -> Bool {
+    func hasRepetitiveGlitch(_ text: String) -> Bool {
         // Match 5 or more identical characters in a row, excluding spaces, dashes, asterisks, equals, dots, underscores, and newlines
         let pattern = "([^ \\-\\*=\\._\\n\\r])\\1{4,}"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return false }
@@ -1844,14 +2986,110 @@ struct ExtractionGroup: Identifiable, Equatable {
         return regex.firstMatch(in: text, options: [], range: range) != nil
     }
     
-    func callOllama(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval = 300.0, forceLocal: Bool = false, options: OllamaOptions? = nil) async -> String? {
+    // MARK: - Fast Network Pre-Flight & Local Fallback
+    
+    public func isTailscaleReachable() async -> Bool {
+        let host = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
+        guard !host.isEmpty, let baseURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: "") else { return false }
+        let tagsUrl = baseURL.appendingPathComponent("api/tags")
+        var req = URLRequest(url: tagsUrl)
+        req.timeoutInterval = 2.5
+        if let (data, resp) = try? await session.data(for: req),
+           let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200,
+           let tags = try? JSONDecoder().decode(TagsResponse.self, from: data),
+           !tags.models.isEmpty {
+            return true
+        }
+        return false
+    }
+    
+    private func fallbackToLocalOllama(
+        prompt: String,
+        images: [String]? = nil,
+        timeout: TimeInterval,
+        options: OllamaOptions? = nil,
+        overrideThink: Bool? = nil
+    ) async -> String? {
+        await ensureLocalOllamaRunning()
+        let localHost = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
+        guard let localBaseURL = AIHelper.normalizedOllamaURL(from: localHost, defaultHost: "http://localhost:11434") else { return nil }
+        let tagsUrl = localBaseURL.appendingPathComponent("api/tags")
+        var checkReq = URLRequest(url: tagsUrl)
+        checkReq.timeoutInterval = 2.0
+        
+        let hasModels: Bool
+        if let (data, resp) = try? await session.data(for: checkReq),
+           let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200,
+           let tags = try? JSONDecoder().decode(TagsResponse.self, from: data),
+           !tags.models.isEmpty {
+            hasModels = true
+        } else {
+            hasModels = false
+        }
+        
+        guard hasModels else {
+            self.logToFile("[AI Helper LOG] Local Ollama fallback unavailable (no models or server offline).")
+            return nil
+        }
+        
+        let fallbackModel: String
+        if images != nil && !(images?.isEmpty ?? true) {
+            fallbackModel = await getOllamaVisionModel(forceLocal: true) ?? ""
+        } else {
+            fallbackModel = await getOllamaModel(forceLocal: true)
+        }
+        guard !fallbackModel.isEmpty else {
+            self.logToFile("[AI Helper LOG] Fallback to Local Ollama failed: no local model available.")
+            return nil
+        }
+        self.logToFile("[AI Helper LOG] Seamlessly falling back to Local Ollama with model '\(fallbackModel)'...")
+        if let localResult = await callAPIOnce(prompt: prompt, model: fallbackModel, images: images, timeout: timeout, provider: "local", options: options, overrideThink: overrideThink) {
+            if !hasRepetitiveGlitch(localResult) {
+                return localResult
+            }
+        }
+        return nil
+    }
+
+    func callOllama(
+        prompt: String,
+        model: String,
+        images: [String]? = nil,
+        timeout: TimeInterval = 300.0,
+        forceLocal: Bool = false,
+        overrideProvider: String? = nil,
+        options: OllamaOptions? = nil,
+        overrideThink: Bool? = nil
+    ) async -> String? {
         let hasImages = images != nil && !(images?.isEmpty ?? true)
         let isWasBusy = self.isAIBusy
+        
+        let effectiveProvider: String
+        if let ov = overrideProvider, !ov.isEmpty {
+            effectiveProvider = ov
+        } else if forceLocal {
+            effectiveProvider = "local"
+        } else if hasImages {
+            effectiveProvider = UserDefaults.standard.string(forKey: "vision_provider") ?? (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
+        } else {
+            effectiveProvider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+        }
+        
         if !isWasBusy {
+            let taskDesc: String
+            if effectiveProvider == "tailscale" {
+                taskDesc = hasImages ? "Processing Tailscale Vision Request..." : "Processing Tailscale AI Request..."
+            } else if effectiveProvider == "local" {
+                taskDesc = hasImages ? "Processing Local Vision Request..." : "Processing Local AI Request..."
+            } else {
+                let pName = self.providerInfo(for: effectiveProvider, isVision: hasImages).name
+                taskDesc = hasImages ? "Processing \(pName) Vision Request..." : "Processing \(pName) Request..."
+            }
             startAITask(
-                description: hasImages ? "Processing Vision Request..." : "Processing AI Request...",
+                description: taskDesc,
                 isVision: hasImages,
-                forceLocal: forceLocal
+                forceLocal: effectiveProvider == "local",
+                provider: effectiveProvider
             )
         }
         defer {
@@ -1861,47 +3099,62 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
         
         let targetModel: String
-        let effectiveProvider: String
         let effectiveImages: [String]? = images
         
-        if hasImages {
-            let visionProvider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "vision_provider") ?? (UserDefaults.standard.string(forKey: "ai_provider") ?? "local"))
-            if visionProvider == "local" || visionProvider == "tailscale" {
-                if visionProvider == "local" {
-                    await ensureLocalOllamaRunning()
-                }
-                let visionModel = await getOllamaVisionModel(forceLocal: forceLocal) ?? model
-                targetModel = visionModel
-                effectiveProvider = visionProvider
-                self.logToFile("[AI Helper LOG] Vision request using \(visionProvider) vision model: \(visionModel)")
-            } else {
-                targetModel = UserDefaults.standard.string(forKey: "vision_model_name") ?? "gpt-4o"
-                effectiveProvider = "cloud_vision"
-                self.logToFile("[AI Helper LOG] Vision request using cloud vision model (\(visionProvider)): \(targetModel)")
-            }
+        if effectiveProvider == "tailscale" {
+            let prefModel = hasImages ?
+                (UserDefaults.standard.string(forKey: "vision_tailscale_model") ?? "") :
+                (UserDefaults.standard.string(forKey: "tailscale_model_general") ?? "")
+            let resolvedPref = !prefModel.isEmpty ? prefModel : (hasImages ? (await getOllamaVisionModel() ?? "") : (await getOllamaModel()))
+            targetModel = model.isEmpty ? resolvedPref : model
+            self.logToFile("[AI Helper LOG] \(hasImages ? "Vision" : "Text") request using Tailscale model (\(effectiveProvider)): \(targetModel)")
+        } else if effectiveProvider == "local" {
+            await ensureLocalOllamaRunning()
+            let prefModel = hasImages ?
+                (UserDefaults.standard.string(forKey: "local_model_vision") ?? "") :
+                (UserDefaults.standard.string(forKey: "local_model_general") ?? "")
+            let resolvedPref = !prefModel.isEmpty ? prefModel : (hasImages ? (await getOllamaVisionModel(forceLocal: true) ?? "") : (await getOllamaModel(forceLocal: true)))
+            targetModel = model.isEmpty ? resolvedPref : model
+            self.logToFile("[AI Helper LOG] \(hasImages ? "Vision" : "Text") request using local model: \(targetModel)")
         } else {
-            let textProvider = forceLocal ? "local" : (UserDefaults.standard.string(forKey: "ai_provider") ?? "local")
-            if textProvider == "local" || textProvider == "tailscale" {
-                if textProvider == "local" {
-                    await ensureLocalOllamaRunning()
+            let prefModel = hasImages ?
+                (UserDefaults.standard.string(forKey: "vision_model_name") ?? "gpt-4o") :
+                (UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud")
+            targetModel = model.isEmpty ? prefModel : model
+            self.logToFile("[AI Helper LOG] \(hasImages ? "Vision" : "Text") request using cloud model (\(effectiveProvider)): \(targetModel)")
+        }
+        
+        // Fast pre-flight check if Tailscale is selected
+        if effectiveProvider == "tailscale" && !forceLocal {
+            if let lastTimeout = self.lastTailscaleTimeoutTime, Date().timeIntervalSince(lastTimeout) < self.tailscaleCooldownSeconds {
+                let remaining = Int(self.tailscaleCooldownSeconds - Date().timeIntervalSince(lastTimeout))
+                self.logToFile("[AI Helper LOG] Tailscale in cooldown after recent timeout (\(remaining)s remaining). Bypassing remote call and falling back to Local Ollama immediately.")
+                if let fallbackResult = await fallbackToLocalOllama(prompt: prompt, images: effectiveImages, timeout: timeout, options: options, overrideThink: overrideThink) {
+                    return fallbackResult
                 }
-                targetModel = model.isEmpty ? await getOllamaModel(forceLocal: forceLocal) : model
-                effectiveProvider = textProvider
-                self.logToFile("[AI Helper LOG] Text request using \(textProvider) model: \(targetModel)")
-            } else {
-                targetModel = UserDefaults.standard.string(forKey: "cloud_model_name") ?? "glm-5.2:cloud"
-                effectiveProvider = textProvider
-                self.logToFile("[AI Helper LOG] Text request using cloud model (\(textProvider)): \(targetModel)")
+            }
+            
+            let reachable = await isTailscaleReachable()
+            if !reachable {
+                self.logToFile("[AI Helper LOG] Fast pre-flight probe: Tailscale host unreachable (link down or server stopped). Bypassing remote retries and immediately falling back to Local Ollama.")
+                if let fallbackResult = await fallbackToLocalOllama(prompt: prompt, images: effectiveImages, timeout: timeout, options: options, overrideThink: overrideThink) {
+                    return fallbackResult
+                }
             }
         }
         
-        let maxRetries = (effectiveProvider == "tailscale") ? 2 : 3
+        let maxRetries = (effectiveProvider == "tailscale") ? 1 : 3
         for attempt in 1...maxRetries {
             self.logToFile("[AI Helper LOG] callOllama (\(effectiveProvider)) attempt \(attempt)/\(maxRetries) for model: \(targetModel)")
-            if let result = await callAPIOnce(prompt: prompt, model: targetModel, images: effectiveImages, timeout: timeout, provider: effectiveProvider, options: options) {
+            // Cap per-attempt remote timeout to 90s to avoid indefinite hangs
+            let perAttemptTimeout = (effectiveProvider == "tailscale") ? min(timeout, 90.0) : timeout
+            if let result = await callAPIOnce(prompt: prompt, model: targetModel, images: effectiveImages, timeout: perAttemptTimeout, provider: effectiveProvider, options: options, overrideThink: overrideThink) {
                 if hasRepetitiveGlitch(result) {
                     self.logToFile("[AI Helper LOG] Repetitive glitch detected (attempt \(attempt)/\(maxRetries)): '\(result.prefix(100))...'")
                     continue
+                }
+                if effectiveProvider == "tailscale" {
+                    self.lastTailscaleTimeoutTime = nil
                 }
                 await MainActor.run {
                     if self.isAIDisconnected {
@@ -1913,55 +3166,31 @@ struct ExtractionGroup: Identifiable, Equatable {
                 return result
             } else {
                 self.logToFile("[AI Helper LOG] callAPIOnce returned nil (attempt \(attempt)/\(maxRetries))")
-                if attempt < maxRetries {
-                    if effectiveProvider == "tailscale" {
-                        self.logToFile("[AI Helper LOG] Tailscale request attempt \(attempt) failed, attempting auto-reconnect...")
-                        let reconnected = await self.attemptAutoReconnect()
-                        if reconnected {
-                            self.logToFile("[AI Helper LOG] Auto-reconnected to Tailscale successfully, retrying request immediately.")
-                            try? await Task.sleep(nanoseconds: 500_000_000)
-                        } else {
-                            let backoff = UInt64(attempt) * 1_500_000_000
-                            self.logToFile("[AI Helper LOG] Waiting \(Double(backoff) / 1e9)s for Tailscale link to recover before attempt \(attempt + 1)...")
-                            try? await Task.sleep(nanoseconds: backoff)
-                        }
-                    } else {
-                        let online = await self.isOllamaRunning()
-                        if !online {
-                            self.logToFile("[AI Helper LOG] AI host unreachable on attempt \(attempt), stopping retries.")
-                            break
-                        }
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if effectiveProvider == "tailscale" {
+                    self.lastTailscaleTimeoutTime = Date()
+                    self.logToFile("[AI Helper LOG] Tailscale request failed or timed out. Entering 3-minute cooldown and immediately falling back to Local Ollama...")
+                    if let localResult = await fallbackToLocalOllama(prompt: prompt, images: effectiveImages, timeout: timeout, options: options, overrideThink: overrideThink) {
+                        return localResult
                     }
+                    break
+                } else if effectiveProvider != "local" {
+                    self.logToFile("[AI Helper LOG] Cloud provider (\(effectiveProvider)) request failed or timed out; skipping duplicate retries.")
+                    break
+                } else if attempt < maxRetries {
+                    let online = await self.isOllamaRunning()
+                    if !online {
+                        self.logToFile("[AI Helper LOG] AI host unreachable on attempt \(attempt), stopping retries.")
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
             }
         }
         
         // Automatic Fallback: If Tailscale was unreachable, check if Local Ollama is available
         if effectiveProvider == "tailscale" && !forceLocal {
-            self.logToFile("[AI Helper LOG] Tailscale host unreachable, checking Local Ollama fallback...")
-            let localHost = UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434"
-            if let localBaseURL = AIHelper.normalizedOllamaURL(from: localHost, defaultHost: "http://localhost:11434") {
-                let tagsUrl = localBaseURL.appendingPathComponent("api/tags")
-                var checkReq = URLRequest(url: tagsUrl)
-                checkReq.timeoutInterval = 1.0
-                if let (data, resp) = try? await session.data(for: checkReq),
-                   let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200,
-                   let tags = try? JSONDecoder().decode(TagsResponse.self, from: data),
-                   !tags.models.isEmpty {
-                    let fallbackModel: String
-                    if effectiveImages != nil {
-                        fallbackModel = await getOllamaVisionModel(forceLocal: true) ?? "qwen2.5vl:7b"
-                    } else {
-                        fallbackModel = await getOllamaModel(forceLocal: true)
-                    }
-                    self.logToFile("[AI Helper LOG] Seamlessly falling back to Local Ollama with model '\(fallbackModel)'...")
-                    if let localResult = await callAPIOnce(prompt: prompt, model: fallbackModel, images: effectiveImages, timeout: timeout, provider: "local", options: options) {
-                        if !hasRepetitiveGlitch(localResult) {
-                            return localResult
-                        }
-                    }
-                }
+            if let localResult = await fallbackToLocalOllama(prompt: prompt, images: effectiveImages, timeout: timeout, options: options, overrideThink: overrideThink) {
+                return localResult
             }
         }
         
@@ -1983,7 +3212,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         return nil
     }
     
-    private func callAPIOnce(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval, provider: String, options: OllamaOptions? = nil) async -> String? {
+    private func callAPIOnce(prompt: String, model: String, images: [String]? = nil, timeout: TimeInterval, provider: String, options: OllamaOptions? = nil, overrideThink: Bool? = nil) async -> String? {
         if provider == "local" || provider == "tailscale" {
             let host: String
             if provider == "tailscale" {
@@ -2008,42 +3237,156 @@ struct ExtractionGroup: Identifiable, Equatable {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.timeoutInterval = timeout
             
-            let body = GenerateRequest(model: model, prompt: prompt, stream: false, images: images, options: options)
+            let isVision = (provider == "cloud_vision") || (images != nil && !(images?.isEmpty ?? true))
+            let defaultThinking: Bool
+            if provider == "local" {
+                if isVision {
+                    defaultThinking = UserDefaults.standard.bool(forKey: "local_vision_thinking_enabled")
+                } else {
+                    defaultThinking = UserDefaults.standard.object(forKey: "local_text_thinking_enabled") != nil
+                        ? UserDefaults.standard.bool(forKey: "local_text_thinking_enabled")
+                        : UserDefaults.standard.bool(forKey: "ai_text_thinking_enabled")
+                }
+            } else {
+                if isVision {
+                    defaultThinking = UserDefaults.standard.bool(forKey: "remote_vision_thinking_enabled")
+                } else {
+                    defaultThinking = UserDefaults.standard.object(forKey: "remote_text_thinking_enabled") != nil
+                        ? UserDefaults.standard.bool(forKey: "remote_text_thinking_enabled")
+                        : UserDefaults.standard.bool(forKey: "ai_text_thinking_enabled")
+                }
+            }
+            let requestedThink = overrideThink ?? defaultThinking
+            let thinkingEnabled = requestedThink && isModelThinkingCapable(model)
+            
+            self.logToFile("[AI Helper LOG] Calling \(provider) Ollama (\(model), \(isVision ? "vision" : "text"), think: \(thinkingEnabled), streaming: true)...")
+            let body = GenerateRequest(model: model, prompt: prompt, stream: true, images: images, options: options, think: thinkingEnabled)
             do {
                 request.httpBody = try JSONEncoder().encode(body)
-                let (data, response) = try await session.data(for: request)
-                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
-                    let errBody = String(data: data, encoding: .utf8) ?? ""
-                    self.logToFile("[AI Helper LOG] HTTP \(httpResponse.statusCode) from \(provider) Ollama (\(url.absoluteString)): \(errBody)")
+                let (asyncBytes, response) = try await session.bytes(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    self.logToFile("[AI Helper LOG] Non-HTTP response from \(provider) Ollama")
                     return nil
                 }
-                let responseObj = try JSONDecoder().decode(GenerateResponse.self, from: data)
-                return responseObj.response.trimmingCharacters(in: .whitespacesAndNewlines)
+                if httpResponse.statusCode != 200 {
+                    self.logToFile("[AI Helper LOG] HTTP \(httpResponse.statusCode) from \(provider) Ollama (\(url.absoluteString))")
+                    return nil
+                }
+                
+                var accumulatedResponse = ""
+                var chunkCount = 0
+                var isDone = false
+                
+                for try await line in asyncBytes.lines {
+                    let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedLine.isEmpty else { continue }
+                    
+                    guard let lineData = trimmedLine.data(using: .utf8),
+                          let chunk = try? JSONDecoder().decode(GenerateResponse.self, from: lineData) else {
+                        continue
+                    }
+                    
+                    if let err = chunk.error, !err.isEmpty {
+                        self.logToFile("[AI Helper LOG] \(provider) streaming chunk error: \(err)")
+                        return nil
+                    }
+                    
+                    if let resp = chunk.response {
+                        accumulatedResponse += resp
+                        chunkCount += 1
+                    }
+                    if let th = chunk.thinking, !th.isEmpty {
+                        chunkCount += 1
+                    }
+                    
+                    if chunkCount % 4 == 0 {
+                        await MainActor.run {
+                            self.batchTokensGenerated += 4
+                            self.lastStreamingActivityDate = Date()
+                        }
+                    }
+                    
+                    if chunk.done == true {
+                        isDone = true
+                        break
+                    }
+                }
+                
+                await MainActor.run {
+                    self.lastStreamingActivityDate = Date()
+                }
+                
+                var cleanText = accumulatedResponse.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression)
+                cleanText = cleanText.replacingOccurrences(of: #"(?i)\[/?think\]"#, with: "", options: .regularExpression)
+                let trimmed = cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty && !isDone {
+                    self.logToFile("[AI Helper LOG] \(provider) stream ended without completing.")
+                    return nil
+                }
+                return trimmed
             } catch {
                 self.logToFile("[AI Helper LOG] Error communicating with \(provider) Ollama (\(url.absoluteString)): \(error.localizedDescription)")
                 return nil
             }
         } else {
-            // Determine which API settings to use — text cloud or vision cloud
-            let baseUrl: String
-            let apiKey: String
-            if provider == "cloud_vision" {
-                baseUrl = UserDefaults.standard.string(forKey: "vision_api_base_url") ?? ""
-                apiKey = UserDefaults.standard.string(forKey: "vision_api_key") ?? ""
-            } else {
-                baseUrl = UserDefaults.standard.string(forKey: "cloud_api_base_url") ?? ""
+            let isVisionTask = (provider == "cloud_vision") || (images != nil && !(images?.isEmpty ?? true))
+            
+            var baseUrl = ""
+            var apiKey = ""
+            
+            if isVisionTask {
+                let vBase = UserDefaults.standard.string(forKey: "vision_api_base_url")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let vKey = UserDefaults.standard.string(forKey: "vision_api_key")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !vBase.isEmpty {
+                    baseUrl = vBase
+                    apiKey = vKey
+                }
+            }
+            
+            if baseUrl.isEmpty {
+                baseUrl = UserDefaults.standard.string(forKey: "cloud_api_base_url")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 apiKey = UserDefaults.standard.string(forKey: "cloud_api_key") ?? ""
             }
+            
             let cleanBase = baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-            // If the base URL already ends with /v1, don't double-append it
+            let isAnthropic = cleanBase.contains("anthropic.com") || provider == "anthropic" || model.lowercased().contains("claude")
+            let isGemini = cleanBase.contains("generativelanguage.googleapis.com") || provider == "gemini" || model.lowercased().contains("gemini")
+            
             let endpoint: String
-            if cleanBase.hasSuffix("/v1") {
-                endpoint = "\(cleanBase)/chat/completions"
+            if isAnthropic {
+                if cleanBase.isEmpty {
+                    endpoint = "https://api.anthropic.com/v1/messages"
+                } else if cleanBase.hasSuffix("/messages") {
+                    endpoint = cleanBase
+                } else if cleanBase.hasSuffix("/v1") {
+                    endpoint = "\(cleanBase)/messages"
+                } else {
+                    endpoint = "\(cleanBase)/v1/messages"
+                }
+            } else if isGemini {
+                if cleanBase.contains("/openai") {
+                    if cleanBase.hasSuffix("/chat/completions") {
+                        endpoint = cleanBase
+                    } else {
+                        endpoint = "\(cleanBase)/chat/completions"
+                    }
+                } else {
+                    endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+                }
             } else {
-                endpoint = "\(cleanBase)/v1/chat/completions"
+                if cleanBase.isEmpty {
+                    endpoint = "https://api.openai.com/v1/chat/completions"
+                } else if cleanBase.hasSuffix("/chat/completions") {
+                    endpoint = cleanBase
+                } else if cleanBase.hasSuffix("/v1") {
+                    endpoint = "\(cleanBase)/chat/completions"
+                } else {
+                    endpoint = "\(cleanBase)/v1/chat/completions"
+                }
             }
+            
             guard let url = URL(string: endpoint) else {
-                self.logToFile("[AI Helper LOG] Invalid API Base URL configured: '\(baseUrl)'")
+                self.logToFile("[AI Helper LOG] Invalid API Base URL configured: '\(baseUrl)' (resolved endpoint: '\(endpoint)')")
                 return nil
             }
             
@@ -2052,61 +3395,143 @@ struct ExtractionGroup: Identifiable, Equatable {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.timeoutInterval = timeout
             
-            if !apiKey.isEmpty {
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            }
-            
-            // Format for Chat Completion endpoint
-            var messagesContent: [[String: Any]] = []
-            messagesContent.append([
-                "type": "text",
-                "text": prompt
-            ])
-            
-            if let images = images {
-                for imgBase64 in images {
-                    messagesContent.append([
-                        "type": "image_url",
-                        "image_url": [
-                            "url": "data:image/png;base64,\(imgBase64)"
-                        ]
-                    ])
+            if isAnthropic {
+                if !apiKey.isEmpty {
+                    request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                }
+                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            } else {
+                if !apiKey.isEmpty {
+                    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
                 }
             }
             
-            let bodyDict: [String: Any] = [
-                "model": model,
-                "messages": [
-                    [
-                        "role": "user",
-                        "content": images != nil ? messagesContent as Any : prompt as Any
-                    ]
-                ],
-                "stream": false
-            ]
-            
             do {
-                request.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [])
-                let (data, _) = try await session.data(for: request)
+                let maxOutTokens = options?.num_predict ?? 8192
+                if isAnthropic {
+                    var contentBlocks: [[String: Any]] = []
+                    
+                    if let images = images {
+                        for imgBase64 in images {
+                            var cleanBase64 = imgBase64
+                            if let commaIdx = cleanBase64.firstIndex(of: ",") {
+                                cleanBase64 = String(cleanBase64[cleanBase64.index(after: commaIdx)...])
+                            }
+                            cleanBase64 = cleanBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let mediaType = cleanBase64.hasPrefix("/9j/") ? "image/jpeg" : "image/png"
+                            contentBlocks.append([
+                                "type": "image",
+                                "source": [
+                                    "type": "base64",
+                                    "media_type": mediaType,
+                                    "data": cleanBase64
+                                ]
+                            ])
+                        }
+                    }
+                    
+                    contentBlocks.append([
+                        "type": "text",
+                        "text": prompt
+                    ])
+                    
+                    let anthropicBody: [String: Any] = [
+                        "model": model,
+                        "max_tokens": maxOutTokens,
+                        "messages": [
+                            [
+                                "role": "user",
+                                "content": contentBlocks
+                            ]
+                        ]
+                    ]
+                    request.httpBody = try JSONSerialization.data(withJSONObject: anthropicBody, options: [])
+                } else {
+                    var messagesContent: [[String: Any]] = []
+                    messagesContent.append([
+                        "type": "text",
+                        "text": prompt
+                    ])
+                    
+                    if let images = images {
+                        for imgBase64 in images {
+                            var cleanBase64 = imgBase64
+                            if let commaIdx = cleanBase64.firstIndex(of: ",") {
+                                cleanBase64 = String(cleanBase64[cleanBase64.index(after: commaIdx)...])
+                            }
+                            cleanBase64 = cleanBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let mediaType = cleanBase64.hasPrefix("/9j/") ? "image/jpeg" : "image/png"
+                            messagesContent.append([
+                                "type": "image_url",
+                                "image_url": [
+                                    "url": "data:\(mediaType);base64,\(cleanBase64)"
+                                ]
+                            ])
+                        }
+                    }
+                    
+                    var bodyDict: [String: Any] = [
+                        "model": model,
+                        "max_tokens": maxOutTokens,
+                        "messages": [
+                            [
+                                "role": "user",
+                                "content": images != nil ? messagesContent as Any : prompt as Any
+                            ]
+                        ],
+                        "stream": false
+                    ]
+                    if let temp = options?.temperature {
+                        bodyDict["temperature"] = temp
+                    }
+                    request.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [])
+                }
+                
+                let (data, response) = try await session.data(for: request)
+                
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+                    let errBody = String(data: data, encoding: .utf8) ?? ""
+                    self.logToFile("[AI Helper LOG] HTTP \(httpResponse.statusCode) from \(provider) (\(url.absoluteString)): \(errBody)")
+                    return nil
+                }
                 
                 if let responseJSON = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                    if let choices = responseJSON["choices"] as? [[String: Any]],
-                       let firstChoice = choices.first,
-                       let message = firstChoice["message"] as? [String: Any],
-                       let content = message["content"] as? String {
-                        return content.trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else if let errorDict = responseJSON["error"] as? [String: Any],
-                              let msg = errorDict["message"] as? String {
-                        self.logToFile("[AI Helper LOG] OpenAI-compatible API error message: \(msg)")
-                        return nil
+                    if isAnthropic {
+                        if let contentArray = responseJSON["content"] as? [[String: Any]] {
+                            let textParts = contentArray.compactMap { block -> String? in
+                                if (block["type"] as? String) == "text" {
+                                    return block["text"] as? String
+                                }
+                                return nil
+                            }
+                            let combined = textParts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !combined.isEmpty {
+                                return combined
+                            }
+                        } else if let errorDict = responseJSON["error"] as? [String: Any],
+                                   let msg = errorDict["message"] as? String {
+                            self.logToFile("[AI Helper LOG] Anthropic error message: \(msg)")
+                            return nil
+                        }
+                    } else {
+                        if let choices = responseJSON["choices"] as? [[String: Any]],
+                           let firstChoice = choices.first,
+                           let message = firstChoice["message"] as? [String: Any],
+                           let content = message["content"] as? String {
+                            return content.trimmingCharacters(in: .whitespacesAndNewlines)
+                        } else if let errorDict = responseJSON["error"] as? [String: Any],
+                                  let msg = errorDict["message"] as? String {
+                            self.logToFile("[AI Helper LOG] Cloud API error message: \(msg)")
+                            return nil
+                        }
                     }
                 }
                 
                 let rawString = String(data: data, encoding: .utf8) ?? "Unable to decode string"
-                self.logToFile("[AI Helper LOG] Unexpected OpenAI response structure: \(rawString)")
+                self.logToFile("[AI Helper LOG] Unexpected \(provider) response structure: \(rawString)")
                 return nil
             } catch {
-                self.logToFile("[AI Helper LOG] Error communicating with OpenAI-compatible API (\(url)): \(error)")
+                self.logToFile("[AI Helper LOG] Error communicating with \(provider) API (\(url)): \(error.localizedDescription)")
                 return nil
             }
         }
@@ -2114,8 +3539,8 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     func pullOllamaModel(modelName: String) async -> Bool {
         let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
-        let host = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "http://100.64.0.4:11434") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
-        guard let bURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: provider == "tailscale" ? "http://100.64.0.4:11434" : "http://localhost:11434") else { return false }
+        let host = provider == "tailscale" ? (UserDefaults.standard.string(forKey: "tailscale_host") ?? "") : (UserDefaults.standard.string(forKey: "local_host") ?? "http://localhost:11434")
+        guard !host.isEmpty, let bURL = AIHelper.normalizedOllamaURL(from: host, defaultHost: provider == "tailscale" ? "" : "http://localhost:11434") else { return false }
         let url = bURL.appendingPathComponent("api/pull")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -2137,34 +3562,379 @@ struct ExtractionGroup: Identifiable, Equatable {
         return false
     }
     
-    // MARK: - Unified Extraction
+    // MARK: - Unified Extraction & Transcription Disk Cache
     
-    /// Unified extraction: renders all PDF pages to high-resolution images and transcribes via the visual AI model (Qwen2.5-VL), ensuring complete visual comprehension of math, layouts, and derivations.
+    private var transcriptionCacheDirectory: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("ProjectNobel/transcription_cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+    
+    private func transcriptionCacheKey(for path: String, isAnswer: Bool) -> String {
+        var key = path
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let modDate = attrs[.modificationDate] as? Date,
+           let size = attrs[.size] as? Int {
+            key += "_\(Int(modDate.timeIntervalSince1970))_\(size)"
+        }
+        let digest = SHA256.hash(data: Data(key.utf8))
+        let hexString = digest.compactMap { String(format: "%02x", $0) }.joined()
+        let suffix = isAnswer ? "_answers.json" : "_questions.json"
+        return "\(hexString)\(suffix)"
+    }
+    
+    public func clearTranscriptionCache() {
+        let dir = transcriptionCacheDirectory
+        if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for f in files {
+                try? FileManager.default.removeItem(at: f)
+            }
+        }
+        self.logToFile("[AI Batch Importer LOG] Cleared all cached transcriptions from disk.")
+    }
+    
+    // MARK: - Automated Cross-Page Boundary Stitcher (Solution 1)
+    
+    public func stitchExtractedProblems(rawProblems: [ExtractedProblem]) async -> [ExtractedProblem] {
+        guard rawProblems.count > 1 else { return rawProblems }
+        
+        let preSplitProblems = preSplitProblemHeaders(rawProblems: rawProblems)
+        guard preSplitProblems.count > 1 else { return preSplitProblems }
+        
+        // 1. Primary AI Problem Stitcher
+        if let aiStitched = await stitchProblemsWithAIModel(fragments: preSplitProblems), !aiStitched.isEmpty {
+            self.logToFile("[AI Batch Importer LOG] AI problem stitching complete: consolidated \(preSplitProblems.count) fragments into \(aiStitched.count) unified problems.")
+            return aiStitched
+        }
+        
+        // 2. Deterministic Fallback if AI server unavailable
+        self.logToFile("[AI Batch Importer LOG] AI problem stitching unavailable or failed; executing deterministic boundary stitcher fallback.")
+        return stitchExtractedProblemsDeterministically(preSplitProblems: preSplitProblems)
+    }
+    
+    /// Pre-splits any single extracted problem that contains embedded problem headers
+    /// (e.g. OCR bundled continuation of Problem 2 and "Problem 3:" into one block)
+    public func preSplitProblemHeaders(rawProblems: [ExtractedProblem]) -> [ExtractedProblem] {
+        var preSplitProblems = [ExtractedProblem]()
+        let probHeaderPattern = #"(?m)^(?=(?:Problem|Question|Exercise|Task)\s+\d+[:\.\s])"#
+        
+        for item in rawProblems {
+            let content = item.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let regex = try? NSRegularExpression(pattern: probHeaderPattern, options: [.caseInsensitive]) {
+                let nsContent = content as NSString
+                let matches = regex.matches(in: content, options: [], range: NSRange(location: 0, length: nsContent.length))
+                let needsSplit = matches.contains { $0.range.location > 0 }
+                if needsSplit {
+                    var lastIndex = 0
+                    for match in matches {
+                        let splitLoc = match.range.location
+                        if splitLoc > lastIndex {
+                            let part = nsContent.substring(with: NSRange(location: lastIndex, length: splitLoc - lastIndex)).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !part.isEmpty {
+                                var splitItem = item
+                                splitItem.id = UUID()
+                                splitItem.content = part
+                                preSplitProblems.append(splitItem)
+                            }
+                        }
+                        lastIndex = splitLoc
+                    }
+                    if lastIndex < nsContent.length {
+                        let remaining = nsContent.substring(with: NSRange(location: lastIndex, length: nsContent.length - lastIndex)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !remaining.isEmpty {
+                            var splitItem = item
+                            splitItem.id = UUID()
+                            splitItem.content = remaining
+                            preSplitProblems.append(splitItem)
+                        }
+                    }
+                    continue
+                }
+            }
+            preSplitProblems.append(item)
+        }
+        return preSplitProblems
+    }
+    
+    /// AI-powered problem stitcher: uses LLM semantic reasoning to consolidate split problem fragments
+    public func stitchProblemsWithAIModel(fragments: [ExtractedProblem]) async -> [ExtractedProblem]? {
+        await withUserPriority {
+            let provider = taskProvider(for: "route_stitching", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
+            self.logToFile("[AI Batch Importer LOG] Calling AI model '\(model)' (\(provider)) to stitch \(fragments.count) page fragments...")
+            
+            await MainActor.run {
+                self.pipelineCurrentPhase = "AI Stitching Problems..."
+                if provider == "local" {
+                    self.isLocalActive = true
+                    self.localTaskStatus = "AI Stitching (\(fragments.count) fragments)..."
+                } else {
+                    self.isRemoteActive = true
+                    self.remoteTaskStatus = "AI Stitching (\(fragments.count) fragments)..."
+                }
+            }
+            defer {
+                Task { @MainActor in
+                    self.isLocalActive = false
+                    self.isRemoteActive = false
+                }
+            }
+            
+            var fragmentList = [String]()
+            for (idx, f) in fragments.enumerated() {
+                fragmentList.append("""
+                [FRAGMENT \(idx + 1)]
+                \(f.content.trimmingCharacters(in: .whitespacesAndNewlines))
+                """)
+            }
+            let fragmentsBody = fragmentList.joined(separator: "\n\n")
+            
+            let prompt = """
+            You are an expert university physics educator and document reconstruction assistant.
+            Below are \(fragments.count) sequentially extracted text fragments from consecutive pages of a physics problem set.
+            Due to PDF page breaks, some problems are split across consecutive fragments (for example, Fragment 1 contains part (a) at the bottom of a page, and Fragment 2 contains parts (b) and (c) at the top of the next page).
+            
+            Your task:
+            Reconstruct and output the exact list of complete, individual, unified physics problems by stitching together consecutive fragments that belong to the same problem.
+            
+            Strict Rules:
+            1. Consolidate consecutive fragments that belong to the same physics problem into a single complete problem.
+            2. Eliminate any page seam artifacts (such as "Continued overleaf", "Page X of Y", "Turn over", or repeated problem headers at page boundaries).
+            3. Preserve ALL physics formulas, mathematical variables, and LaTeX delimiters ($...$ for inline, $$...$$ for block equations) with 100% exact fidelity. Do NOT summarize, shorten, or alter any questions or numbers.
+            4. Retain all subparts (e.g. (a), (b), (c) and (i), (ii), (iii)) in the unified question. Do NOT prefix top-level numbers like "Problem 1:" or "1." because the application handles problem numbering.
+            5. Output each reconstructed problem strictly in this format:
+            [PROBLEM]
+            Question: <complete question statement with all subparts and LaTeX>
+            Hint: <concise solution hint with LaTeX if present, or leave empty>
+            [PROBLEM]
+            
+            Output ONLY the [PROBLEM] blocks. Do NOT include any introductory or conversational text.
+            
+            Sequential Fragments:
+            ---
+            \(fragmentsBody)
+            ---
+            """
+            
+            let response = await callOllama(prompt: prompt, model: model, timeout: 180.0, overrideProvider: provider)
+            
+            guard let rawText = response, !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            
+            let normalized = normalizeLaTeXDelimiters(rawText)
+            let parsed = parseExtractedProblems(normalized)
+            guard !parsed.isEmpty else { return nil }
+            
+            var cleaned = [ExtractedProblem]()
+            for var p in parsed {
+                p.content = cleanQuestionContent(p.content)
+                cleaned.append(p)
+            }
+            return cleaned
+        }
+    }
+    
+    /// Deterministic boundary stitcher fallback
+    public func stitchExtractedProblemsDeterministically(preSplitProblems: [ExtractedProblem]) -> [ExtractedProblem] {
+        var merged = [ExtractedProblem]()
+        var i = 0
+        while i < preSplitProblems.count {
+            var cur = preSplitProblems[i]
+            while i + 1 < preSplitProblems.count {
+                let nxt = preSplitProblems[i + 1]
+                let (isCont, reason) = isProblemContinuation(prevContent: cur.content, nextContent: nxt.content)
+                if isCont {
+                    self.logToFile("[AI Batch Importer LOG] Stitching problem fragment \(i + 1) with fragment \(i + 2) (\(reason))")
+                    cur.content = mergeFragmentContents(c1: cur.content, c2: nxt.content)
+                    if cur.solutionHint.isEmpty && !nxt.solutionHint.isEmpty {
+                        cur.solutionHint = nxt.solutionHint
+                    }
+                    if cur.solution.isEmpty && !nxt.solution.isEmpty {
+                        cur.solution = nxt.solution
+                    }
+                    if !nxt.steps.isEmpty {
+                        cur.steps.append(contentsOf: nxt.steps)
+                    }
+                    i += 1
+                } else {
+                    break
+                }
+            }
+            cur.content = cleanQuestionContent(cur.content)
+            merged.append(cur)
+            i += 1
+        }
+        return merged
+    }
+    
+    private func isProblemContinuation(prevContent: String, nextContent: String) -> (Bool, String) {
+        var strippedNext = nextContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        strippedNext = strippedNext.replacingOccurrences(of: #"^[#*`\s]+"#, with: "", options: .regularExpression)
+        let strippedPrev = prevContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if strippedNext.isEmpty { return (false, "") }
+        
+        // 1. Lowercase start (mid-sentence continuation, e.g. "for some real...", "second eigenstate...")
+        if let firstChar = strippedNext.first, firstChar.isLetter && firstChar.isLowercase {
+            return (true, "lowercase sentence continuation")
+        }
+        
+        // 2. Starts with continuation punctuation or math (e.g. ",", ";", ")", "=", "+", "-", "$$")
+        let contPunctuation = [",", ";", ")", "=", "+", "-", "$$"]
+        for p in contPunctuation {
+            if strippedNext.starts(with: p) {
+                return (true, "continuation punctuation '\(p)'")
+            }
+        }
+        let contWords = ["and ", "where ", "such that ", "with ", "in the case of "]
+        for w in contWords {
+            if strippedNext.lowercased().starts(with: w) {
+                return (true, "continuation conjunction '\(w.trimmingCharacters(in: .whitespaces))'")
+            }
+        }
+        
+        // 3. Previous ended with incomplete phrase or dangling conjunction
+        let prevIncompletePattern = #"(?:and|such that|Find this|with|is|the|where|in the case of the|for the position and|\,,|\,)\s*$"#
+        if let regex = try? NSRegularExpression(pattern: prevIncompletePattern, options: [.caseInsensitive]) {
+            let range = NSRange(location: 0, length: (strippedPrev as NSString).length)
+            if regex.firstMatch(in: strippedPrev, options: [], range: range) != nil {
+                return (true, "previous fragment ended with incomplete phrase")
+            }
+        }
+        
+        // 4. Next starts with continuation subpart (b), (c), (ii), (iii), etc.
+        // Standalone questions never start with (b), (c), or (ii)
+        let subpartPattern = #"^\(?([b-fB-F]|ii|iii|iv|v|vi)\)[\.\s]"#
+        if let regex = try? NSRegularExpression(pattern: subpartPattern, options: []) {
+            let range = NSRange(location: 0, length: (strippedNext as NSString).length)
+            if let m = regex.firstMatch(in: strippedNext, options: [], range: range), m.range.location == 0 {
+                return (true, "continuation subpart letter")
+            }
+        }
+        
+        // 5. Overlap detection (page boundary OCR repeated text snippet)
+        let sampleLen = min(40, strippedNext.count)
+        if sampleLen >= 20 {
+            let prefix = String(strippedNext.prefix(sampleLen))
+            if strippedPrev.contains(prefix) {
+                return (true, "page boundary overlap bleed")
+            }
+        }
+        
+        return (false, "")
+    }
+    
+    private func mergeFragmentContents(c1: String, c2: String) -> String {
+        var trimmed1 = c1.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed2 = c2.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        trimmed1 = trimmed1.replacingOccurrences(of: #"(?m)^```[a-zA-Z0-9_-]*\s*$"#, with: "", options: .regularExpression)
+        trimmed1 = trimmed1.replacingOccurrences(of: "```", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        trimmed2 = trimmed2.replacingOccurrences(of: #"(?m)^```[a-zA-Z0-9_-]*\s*$"#, with: "", options: .regularExpression)
+        trimmed2 = trimmed2.replacingOccurrences(of: "```", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Check for boundary overlap to deduplicate bleed
+        let maxOverlap = min(120, trimmed2.count)
+        if maxOverlap >= 20 {
+            for testLen in stride(from: maxOverlap, through: 20, by: -1) {
+                let snip = String(trimmed2.prefix(testLen))
+                if let range = trimmed1.range(of: snip, options: .backwards) {
+                    let nonOverlappingPrefix = String(trimmed1[..<range.lowerBound])
+                    return nonOverlappingPrefix.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + trimmed2
+                }
+            }
+        }
+        
+        return trimmed1 + "\n\n" + trimmed2
+    }
+    
+    /// Unified extraction: renders PDF pages to images and transcribes via the visual AI model, caching results to disk to avoid repeated OCR.
     func extractProblemsUnified(item: ExtractionQueueItem, onPageExtracted: (@MainActor ([ExtractedProblem]) async -> Void)? = nil) async -> [ExtractedProblem] {
         if item.type == .pdf {
             let pdfPath = item.pathOrName
-            self.logToFile("[AI Batch Importer LOG] PDF '\(pdfPath)' — rendering high-res page images for visual AI transcription")
-            let images = convertPDFToImages(path: pdfPath, maxPages: 25)
+            let cacheURL = transcriptionCacheDirectory.appendingPathComponent(transcriptionCacheKey(for: pdfPath, isAnswer: false))
+            
+            // 1. Check persistent disk cache first (problems are already boundary-stitched and cleaned)
+            if let cachedData = try? Data(contentsOf: cacheURL),
+               let cachedProblems = try? JSONDecoder().decode([ExtractedProblem].self, from: cachedData),
+               !cachedProblems.isEmpty {
+                self.logToFile("[AI Batch Importer LOG] Using cached visual question transcription for '\(pdfPath)' (\(cachedProblems.count) problems). Skipping visual OCR.")
+                self.addBatchLiveEvent("Question OCR loaded from cache (\(cachedProblems.count) problems).")
+                await MainActor.run {
+                    let pageCount = PDFDocument(url: URL(fileURLWithPath: pdfPath))?.pageCount ?? 1
+                    self.localPagesCompleted = min(self.localPagesTotal, self.localPagesCompleted + pageCount)
+                    self.localTaskStatus = "Done (Loaded from Cache)"
+                    self.isLocalActive = false
+                }
+                if let onPageExtracted = onPageExtracted {
+                    await onPageExtracted(cachedProblems)
+                }
+                return cachedProblems
+            }
+            
+            // 2. Perform local visual OCR
+            self.logToFile("[AI Batch Importer LOG] PDF '\(pdfPath)' — rendering page images for visual AI transcription")
+            let images = convertPDFToImages(path: pdfPath, maxPages: 100)
+            self.addBatchLiveEvent("Rendering \(images.count) PDF pages for visual OCR.")
+            await MainActor.run {
+                self.isLocalActive = true
+                self.isRemoteActive = false
+                self.localPagesTotal = max(self.localPagesTotal, images.count)
+                self.localTaskStatus = "Transcribing page 1 of \(images.count)..."
+                self.pipelineCurrentPhase = "Phase 1/2: Local OCR"
+            }
             var allProblems = [ExtractedProblem]()
             for (idx, base64) in images.enumerated() {
+                await MainActor.run {
+                    self.localTaskStatus = "Transcribing page \(idx + 1) of \(images.count)..."
+                }
                 self.logToFile("[AI Batch Importer LOG] Visual transcription for page \(idx + 1)/\(images.count) of \(pdfPath)")
                 if let rawText = await extractProblemsFromImage(base64Image: base64) {
-                    if rawText != "MODEL_NOT_FOUND" {
+                    if rawText != "MODEL_NOT_FOUND" && !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         let normalized = normalizeLaTeXDelimiters(rawText)
                         let parsed = parseExtractedProblems(normalized)
                         self.logToFile("[AI Batch Importer LOG] Page \(idx + 1) parsed \(parsed.count) problems.")
+                        self.addBatchLiveEvent("Page \(idx + 1)/\(images.count): \(parsed.count) candidate questions parsed.")
                         allProblems.append(contentsOf: parsed)
                         if let onPageExtracted = onPageExtracted {
                             await onPageExtracted(parsed)
                         }
                     }
                 }
+                await MainActor.run {
+                    self.localPagesCompleted = min(self.localPagesTotal, self.localPagesCompleted + 1)
+                }
+            }
+            
+            // Local Visual OCR is now complete
+            await MainActor.run {
+                self.localPagesCompleted = self.localPagesTotal
+                self.localTaskStatus = "Done (\(images.count) pgs OCR'd)"
+                self.isLocalActive = false
+            }
+            
+            // 2b. Automatically stitch problems that were split across PDF page boundaries (Text AI on Remote Engine)
+            if images.count > 1 && allProblems.count > 1 {
+                self.logToFile("[AI Batch Importer LOG] Running automated boundary stitcher on \(allProblems.count) raw page fragments...")
+                self.addBatchLiveEvent("Stitching \(allProblems.count) raw fragments across PDF page boundaries...")
+                let stitched = await self.stitchExtractedProblems(rawProblems: allProblems)
+                self.logToFile("[AI Batch Importer LOG] Stitching complete: consolidated \(allProblems.count) fragments into \(stitched.count) unified problems.")
+                self.addBatchLiveEvent("Consolidated into \(stitched.count) unified questions.")
+                allProblems = stitched
+            }
+            
+            // 3. Persist unified problems to disk cache
+            if !allProblems.isEmpty, let encoded = try? JSONEncoder().encode(allProblems) {
+                try? encoded.write(to: cacheURL)
+                self.logToFile("[AI Batch Importer LOG] Saved \(allProblems.count) problems to transcription disk cache for '\(pdfPath)'.")
             }
             return allProblems
         } else if item.type == .image, let base64 = item.imageBase64 {
             self.logToFile("[AI Batch Importer LOG] Using visual AI model for image: \(item.pathOrName)")
             if let rawText = await extractProblemsFromImage(base64Image: base64) {
-                if rawText != "MODEL_NOT_FOUND" {
+                if rawText != "MODEL_NOT_FOUND" && !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let normalized = normalizeLaTeXDelimiters(rawText)
                     let parsed = parseExtractedProblems(normalized)
                     self.logToFile("[AI Batch Importer LOG] Image parsed \(parsed.count) problems.")
@@ -2181,13 +3951,39 @@ struct ExtractionGroup: Identifiable, Equatable {
     func extractAnswersUnified(item: ExtractionQueueItem, onPageExtracted: (@MainActor ([ExtractedAnswer]) async -> Void)? = nil) async -> [ExtractedAnswer] {
         if item.type == .pdf {
             let pdfPath = item.pathOrName
-            self.logToFile("[AI Batch Importer LOG] PDF '\(pdfPath)' — rendering high-res page images for visual AI answer extraction")
-            let images = convertPDFToImages(path: pdfPath, maxPages: 25)
+            let cacheURL = transcriptionCacheDirectory.appendingPathComponent(transcriptionCacheKey(for: pdfPath, isAnswer: true))
+            
+            // 1. Check persistent disk cache first
+            if let cachedData = try? Data(contentsOf: cacheURL),
+               let cachedAnswers = try? JSONDecoder().decode([ExtractedAnswer].self, from: cachedData),
+               !cachedAnswers.isEmpty {
+                self.logToFile("[AI Batch Importer LOG] Using cached visual answer extraction for '\(pdfPath)' (\(cachedAnswers.count) answers). Skipping visual OCR.")
+                let pageCount = PDFDocument(url: URL(fileURLWithPath: pdfPath))?.pageCount ?? 1
+                await MainActor.run {
+                    self.localPagesCompleted = min(self.localPagesTotal, self.localPagesCompleted + pageCount)
+                }
+                if let onPageExtracted = onPageExtracted {
+                    await onPageExtracted(cachedAnswers)
+                }
+                return cachedAnswers
+            }
+            
+            // 2. Perform local visual OCR
+            self.logToFile("[AI Batch Importer LOG] PDF '\(pdfPath)' — rendering page images for visual AI answer extraction")
+            let images = convertPDFToImages(path: pdfPath, maxPages: 100)
+            await MainActor.run {
+                self.isLocalActive = true
+                self.pipelineCurrentPhase = "Phase 1/2: Local OCR"
+            }
             var allAnswers = [ExtractedAnswer]()
             for (idx, base64) in images.enumerated() {
+                await MainActor.run {
+                    self.isLocalActive = true
+                    self.localTaskStatus = "Transcribing answer page \(idx + 1) of \(images.count)..."
+                }
                 self.logToFile("[AI Batch Importer LOG] Visual answer extraction for page \(idx + 1)/\(images.count) of \(pdfPath)")
                 if let rawText = await extractAnswersFromImage(base64Image: base64) {
-                    if rawText != "MODEL_NOT_FOUND" {
+                    if rawText != "MODEL_NOT_FOUND" && !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         let normalized = normalizeLaTeXDelimiters(rawText)
                         let parsed = parseExtractedAnswers(normalized)
                         self.logToFile("[AI Batch Importer LOG] Page \(idx + 1) parsed \(parsed.count) answers.")
@@ -2197,12 +3993,21 @@ struct ExtractionGroup: Identifiable, Equatable {
                         }
                     }
                 }
+                await MainActor.run {
+                    self.localPagesCompleted = min(self.localPagesTotal, self.localPagesCompleted + 1)
+                }
+            }
+            
+            // 3. Persist to disk cache
+            if !allAnswers.isEmpty, let encoded = try? JSONEncoder().encode(allAnswers) {
+                try? encoded.write(to: cacheURL)
+                self.logToFile("[AI Batch Importer LOG] Saved \(allAnswers.count) answers to transcription disk cache for '\(pdfPath)'.")
             }
             return allAnswers
         } else if item.type == .image, let base64 = item.imageBase64 {
             self.logToFile("[AI Batch Importer LOG] Using visual AI model for image: \(item.pathOrName)")
             if let rawText = await extractAnswersFromImage(base64Image: base64) {
-                if rawText != "MODEL_NOT_FOUND" {
+                if rawText != "MODEL_NOT_FOUND" && !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let normalized = normalizeLaTeXDelimiters(rawText)
                     let parsed = parseExtractedAnswers(normalized)
                     self.logToFile("[AI Batch Importer LOG] Image parsed \(parsed.count) answers.")
@@ -2257,7 +4062,7 @@ struct ExtractionGroup: Identifiable, Equatable {
         return avgCharsPerPage < 20
     }
     
-    func convertPDFToImages(path: String, maxPages: Int = 15) -> [String] {
+    func convertPDFToImages(path: String, maxPages: Int = 100) -> [String] {
         guard let document = PDFDocument(url: URL(fileURLWithPath: path)) else {
             print("[AI Helper] Error opening PDF for image conversion at \(path)")
             return []
@@ -2268,13 +4073,16 @@ struct ExtractionGroup: Identifiable, Equatable {
             guard let page = document.page(at: i) else { continue }
             let bounds = page.bounds(for: .mediaBox)
             if bounds.width > 0 && bounds.height > 0 {
-                // Render at 1.5x scale for optimal OCR quality
-                let size = CGSize(width: bounds.width * 1.5, height: bounds.height * 1.5)
+                // Optimal resolution for Qwen2.5-VL: max 1280px dimension, preserving aspect ratio
+                let maxDim: CGFloat = 1280.0
+                let currentMax = max(bounds.width, bounds.height)
+                let scale = currentMax > maxDim ? (maxDim / currentMax) : 1.25
+                let size = CGSize(width: max(1, bounds.width * scale), height: max(1, bounds.height * scale))
                 let image = page.thumbnail(of: size, for: .mediaBox)
                 if let tiff = image.tiffRepresentation,
                    let bitmap = NSBitmapImageRep(data: tiff),
-                   let pngData = bitmap.representation(using: .png, properties: [:]) {
-                    let base64 = pngData.base64EncodedString()
+                   let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+                    let base64 = jpegData.base64EncodedString()
                     base64Images.append(base64)
                 }
             }
@@ -2575,9 +4383,10 @@ struct ExtractionGroup: Identifiable, Equatable {
             print("[AI Helper] Note ID \(noteId) text is sparse/empty (\(pdfText.count) chars) — attempting visual extraction via vision model...")
             let images = convertPDFToImages(path: note.filePath, maxPages: 4)
             if !images.isEmpty {
-                let visionModel = await getOllamaVisionModel() ?? "qwen2.5vl:7b"
-                let prompt = "\(summaryPromptTemplate)\n\nPlease extract and summarize the core physics equations and concepts from these lecture note pages into the required formula-first format."
-                summaryRes = await callOllama(prompt: prompt, model: visionModel, images: images, timeout: 300.0)
+                if let visionModel = await getOllamaVisionModel(), !visionModel.isEmpty {
+                    let prompt = "\(summaryPromptTemplate)\n\nPlease extract and summarize the core physics equations and concepts from these lecture note pages into the required formula-first format."
+                    summaryRes = await callOllama(prompt: prompt, model: visionModel, images: images, timeout: 300.0)
+                }
             }
         }
         
@@ -2626,7 +4435,7 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     // MARK: - LaTeX helpers
     
-    private func cleanLaTeXOutput(_ text: String?) -> String? {
+    func cleanLaTeXOutput(_ text: String?) -> String? {
         guard var result = text?.trimmingCharacters(in: .whitespacesAndNewlines), !result.isEmpty else { return nil }
         
         // 1. Strip think tags (including unclosed think tags if output was cut off)
@@ -2691,11 +4500,25 @@ struct ExtractionGroup: Identifiable, Equatable {
             "The equation in LaTeX is:",
             "The LaTeX representation is:",
             "Here is the translated LaTeX:",
-            "Here is the formula:"
+            "Here is the formula:",
+            "The formula is:",
+            "The equation is:",
+            "Equation:",
+            "Here is the transcribed LaTeX:",
+            "Here is the transcribed equation:",
+            "Transcribed equation:"
         ]
         for prefix in introPrefixes {
             if result.lowercased().hasPrefix(prefix.lowercased()) {
                 result = String(result.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        
+        // Check for embedded "The equation is:" or "Formula is:" after any reasoning prose
+        if let eqRange = result.range(of: #"(?i)(?:the\s+)?(?:equation|formula)\s+is:\s*"#, options: .regularExpression) {
+            let candidate = String(result[eqRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty {
+                result = candidate
             }
         }
         
@@ -2715,8 +4538,9 @@ struct ExtractionGroup: Identifiable, Equatable {
             finishAITask(force: true)
         }
         return await withUserPriority {
-            let useLocal = latexAlwaysLocal
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let routeProvider = taskProvider(for: "route_translation", defaultProvider: "local")
+            let useLocal = latexAlwaysLocal || routeProvider == "local"
+            let model = await getOllamaModel(forProvider: useLocal ? "local" : routeProvider, forceLocal: useLocal)
             let prompt = """
             You are a mathematical LaTeX translator. Translate the following plain-text equation description or expression into clean, valid raw LaTeX code.
             Do NOT include <think> tags or conversational filler. Return ONLY the raw LaTeX code itself.
@@ -2731,14 +4555,14 @@ struct ExtractionGroup: Identifiable, Equatable {
             \(rawEquation)
             """
             
-            let fastOptions = OllamaOptions(temperature: 0.0, num_predict: 512, top_p: 0.9)
-            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal, options: fastOptions)
+            let fastOptions = OllamaOptions(temperature: 0.0, num_predict: 1024, top_p: 0.9)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal, overrideProvider: useLocal ? "local" : routeProvider, options: fastOptions, overrideThink: false)
             // Bidirectional fallback: if preferred provider failed, try the opposite (Local <-> Remote)
             if res == nil {
                 let fallbackUseLocal = !useLocal
                 self.logToFile("[AI Helper LOG] LaTeX translation failed on preferred provider, trying fallback (forceLocal: \(fallbackUseLocal))...")
                 let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
-                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal, options: fastOptions)
+                res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal, options: fastOptions, overrideThink: false)
             }
             return cleanLaTeXOutput(res)
         }
@@ -2750,18 +4574,19 @@ struct ExtractionGroup: Identifiable, Equatable {
             finishAITask(force: true)
         }
         return await withUserPriority {
-            let useLocal = latexAlwaysLocal
+            let routeProvider = taskProvider(for: "route_translation", isVision: true, defaultProvider: "local")
+            let useLocal = latexAlwaysLocal || routeProvider == "local"
             let prompt = """
             Transcribe the mathematical equation or expression in this image into valid LaTeX format. \
             Do NOT wrap the equation in any delimiters like $ or $$ or \\[ or \\]. \
             Do NOT include <think> tags or conversational filler. Return ONLY the raw LaTeX code itself.
             """
-            let fastOptions = OllamaOptions(temperature: 0.0, num_predict: 512, top_p: 0.9)
+            let fastOptions = OllamaOptions(temperature: 0.0, num_predict: 1024, top_p: 0.9)
             
             // 1. Initial attempt with preferred provider
             var res: String? = nil
             if let visionModel = await getOllamaVisionModel(forceLocal: useLocal) {
-                res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 120.0, forceLocal: useLocal, options: fastOptions)
+                res = await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 120.0, forceLocal: useLocal, overrideProvider: useLocal ? "local" : routeProvider, options: fastOptions, overrideThink: false)
             }
             
             // 2. Bidirectional fallback (Local <-> Tailscale)
@@ -2769,7 +4594,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                 let fallbackUseLocal = !useLocal
                 self.logToFile("[AI Helper LOG] LaTeX image transcription failed on preferred provider, trying fallback (forceLocal: \(fallbackUseLocal))...")
                 if let fallbackVisionModel = await getOllamaVisionModel(forceLocal: fallbackUseLocal) {
-                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 120.0, forceLocal: fallbackUseLocal, options: fastOptions)
+                    res = await callOllama(prompt: prompt, model: fallbackVisionModel, images: [base64Image], timeout: 120.0, forceLocal: fallbackUseLocal, options: fastOptions, overrideThink: false)
                 }
             }
             
@@ -2780,7 +4605,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                 let cloudBase = UserDefaults.standard.string(forKey: "vision_api_base_url") ?? ""
                 if (visionProvider != "local" && visionProvider != "tailscale") || !cloudKey.isEmpty || !cloudBase.isEmpty {
                     let cloudModel = UserDefaults.standard.string(forKey: "vision_model_name") ?? "gpt-4o"
-                    res = await callAPIOnce(prompt: prompt, model: cloudModel, images: [base64Image], timeout: 120.0, provider: "cloud_vision")
+                    res = await callAPIOnce(prompt: prompt, model: cloudModel, images: [base64Image], timeout: 120.0, provider: "cloud_vision", overrideThink: false)
                 }
             }
             
@@ -2790,8 +4615,8 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     func extractProblemsFromPDF(pdfText: String) async -> String? {
         await withUserPriority {
-            let useLocal = isTaskLocal("route_problem_extraction", defaultLocal: false)
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let provider = taskProvider(for: "route_vision", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
             let prompt = """
             You are a physics teaching assistant. Analyze the following text extracted from a physics document/homework:
             ---
@@ -2815,14 +4640,14 @@ struct ExtractionGroup: Identifiable, Equatable {
             Output ONLY the structured [PROBLEM] blocks. Do NOT include any conversation, conversational filler, or introductory text.
             """
             
-            return await callOllama(prompt: prompt, model: model, timeout: 120.0, forceLocal: useLocal)
+            return await callOllama(prompt: prompt, model: model, timeout: 120.0, overrideProvider: provider)
         }
     }
     
     func extractProblemsFromImage(base64Image: String) async -> String? {
         await withUserPriority {
-            let useLocal = isTaskLocal("route_vision", defaultLocal: true)
-            guard let visionModel = await getOllamaVisionModel(forceLocal: useLocal) else {
+            let provider = taskProvider(for: "route_vision", isVision: true, defaultProvider: "local")
+            guard let visionModel = await getOllamaVisionModel(forceLocal: provider == "local") else {
                 return "MODEL_NOT_FOUND"
             }
             let prompt = """
@@ -2846,7 +4671,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             Output ONLY the structured [PROBLEM] blocks. Do NOT include any introduction, explanations, or conversational filler.
             """
             
-            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 180.0, forceLocal: useLocal)
+            return await callOllama(prompt: prompt, model: visionModel, images: [base64Image], timeout: 180.0, overrideProvider: provider)
         }
     }
     
@@ -2869,8 +4694,8 @@ struct ExtractionGroup: Identifiable, Equatable {
             }
             
             let topicListStr = topicContexts.joined(separator: "\n\n---\n\n")
-            let useLocal = isTaskLocal("route_classification", defaultLocal: false)
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let provider = taskProvider(for: "route_classification", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
             let prompt = """
             You are a physics teaching assistant. Analyze the following practice problem:
             ---
@@ -2885,7 +4710,7 @@ struct ExtractionGroup: Identifiable, Equatable {
             Do NOT include any other text, explanation, or markdown formatting. Output only the digit.
             """
             
-            if let res = await callOllama(prompt: prompt, model: model, timeout: 60.0, forceLocal: useLocal) {
+            if let res = await callOllama(prompt: prompt, model: model, timeout: 60.0, overrideProvider: provider) {
                 let cleaned = res.trimmingCharacters(in: .whitespacesAndNewlines)
                 let digits = cleaned.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
                 return Int(digits)
@@ -3010,8 +4835,9 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     func evaluateFeynmanSummary(explanation: String, noteTitle: String, aiSummary: String) async -> String? {
         await withUserPriority {
-            let useLocal = feynmanAlwaysLocal
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let routeProvider = taskProvider(for: "route_feynman", defaultProvider: "local")
+            let useLocal = feynmanAlwaysLocal || routeProvider == "local"
+            let model = await getOllamaModel(forProvider: useLocal ? "local" : routeProvider, forceLocal: useLocal)
             let prompt = """
             You are a physics professor. The user is using the Feynman technique to explain a lecture note they just studied.
             Lecture Note Title: \(noteTitle)
@@ -3022,7 +4848,8 @@ struct ExtractionGroup: Identifiable, Equatable {
             \(explanation)
 
             Assess the user's explanation. Grade it out of 10 (integer rating) based on accuracy, completeness, and clarity. \
-            List any important concepts, terms, or equations from the reference summary that the user left out or explained poorly.
+            List any important concepts, terms, or equations from the reference summary that the user left out or explained poorly. \
+            If the explanation covers all key concepts, write "- None" under Concepts Left Out.
 
             Your response MUST follow this exact structure:
             Rating: [X]/10
@@ -3033,20 +4860,21 @@ struct ExtractionGroup: Identifiable, Equatable {
 
             Do NOT include any conversational introduction or outro. Start directly with 'Rating:'.
             """
-            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal, overrideProvider: useLocal ? "local" : routeProvider)
             if res == nil {
                 let fallbackUseLocal = !useLocal
                 let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
                 res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
-            return res
+            return res?.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
     
     func getFeynmanDialogueResponse(noteTitle: String, aiSummary: String, chatHistory: [FeynmanChat]) async -> String? {
         await withUserPriority {
-            let useLocal = feynmanAlwaysLocal
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let routeProvider = taskProvider(for: "route_feynman", defaultProvider: "local")
+            let useLocal = feynmanAlwaysLocal || routeProvider == "local"
+            let model = await getOllamaModel(forProvider: useLocal ? "local" : routeProvider, forceLocal: useLocal)
             var historyStr = ""
             
             let lastMsgs = chatHistory.suffix(6)
@@ -3071,20 +4899,22 @@ struct ExtractionGroup: Identifiable, Equatable {
             Student:
             """
             
-            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal, overrideProvider: useLocal ? "local" : routeProvider)
             if res == nil {
                 let fallbackUseLocal = !useLocal
                 let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
                 res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
-            return res ?? "I'm having a bit of trouble formulating my thoughts right now. Could you please rephrase or expand on your previous explanation?"
+            let cleaned = res?.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (cleaned?.isEmpty == false ? cleaned : nil) ?? "I'm having a bit of trouble formulating my thoughts right now. Could you please rephrase or expand on your previous explanation?"
         }
     }
     
     func generateFeynmanStartingQuestion(noteTitle: String, aiSummary: String) async -> String? {
         await withUserPriority {
-            let useLocal = feynmanAlwaysLocal
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let routeProvider = taskProvider(for: "route_feynman", defaultProvider: "local")
+            let useLocal = feynmanAlwaysLocal || routeProvider == "local"
+            let model = await getOllamaModel(forProvider: useLocal ? "local" : routeProvider, forceLocal: useLocal)
             let prompt = """
             You are a curious physics student. The user just studied a lecture notes topic: '\(noteTitle)'.
             Here is the reference summary of the topic: 
@@ -3098,13 +4928,14 @@ struct ExtractionGroup: Identifiable, Equatable {
             Student Question:
             """
             
-            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal)
+            var res = await callOllama(prompt: prompt, model: model, forceLocal: useLocal, overrideProvider: useLocal ? "local" : routeProvider)
             if res == nil {
                 let fallbackUseLocal = !useLocal
                 let fallbackModel = await getOllamaModel(forceLocal: fallbackUseLocal)
                 res = await callOllama(prompt: prompt, model: fallbackModel, forceLocal: fallbackUseLocal)
             }
-            return res ?? "Can you explain the main physical concepts and principles covered in the '\(noteTitle)' lecture?"
+            let cleaned = res?.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (cleaned?.isEmpty == false ? cleaned : nil) ?? "Can you explain the main physical concepts and principles covered in the '\(noteTitle)' lecture?"
         }
     }
     
@@ -3136,9 +4967,18 @@ struct ExtractionGroup: Identifiable, Equatable {
             // For cloud/hermes/openai/groq/anthropic/gemini providers, check the cloud API base URL
             let baseUrl = UserDefaults.standard.string(forKey: "cloud_api_base_url") ?? ""
             let cleanBase = baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            let isAnthropic = cleanBase.contains("anthropic.com") || provider == "anthropic"
+            let isGemini = cleanBase.contains("generativelanguage.googleapis.com") || provider == "gemini"
+            
             let modelsUrlString: String
-            if cleanBase.hasSuffix("/v1") || cleanBase.hasSuffix("/v1beta") {
+            if isAnthropic {
+                modelsUrlString = "https://api.anthropic.com/v1/models"
+            } else if isGemini {
+                modelsUrlString = "https://generativelanguage.googleapis.com/v1beta/openai/models"
+            } else if cleanBase.hasSuffix("/v1") || cleanBase.hasSuffix("/v1beta") {
                 modelsUrlString = "\(cleanBase)/models"
+            } else if cleanBase.isEmpty {
+                modelsUrlString = "https://api.openai.com/v1/models"
             } else {
                 modelsUrlString = "\(cleanBase)/v1/models"
             }
@@ -3147,8 +4987,15 @@ struct ExtractionGroup: Identifiable, Equatable {
             request.httpMethod = "GET"
             request.timeoutInterval = 3.0
             let apiKey = UserDefaults.standard.string(forKey: "cloud_api_key") ?? ""
-            if !apiKey.isEmpty {
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            if isAnthropic {
+                if !apiKey.isEmpty {
+                    request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                }
+                request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            } else {
+                if !apiKey.isEmpty {
+                    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                }
             }
             do {
                 let (_, response) = try await session.data(for: request)
@@ -3162,53 +5009,67 @@ struct ExtractionGroup: Identifiable, Equatable {
         }
     }
     
-    /// Ensures local Ollama is running. Used for lazy startup when a cloud provider
-    /// is selected but a vision request needs to fall back to a local vision model.
+    private static var isStartingLocalOllama = false
+    
+    /// Ensures local Ollama is running safely without spawning duplicate zombie processes.
     func ensureLocalOllamaRunning() async {
-        // Quick check — is it already running?
         let url = baseURL.appendingPathComponent("api/tags")
         var request = URLRequest(url: url)
-        request.timeoutInterval = 1.0
-        do {
-            _ = try await session.data(for: request)
-            return // Already running
-        } catch {
-            // Not running — start it
+        request.timeoutInterval = 2.5
+        if let _ = try? await session.data(for: request) {
+            return // Running and healthy
         }
         
-        self.logToFile("[AI Helper LOG] Starting local Ollama for vision fallback...")
-        let process = Process()
-        let paths = [
-            "/opt/homebrew/bin/ollama",
-            "/usr/local/bin/ollama",
-            "/Applications/Ollama.app/Contents/Resources/ollama"
-        ]
-        var execPath = "ollama"
-        for p in paths {
-            if FileManager.default.fileExists(atPath: p) {
-                execPath = p
-                break
+        guard !Self.isStartingLocalOllama else { return }
+        Self.isStartingLocalOllama = true
+        defer { Self.isStartingLocalOllama = false }
+        
+        // Check if an Ollama process is already running in macOS
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-x", "ollama"]
+        if (try? pgrep.run()) != nil {
+            pgrep.waitUntilExit()
+            if pgrep.terminationStatus == 0 {
+                self.logToFile("[AI Helper LOG] Ollama process already active in system, awaiting readiness...")
+                for _ in 0..<5 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    var checkReq = URLRequest(url: url)
+                    checkReq.timeoutInterval = 2.0
+                    if let _ = try? await session.data(for: checkReq) {
+                        return
+                    }
+                }
+                return
             }
         }
-        process.executableURL = URL(fileURLWithPath: execPath)
-        process.arguments = ["serve"]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        
+        self.logToFile("[AI Helper LOG] Launching Ollama application...")
+        let openTask = Process()
+        openTask.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        if FileManager.default.fileExists(atPath: "/Applications/Ollama.app") {
+            openTask.arguments = ["-a", "Ollama", "--background"]
+        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/ollama") {
+            openTask.executableURL = URL(fileURLWithPath: "/usr/local/bin/ollama")
+            openTask.arguments = ["serve"]
+        } else {
+            openTask.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ollama")
+            openTask.arguments = ["serve"]
+        }
         do {
-            try process.run()
-            // Wait for Ollama to be ready (up to 10 seconds)
+            try openTask.run()
             for _ in 0..<10 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 var checkReq = URLRequest(url: url)
-                checkReq.timeoutInterval = 1.0
+                checkReq.timeoutInterval = 1.5
                 if let _ = try? await session.data(for: checkReq) {
-                    self.logToFile("[AI Helper LOG] Local Ollama started successfully for vision fallback.")
+                    self.logToFile("[AI Helper LOG] Local Ollama is now ready.")
                     return
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
-            self.logToFile("[AI Helper LOG] Local Ollama did not become ready within 10s.")
+            self.logToFile("[AI Helper LOG] Local Ollama did not respond within 10s.")
         } catch {
-            self.logToFile("[AI Helper LOG] Error starting local Ollama: \(error)")
+            self.logToFile("[AI Helper LOG] Failed to launch Ollama: \(error.localizedDescription)")
         }
     }
     
@@ -3389,8 +5250,8 @@ struct ExtractionGroup: Identifiable, Equatable {
     
     func generateProblemSolution(content: String) async -> String {
         await withUserPriority {
-            let useLocal = isTaskLocal("route_math", defaultLocal: false)
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let provider = taskProvider(for: "route_math", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
             let prompt = """
             You are an expert physics solver. Solve the following practice problem step-by-step:
             ---
@@ -3400,14 +5261,14 @@ struct ExtractionGroup: Identifiable, Equatable {
             ALWAYS wrap all inline math variables, formulas, and math symbols in single dollar signs (e.g. $x_i$, $\theta$), and all block equations in double dollar signs (e.g. $$E = mc^2$$) on their own lines. Never output naked equations or symbols without delimiters.
             Output ONLY the final solution and explanation. Do not include conversational introduction or general filler.
             """
-            return await callOllama(prompt: prompt, model: model, timeout: 120.0, forceLocal: useLocal) ?? ""
+            return await callOllama(prompt: prompt, model: model, timeout: 120.0, overrideProvider: provider) ?? ""
         }
     }
     
     func generateProblemSteps(content: String, solution: String) async -> [String] {
         await withUserPriority {
-            let useLocal = isTaskLocal("route_steps", defaultLocal: false)
-            let model = await getOllamaModel(forceLocal: useLocal)
+            let provider = taskProvider(for: "route_steps", defaultProvider: "tailscale")
+            let model = await getOllamaModel(forProvider: provider, forceLocal: provider == "local")
             self.logToFile("[AI Helper LOG] generateProblemSteps called for content: '\(content.prefix(60))...' with solution: '\(solution.prefix(60))...'")
             let prompt = """
             You are a physics teaching assistant. Break down the following practice problem and its solution into a sequence of simple, clear step-by-step instructions or scaffolding questions.
@@ -3423,8 +5284,8 @@ struct ExtractionGroup: Identifiable, Equatable {
             Format the output strictly as a list with each step starting with 'Step X:' (e.g. 'Step 1: Calculate the charge...', 'Step 2: Find the electric field...').
             Do NOT include introduction, general filler, or raw markdown lists. Output only the steps.
             """
-            self.logToFile("[AI Helper LOG] Sending prompt to Ollama (\(model))...")
-            guard let res = await callOllama(prompt: prompt, model: model, timeout: 120.0, forceLocal: useLocal) else {
+            self.logToFile("[AI Helper LOG] Sending prompt to Ollama (\(model), provider: \(provider))...")
+            guard let res = await callOllama(prompt: prompt, model: model, timeout: 120.0, overrideProvider: provider) else {
                 self.logToFile("[AI Helper LOG] callOllama returned nil in generateProblemSteps")
                 return []
             }
@@ -3536,10 +5397,10 @@ struct ExtractionGroup: Identifiable, Equatable {
             if let response = await callOllama(prompt: prompt, model: model) {
                 self.logToFile("[AI Helper LOG] Response received (length \(response.count)): '\(response.prefix(150))...'")
                 
-                if let start = response.firstIndex(of: "["),
-                   let end = response.lastIndex(of: "]"),
-                   start <= end {
-                    let jsonSubstring = String(response[start...end])
+                let strippedResponse = response.replacingOccurrences(of: #"(?s)<think>.*?</think>"#, with: "", options: .regularExpression)
+                let arrayPattern = #"\[\s*\d+(?:\s*,\s*\d+)*\s*\]"#
+                if let range = strippedResponse.range(of: arrayPattern, options: .regularExpression) {
+                    let jsonSubstring = String(strippedResponse[range])
                     if let data = jsonSubstring.data(using: .utf8),
                        let ids = try? JSONSerialization.jsonObject(with: data, options: []) as? [Int],
                        !ids.isEmpty {
@@ -3549,7 +5410,7 @@ struct ExtractionGroup: Identifiable, Equatable {
                         self.logToFile("[AI Helper LOG] Substring JSON array extraction failed for string: '\(jsonSubstring.prefix(100))'")
                     }
                 } else {
-                    self.logToFile("[AI Helper LOG] No '[' or ']' brackets found in response.")
+                    self.logToFile("[AI Helper LOG] No integer JSON array found in response.")
                 }
             } else {
                 self.logToFile("[AI Helper LOG] callOllama returned nil during pre-exam curation.")

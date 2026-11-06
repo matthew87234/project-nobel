@@ -460,7 +460,9 @@ struct PostLectureView: View {
             } else if parsingConcepts {
                 if trimmed.hasPrefix("-") || trimmed.hasPrefix("•") || trimmed.hasPrefix("*") {
                     let concept = String(trimmed.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
-                    conceptsVal.append(concept)
+                    if !concept.isEmpty && !concept.lowercased().hasPrefix("none") {
+                        conceptsVal.append(concept)
+                    }
                 }
             }
         }

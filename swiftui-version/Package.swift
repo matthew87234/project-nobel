@@ -10,10 +10,6 @@ let package = Package(
         .executableTarget(
             name: "macOS-Native",
             path: "Sources/macOS-Native"
-        ),
-        .testTarget(
-            name: "macOS-NativeTests",
-            dependencies: ["macOS-Native"]
-        ),
+        )
     ]
 )

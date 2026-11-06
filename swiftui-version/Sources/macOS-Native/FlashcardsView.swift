@@ -58,102 +58,429 @@ enum SessionFocusFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+struct FlashcardScheduler {
+    /// Shuffles cards while interleaving across modules in randomized round-robin waves
+    /// so cards from the same module do not clump together in multi-module study mode.
+    static func interleavedShuffle(_ cards: [Flashcard]) -> [Flashcard] {
+        guard cards.count > 1 else { return cards }
+        var byModule: [Int: [Flashcard]] = [:]
+        for card in cards {
+            byModule[card.moduleId, default: []].append(card)
+        }
+        if byModule.count <= 1 {
+            return cards.shuffled()
+        }
+        for modId in byModule.keys {
+            byModule[modId]?.shuffle()
+        }
+        var result: [Flashcard] = []
+        result.reserveCapacity(cards.count)
+        while !byModule.isEmpty {
+            let activeModIds = Array(byModule.keys).shuffled()
+            for modId in activeModIds {
+                if var list = byModule[modId], !list.isEmpty {
+                    result.append(list.removeFirst())
+                    if list.isEmpty {
+                        byModule.removeValue(forKey: modId)
+                    } else {
+                        byModule[modId] = list
+                    }
+                }
+            }
+        }
+        return result
+    }
+    
+    /// Builds a prioritized, randomized session deck that prevents 1-day interval cards
+    /// from starving brand-new untouched cards (`repetitions == 0 && interval == 0`)
+    /// and oldest overdue cards, then shuffles the chosen deck across modules.
+    static func buildSessionDeck(
+        candidates: [Flashcard],
+        targetCount: Int,
+        today: String,
+        studyAhead: Bool,
+        recentlyReviewedIds: Set<Int> = []
+    ) -> [Flashcard] {
+        guard !candidates.isEmpty else { return [] }
+        let limit = targetCount > 0 ? min(targetCount, candidates.count) : candidates.count
+        
+        let freshPool = candidates.filter { !recentlyReviewedIds.contains($0.id) }
+        let recentPool = candidates.filter { recentlyReviewedIds.contains($0.id) }
+        
+        var selected = selectPrioritizedCards(from: freshPool, count: limit, today: today, studyAhead: studyAhead)
+        if selected.count < limit && !recentPool.isEmpty {
+            let needed = limit - selected.count
+            let fallback = selectPrioritizedCards(from: recentPool, count: needed, today: today, studyAhead: studyAhead)
+            selected.append(contentsOf: fallback)
+        }
+        
+        return interleavedShuffle(selected)
+    }
+    
+    private static func selectPrioritizedCards(
+        from pool: [Flashcard],
+        count: Int,
+        today: String,
+        studyAhead: Bool
+    ) -> [Flashcard] {
+        guard !pool.isEmpty, count > 0 else { return [] }
+        if pool.count <= count {
+            return pool
+        }
+        
+        if studyAhead {
+            // Prioritize cards with fewer repetitions and earlier review dates, randomized within repetition tiers
+            let groupedByReps = Dictionary(grouping: pool) { $0.repetitions }
+            var ordered: [Flashcard] = []
+            for reps in groupedByReps.keys.sorted() {
+                if let tier = groupedByReps[reps] {
+                    ordered.append(contentsOf: interleavedShuffle(tier))
+                }
+                if ordered.count >= count { break }
+            }
+            return Array(ordered.prefix(count))
+        }
+        
+        // 1. Brand-new untouched cards (never reviewed once: repetitions == 0 && interval == 0)
+        var untouched = interleavedShuffle(pool.filter { $0.repetitions == 0 && $0.interval == 0 })
+        
+        // 2. Overdue cards (already reviewed or scheduled in the past: nextReviewDate < today)
+        let overdueRaw = pool.filter {
+            !($0.repetitions == 0 && $0.interval == 0) &&
+            !$0.nextReviewDate.isEmpty &&
+            $0.nextReviewDate < today
+        }
+        // Group overdue cards by their due date (oldest first) and shuffle within each date bucket
+        let overdueByDate = Dictionary(grouping: overdueRaw) { $0.nextReviewDate }
+        var overdue: [Flashcard] = []
+        for dateKey in overdueByDate.keys.sorted() {
+            if let bucket = overdueByDate[dateKey] {
+                overdue.append(contentsOf: interleavedShuffle(bucket))
+            }
+        }
+        
+        // 3. Due today (including yesterday's 1-day interval cards whose nextReviewDate == today)
+        var dueToday = interleavedShuffle(pool.filter {
+            !($0.repetitions == 0 && $0.interval == 0) &&
+            ($0.nextReviewDate.isEmpty || $0.nextReviewDate >= today)
+        })
+        
+        var chosen: [Flashcard] = []
+        chosen.reserveCapacity(count)
+        
+        // Allocate up to 50% of session to untouched cards first so unseen cards are never starved
+        let untouchedQuota = min(untouched.count, max(1, Int(ceil(Double(count) * 0.5))))
+        if untouchedQuota > 0 {
+            chosen.append(contentsOf: untouched.prefix(untouchedQuota))
+            untouched.removeFirst(untouchedQuota)
+        }
+        
+        // Next, fill from oldest overdue cards
+        let remainingAfterUntouched = count - chosen.count
+        if remainingAfterUntouched > 0 && !overdue.isEmpty {
+            let takeOverdue = min(remainingAfterUntouched, overdue.count)
+            chosen.append(contentsOf: overdue.prefix(takeOverdue))
+            overdue.removeFirst(takeOverdue)
+        }
+        
+        // Next, fill from cards due today
+        let remainingAfterOverdue = count - chosen.count
+        if remainingAfterOverdue > 0 && !dueToday.isEmpty {
+            let takeToday = min(remainingAfterOverdue, dueToday.count)
+            chosen.append(contentsOf: dueToday.prefix(takeToday))
+            dueToday.removeFirst(takeToday)
+        }
+        
+        // Finally, if slots still remain (e.g. >50% of due pool is brand-new untouched cards), top up from remaining untouched/overdue
+        if chosen.count < count && !untouched.isEmpty {
+            let needed = min(count - chosen.count, untouched.count)
+            chosen.append(contentsOf: untouched.prefix(needed))
+        }
+        if chosen.count < count && !overdue.isEmpty {
+            let needed = min(count - chosen.count, overdue.count)
+            chosen.append(contentsOf: overdue.prefix(needed))
+        }
+        
+        return chosen
+    }
+    
+    private static func round1(_ value: Double) -> Double {
+        return (value * 10.0).rounded() / 10.0
+    }
+    
+    /// Calculates the next SM-2 review interval in days (to 1 decimal place) for the 5-button scale.
+    /// Uses the card's ease factor directly on every review so no two cards with different ease/intervals show identical flat numbers.
+    static func calculateNextInterval(card: Flashcard, quality: Int) -> Double {
+        if quality == 1 {
+            return 1.0
+        }
+        
+        let effectiveReps = (card.repetitions == 0 && card.interval > 0) ? 1 : card.repetitions
+        let ease = max(1.3, card.easeFactor)
+        
+        if effectiveReps == 0 {
+            switch quality {
+            case 2: return round1(max(1.2, 0.8 * ease)) // Hard (~2.0d at ease 2.5)
+            case 3: return round1(max(2.0, 1.5 * ease)) // Good (~3.8d at ease 2.5)
+            case 4: return round1(max(3.5, 2.5 * ease)) // Easy (~6.3d at ease 2.5)
+            case 5: return round1(max(5.0, 3.8 * ease)) // Perfect (~9.5d at ease 2.5)
+            default: return 1.0
+            }
+        }
+        
+        let base = max(card.interval, 1.8 + 0.6 * Double(effectiveReps))
+        switch quality {
+        case 2: // Hard
+            return round1(max(card.interval + 0.8, base * 1.25))
+        case 3: // Good
+            return round1(max(card.interval + 1.5, base * ease))
+        case 4: // Easy
+            return round1(max(card.interval + 3.0, base * ease * 1.3))
+        case 5: // Perfect
+            return round1(max(card.interval + 5.0, base * ease * 1.6))
+        default:
+            return 1.0
+        }
+    }
+    
+    static func calculateNextRepetitions(card: Flashcard, quality: Int) -> Int {
+        let effectiveReps = (card.repetitions == 0 && card.interval > 0) ? 1 : card.repetitions
+        if quality >= 3 {
+            return effectiveReps + 1
+        } else if quality == 2 {
+            // Hard means recalled with effort; keep progress at >= 1 so it does not reset like Again (1)
+            return max(1, effectiveReps)
+        } else {
+            return 0
+        }
+    }
+    
+    /// Updates ease factor calibrated for a 5-button scale (where 3 = Good is neutral +0.00, not -0.14).
+    static func calculateNextEaseFactor(currentEase: Double, quality: Int) -> Double {
+        let delta: Double
+        switch quality {
+        case 1: delta = -0.20 // Again
+        case 2: delta = -0.15 // Hard
+        case 3: delta = 0.00  // Good (neutral — do not penalize ease on Good recall)
+        case 4: delta = 0.10  // Easy
+        case 5: delta = 0.15  // Perfect
+        default: delta = 0.00
+        }
+        return max(1.3, currentEase + delta)
+    }
+}
+
+struct FlipCardEffect<Back: View>: AnimatableModifier {
+    var angle: Double
+    let backView: Back
+    
+    var animatableData: Double {
+        get { angle }
+        set { angle = newValue }
+    }
+    
+    func body(content: Content) -> some View {
+        let normalizedAngle = angle.truncatingRemainder(dividingBy: 360)
+        let positiveAngle = normalizedAngle < 0 ? normalizedAngle + 360 : normalizedAngle
+        let isShowingFront = positiveAngle < 90 || positiveAngle > 270
+        let lift = abs(sin(positiveAngle * .pi / 180.0))
+        
+        ZStack {
+            content
+                .opacity(isShowingFront ? 1.0 : 0.0)
+                .allowsHitTesting(isShowingFront)
+                .rotation3DEffect(
+                    .degrees(angle),
+                    axis: (x: 0.0, y: 1.0, z: 0.0),
+                    perspective: 0.55
+                )
+            
+            backView
+                .opacity(isShowingFront ? 0.0 : 1.0)
+                .allowsHitTesting(!isShowingFront)
+                .rotation3DEffect(
+                    .degrees(angle - 180.0),
+                    axis: (x: 0.0, y: 1.0, z: 0.0),
+                    perspective: 0.55
+                )
+        }
+        .scaleEffect(1.0 + 0.025 * lift)
+        .shadow(
+            color: Color.black.opacity(0.08 + 0.07 * lift),
+            radius: 6.0 + 9.0 * lift,
+            x: 0,
+            y: 3.0 + 6.0 * lift
+        )
+    }
+}
+
 struct FlipCardView: View {
     let front: String
     let back: String
-    @Binding var isFlipped: Bool
+    var isFlipped: Bool
     var isFlagged: Bool = false
+    var moduleName: String? = nil
+    var moduleCode: String? = nil
     var onToggleFlag: (() -> Void)? = nil
     
-    var body: some View {
-        ZStack {
-            // Front Card
-            VStack {
-                HStack {
-                    Spacer()
-                    if isFlagged {
-                        Image(systemName: "flag.fill")
-                            .foregroundColor(.purple)
-                            .padding(.top, 14)
-                            .padding(.trailing, 16)
-                    }
-                }
-                Spacer()
-                if isLaTeX(front) {
-                    LaTeXView(latex: front)
-                        .frame(height: 130)
-                        .padding(.horizontal, 20)
-                } else {
-                    Text(front)
-                        .font(.system(size: 20, weight: .medium))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 25)
-                }
-                Spacer()
-                Text("Click to Flip")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .padding(.bottom, 14)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(NSColor.controlBackgroundColor))
-            .cornerRadius(16)
-            .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 3)
-            .opacity(isFlipped ? 0.0 : 1.0)
-            .rotation3DEffect(.degrees(isFlipped ? 180 : 0), axis: (x: 0.0, y: 1.0, z: 0.0))
-            
-            // Back Card
-            VStack {
-                HStack {
-                    Spacer()
-                    if let onToggleFlag = onToggleFlag {
-                        Button(action: onToggleFlag) {
-                            HStack(spacing: 4) {
-                                Image(systemName: isFlagged ? "flag.fill" : "flag")
-                                    .foregroundColor(isFlagged ? .purple : .secondary)
-                                Text(isFlagged ? "Flagged" : "Flag")
-                                    .font(.caption)
-                                    .bold()
-                                    .foregroundColor(isFlagged ? .purple : .secondary)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(Color.purple.opacity(isFlagged ? 0.15 : 0.06))
-                            .cornerRadius(8)
-                        }
-                        .buttonStyle(.plain)
-                        .pointingHandCursor()
-                        .padding(.top, 12)
-                        .padding(.trailing, 14)
-                    }
-                }
-                Spacer()
-                if isLaTeX(back) {
-                    LaTeXView(latex: back)
-                        .frame(height: 130)
-                        .padding(.horizontal, 20)
-                } else {
-                    Text(back)
-                        .font(.system(size: 20, weight: .medium))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 25)
-                }
-                Spacer()
-                Text("Click to Flip")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .padding(.bottom, 14)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(NSColor.controlBackgroundColor))
-            .cornerRadius(16)
-            .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 3)
-            .opacity(isFlipped ? 1.0 : 0.0)
-            .rotation3DEffect(.degrees(isFlipped ? 0 : -180), axis: (x: 0.0, y: 1.0, z: 0.0))
+    @State private var isHoveringBadge: Bool = false
+    
+    private var moduleTooltip: String {
+        if let code = moduleCode, !code.isEmpty, let name = moduleName, !name.isEmpty {
+            return "\(code): \(name)"
         }
-        .frame(height: 280)
-        .frame(maxWidth: 520)
-        .pointingHandCursor()
+        return moduleName ?? moduleCode ?? "Module Context"
+    }
+    
+    @ViewBuilder
+    private var moduleBadge: some View {
+        if let name = moduleName, !name.isEmpty {
+            HStack(spacing: 5) {
+                Image(systemName: "book.closed")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                
+                Text(name)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.secondary.opacity(isHoveringBadge ? 0.16 : 0.08))
+            .cornerRadius(6)
+            .onHover { hovering in
+                isHoveringBadge = hovering
+            }
+            .help(moduleTooltip)
+        }
+    }
+    
+    @ViewBuilder
+    private var frontCard: some View {
+        VStack {
+            HStack(alignment: .center) {
+                moduleBadge
+                
+                Spacer()
+                
+                if isFlagged {
+                    Image(systemName: "flag.fill")
+                        .foregroundColor(.purple)
+                        .font(.system(size: 12))
+                        .padding(.trailing, 2)
+                }
+            }
+            .padding(.top, 12)
+            .padding(.horizontal, 14)
+            
+            Spacer()
+            if isLaTeX(front) {
+                LaTeXView(latex: front)
+                    .frame(height: 130)
+                    .padding(.horizontal, 20)
+            } else {
+                Text(front)
+                    .font(.system(size: 20, weight: .medium))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 25)
+            }
+            Spacer()
+            Text("Click to Flip")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.bottom, 14)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(NSColor.windowBackgroundColor))
+        )
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+    
+    @ViewBuilder
+    private var backCard: some View {
+        VStack {
+            HStack(alignment: .center) {
+                moduleBadge
+                
+                Spacer()
+                
+                if let onToggleFlag = onToggleFlag {
+                    Button(action: onToggleFlag) {
+                        HStack(spacing: 4) {
+                            Image(systemName: isFlagged ? "flag.fill" : "flag")
+                                .foregroundColor(isFlagged ? .purple : .secondary)
+                            Text(isFlagged ? "Flagged" : "Flag")
+                                .font(.caption)
+                                .bold()
+                                .foregroundColor(isFlagged ? .purple : .secondary)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.purple.opacity(isFlagged ? 0.15 : 0.06))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .pointingHandCursor()
+                }
+            }
+            .padding(.top, 12)
+            .padding(.horizontal, 14)
+            
+            Spacer()
+            if isLaTeX(back) {
+                LaTeXView(latex: back)
+                    .frame(height: 130)
+                    .padding(.horizontal, 20)
+            } else {
+                Text(back)
+                    .font(.system(size: 20, weight: .medium))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 25)
+            }
+            Spacer()
+            Text("Click to Flip")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.bottom, 14)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(NSColor.windowBackgroundColor))
+        )
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+    
+    var body: some View {
+        frontCard
+            .modifier(
+                FlipCardEffect(
+                    angle: isFlipped ? 180.0 : 0.0,
+                    backView: backCard
+                )
+            )
+            .frame(height: 280)
+            .frame(maxWidth: 520)
+            .pointingHandCursor()
     }
 }
 
@@ -301,11 +628,37 @@ struct FlashcardsView: View {
     @State private var dueCards: [Flashcard] = []
     @State private var sessionCards: [Flashcard] = []
     @State private var currentCardIdx: Int = 0
-    @State private var isFlipped: Bool = false
+    @State private var flippedCardKey: String? = nil
+    
+    private var isFlipped: Bool {
+        guard currentCardIdx < sessionCards.count else { return false }
+        return flippedCardKey == "\(sessionCards[currentCardIdx].id)_\(currentCardIdx)"
+    }
+    
+    private func toggleCurrentCardFlip() {
+        guard currentCardIdx < sessionCards.count else { return }
+        let key = "\(sessionCards[currentCardIdx].id)_\(currentCardIdx)"
+        if flippedCardKey == key {
+            flippedCardKey = nil
+        } else {
+            flippedCardKey = key
+        }
+    }
+    
+    private func setCurrentCardFlipped(_ flipped: Bool) {
+        guard currentCardIdx < sessionCards.count else { return }
+        let key = "\(sessionCards[currentCardIdx].id)_\(currentCardIdx)"
+        if flipped {
+            flippedCardKey = key
+        } else if flippedCardKey == key {
+            flippedCardKey = nil
+        }
+    }
     @State private var fcTimerSeconds: Int = 0
     @State private var fcTimer: Timer?
     @State private var requeuedCount: Int = 0
     @State private var cardRequeueCounts: [Int: Int] = [:]
+    @State private var recentSessionCardIds: Set<Int> = []
     
     // Session Presets & Settings State
     @State private var selectedPreset: SessionPreset = .optimal
@@ -316,6 +669,7 @@ struct FlashcardsView: View {
     @State private var cardsReviewedInSession: Int = 0
     @State private var isSessionComplete: Bool = false
     @State private var allCards: [Flashcard] = []
+    @State private var modulesDict: [Int: Module] = [:]
     
     // Idle 5-Minute Prompt & Graph Popups State
     @State private var secondsSinceLastCard: Int = 0
@@ -349,6 +703,7 @@ struct FlashcardsView: View {
             }
         }
         .onAppear {
+            loadModules()
             if currentMode != .review || sessionCards.isEmpty || isSessionComplete {
                 currentMode = mode
             }
@@ -382,6 +737,12 @@ struct FlashcardsView: View {
                 loadInitialData()
             }
         }
+        .onChange(of: activeYear) { oldValue, newValue in
+            loadModules()
+            if isActive {
+                loadInitialData()
+            }
+        }
         .onChange(of: isActive) { oldValue, newValue in
             if newValue {
                 if currentMode == .review && !sessionCards.isEmpty && !isSessionComplete {
@@ -408,7 +769,13 @@ struct FlashcardsView: View {
         }
     }
     
+    private func loadModules() {
+        let all = DatabaseManager.shared.getModules()
+        self.modulesDict = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
+    }
+    
     private func loadInitialData() {
+        loadModules()
         if currentMode == .manage {
             loadAllCards()
         } else if currentMode == .review {
@@ -437,7 +804,8 @@ struct FlashcardsView: View {
                 
                 if fcTimerSeconds % 10 == 0 {
                     DatabaseManager.shared.addStudyTime(flashcardsDelta: 10, problemsDelta: 0)
-                    if let modId = activeModuleId {
+                    let modId = (currentCardIdx < sessionCards.count) ? sessionCards[currentCardIdx].moduleId : activeModuleId
+                    if let modId = modId {
                         DatabaseManager.shared.addModuleStudyTime(moduleId: modId, flashcardsDelta: 10, problemsDelta: 0)
                     }
                 }
@@ -452,7 +820,8 @@ struct FlashcardsView: View {
     private func deductIdleTime(seconds: Int) {
         fcTimerSeconds = max(0, fcTimerSeconds - seconds)
         DatabaseManager.shared.addStudyTime(flashcardsDelta: -seconds, problemsDelta: 0)
-        if let modId = activeModuleId {
+        let modId = (currentCardIdx < sessionCards.count) ? sessionCards[currentCardIdx].moduleId : activeModuleId
+        if let modId = modId {
             DatabaseManager.shared.addModuleStudyTime(moduleId: modId, flashcardsDelta: -seconds, problemsDelta: 0)
         }
     }
@@ -461,7 +830,8 @@ struct FlashcardsView: View {
         let remainder = fcTimerSeconds % 10
         if remainder > 0 {
             DatabaseManager.shared.addStudyTime(flashcardsDelta: remainder, problemsDelta: 0)
-            if let modId = activeModuleId {
+            let modId = (currentCardIdx < sessionCards.count) ? sessionCards[currentCardIdx].moduleId : activeModuleId
+            if let modId = modId {
                 DatabaseManager.shared.addModuleStudyTime(moduleId: modId, flashcardsDelta: remainder, problemsDelta: 0)
             }
         }
@@ -511,6 +881,9 @@ struct FlashcardsView: View {
     }
     
     private func startNewSession(studyAhead: Bool = false) {
+        if modulesDict.isEmpty {
+            loadModules()
+        }
         let cardCount = (selectedPreset == .custom) ? customCardCount : selectedPreset.baseCardCount
         targetCardCount = cardCount
         targetSessionMinutes = estimatedMinutes(forCardCount: cardCount)
@@ -523,22 +896,31 @@ struct FlashcardsView: View {
         switch sessionFocusFilter {
         case .allDue:
             if studyAhead {
-                pool = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId).shuffled()
+                pool = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
             } else {
-                pool = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today).shuffled()
+                pool = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today)
             }
         case .lowEase:
-            let all = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
-            pool = all.filter { $0.easeFactor < 2.3 }.shuffled()
+            if studyAhead {
+                let all = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
+                pool = all.filter { $0.easeFactor < 2.3 }
+            } else {
+                let due = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today)
+                pool = due.filter { $0.easeFactor < 2.3 }
+            }
         }
         
-        if cardCount > 0 && pool.count > cardCount {
-            pool = Array(pool.prefix(cardCount))
-        }
+        pool = FlashcardScheduler.buildSessionDeck(
+            candidates: pool,
+            targetCount: cardCount,
+            today: today,
+            studyAhead: studyAhead,
+            recentlyReviewedIds: recentSessionCardIds
+        )
         
         self.sessionCards = pool
         self.currentCardIdx = 0
-        self.isFlipped = false
+        self.flippedCardKey = nil
         self.cardRequeueCounts.removeAll()
         self.cardsReviewedInSession = 0
         self.requeuedCount = 0
@@ -867,17 +1249,25 @@ struct FlashcardsView: View {
                         Spacer()
                     }
                     
+                    let currentMod = modulesDict[card.moduleId]
+                    let cardKey = "\(card.id)_\(currentCardIdx)"
+                    let isCardFlipped = (flippedCardKey == cardKey)
+                    
                     FlipCardView(
                         front: card.front,
                         back: card.back,
-                        isFlipped: $isFlipped,
+                        isFlipped: isCardFlipped,
                         isFlagged: card.isFlagged,
+                        moduleName: currentMod?.name,
+                        moduleCode: currentMod?.code,
                         onToggleFlag: { toggleCurrentCardFlag() }
                     )
+                    .id(cardKey)
+                    .transition(.opacity)
                     .pointingHandCursor()
                     .onTapGesture {
-                        withAnimation(.spring()) {
-                            isFlipped.toggle()
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                            toggleCurrentCardFlip()
                         }
                     }
                     
@@ -965,7 +1355,7 @@ struct FlashcardsView: View {
                     } else {
                         Button("Show Answer") {
                             withAnimation(.spring()) {
-                                isFlipped = true
+                                setCurrentCardFlipped(true)
                             }
                         }
                         .buttonStyle(.borderedProminent)
@@ -981,8 +1371,8 @@ struct FlashcardsView: View {
             ZStack {
                 if !sessionCards.isEmpty && currentCardIdx < sessionCards.count && !isSessionComplete {
                     Button("") {
-                        withAnimation(.spring()) {
-                            isFlipped.toggle()
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                            toggleCurrentCardFlip()
                         }
                     }
                     .keyboardShortcut(.space, modifiers: [])
@@ -1120,73 +1510,53 @@ struct FlashcardsView: View {
         switch sessionFocusFilter {
         case .allDue:
             if studyAhead {
-                cards = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId).shuffled()
+                cards = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
             } else {
-                cards = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today).shuffled()
+                cards = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today)
             }
         case .lowEase:
-            let all = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
-            cards = all.filter { $0.easeFactor < 2.3 }.shuffled()
+            if studyAhead {
+                let all = DatabaseManager.shared.getFlashcards(forYear: targetYear, forModuleId: targetModId)
+                cards = all.filter { $0.easeFactor < 2.3 }
+            } else {
+                let due = DatabaseManager.shared.getDueFlashcards(forYear: targetYear, forModuleId: targetModId, today: today)
+                cards = due.filter { $0.easeFactor < 2.3 }
+            }
         }
         
-        if let maxCards = limit, cards.count > maxCards {
-            cards = Array(cards.prefix(maxCards))
-        }
+        cards = FlashcardScheduler.buildSessionDeck(
+            candidates: cards,
+            targetCount: limit ?? cards.count,
+            today: today,
+            studyAhead: studyAhead,
+            recentlyReviewedIds: recentSessionCardIds
+        )
         
         self.dueCards = cards
     }
     
-    private func calculateNextInterval(card: Flashcard, quality: Int) -> Int {
-        if quality == 1 {
-            return 1
-        }
-        
-        let reps = card.repetitions
-        let ease = card.easeFactor
-        
-        switch quality {
-        case 2: // Hard
-            if reps == 0 { return 1 }
-            return max(1, Int(Double(card.interval) * 1.2))
-        case 3: // Good
-            if reps == 0 { return 2 }
-            if reps == 1 { return 6 }
-            return max(2, Int(Double(card.interval) * ease))
-        case 4: // Easy
-            if reps == 0 { return 4 }
-            if reps == 1 { return 10 }
-            return max(4, Int(Double(card.interval) * ease * 1.3))
-        case 5: // Perfect
-            if reps == 0 { return 7 }
-            if reps == 1 { return 14 }
-            return max(7, Int(Double(card.interval) * ease * 1.6))
-        default:
-            return 1
-        }
+    private func calculateNextInterval(card: Flashcard, quality: Int) -> Double {
+        return FlashcardScheduler.calculateNextInterval(card: card, quality: quality)
     }
     
     private func rateRecall(quality: Int) {
         guard currentCardIdx < sessionCards.count else { return }
         let card = sessionCards[currentCardIdx]
         
-        // SM-2 Spaced Repetition Algorithm
+        // SM-2 Spaced Repetition Algorithm (5-button scale, 1-decimal-place interval)
         let interval = calculateNextInterval(card: card, quality: quality)
-        var easeFactor = card.easeFactor
-        var repetitions = card.repetitions
-        
-        if quality >= 3 {
-            repetitions += 1
-        } else {
-            repetitions = 0
-        }
-        
-        easeFactor = easeFactor + (0.1 - (5.0 - Double(quality)) * (0.08 + (5.0 - Double(quality)) * 0.02))
-        if easeFactor < 1.3 {
-            easeFactor = 1.3
-        }
+        let easeFactor = FlashcardScheduler.calculateNextEaseFactor(
+            currentEase: card.easeFactor,
+            quality: quality
+        )
+        let repetitions = FlashcardScheduler.calculateNextRepetitions(
+            card: card,
+            quality: quality
+        )
         
         let calendar = Calendar.current
-        let nextReview = calendar.date(byAdding: .day, value: interval, to: Date()) ?? Date()
+        let daysToAdd = max(1, Int(interval.rounded()))
+        let nextReview = calendar.date(byAdding: .day, value: daysToAdd, to: Date()) ?? Date()
         let nextReviewStr = formatDate(nextReview)
         
         _ = DatabaseManager.shared.updateFlashcardReview(
@@ -1197,28 +1567,43 @@ struct FlashcardsView: View {
             nextReviewDate: nextReviewStr
         )
         
+        recentSessionCardIds.insert(card.id)
+        
         // Log study activity
-        DatabaseManager.shared.logActivity("flashcard", moduleId: activeModuleId)
+        DatabaseManager.shared.logActivity("flashcard", moduleId: card.moduleId)
         secondsSinceLastCard = 0
         
-        // If rating is 1 (Again), re-queue card to the end of the pile max 2 times (3 total views)
+        // If rating is 1 (Again), re-queue card into the latter portion of the remaining deck max 2 times (3 total views)
         if quality == 1 {
             let previousRequeues = cardRequeueCounts[card.id, default: 0]
             if previousRequeues < 2 {
                 cardRequeueCounts[card.id] = previousRequeues + 1
-                sessionCards.append(card)
+                var updatedCard = card
+                updatedCard.interval = interval
+                updatedCard.easeFactor = easeFactor
+                updatedCard.repetitions = repetitions
+                updatedCard.nextReviewDate = nextReviewStr
+                
+                let remaining = sessionCards.count - (currentCardIdx + 1)
+                if remaining >= 4 {
+                    let minOffset = max(3, remaining / 2)
+                    let insertIdx = Int.random(in: (currentCardIdx + 1 + minOffset)...sessionCards.count)
+                    sessionCards.insert(updatedCard, at: insertIdx)
+                } else {
+                    sessionCards.append(updatedCard)
+                }
                 requeuedCount += 1
             }
         }
         
-        // Advance
-        withAnimation {
-            isFlipped = false
+        // Advance: Card N stays on its answer while smoothly fading out, Card N+1 enters on its question
+        withAnimation(.easeInOut(duration: 0.15)) {
             cardsReviewedInSession += 1
             if currentCardIdx + 1 < sessionCards.count {
                 currentCardIdx += 1
             } else {
                 isSessionComplete = true
+                flippedCardKey = nil
                 fcTimer?.invalidate()
                 logActiveSeconds()
             }
@@ -1231,12 +1616,10 @@ struct FlashcardsView: View {
         }
         
         let interval = calculateNextInterval(card: card, quality: quality)
-        if interval <= 1 {
-            return "1d"
-        } else if interval < 30 {
-            return "\(interval)d"
+        if interval < 30.0 {
+            return String(format: "%.1fd", interval)
         } else {
-            let months = String(format: "%.1f", Double(interval) / 30.0)
+            let months = String(format: "%.1f", interval / 30.0)
             return "\(months)mo"
         }
     }
@@ -1253,7 +1636,10 @@ struct FlashcardsView: View {
     }
     
     private func setupFlaggedCorrectionQueue() {
-        let flagged = allCards.filter { $0.isFlagged }
+        let flagged = DatabaseManager.shared.getFlaggedFlashcards(
+            forYear: activeModuleId == nil ? activeYear : nil,
+            forModuleId: activeModuleId
+        )
         self.flaggedCorrectionQueue = flagged
         self.flaggedCardIdx = 0
         if !flagged.isEmpty {
@@ -1278,7 +1664,10 @@ struct FlashcardsView: View {
         }
         loadAllCards()
         
-        let flaggedRemaining = allCards.filter { $0.isFlagged }
+        let flaggedRemaining = DatabaseManager.shared.getFlaggedFlashcards(
+            forYear: activeModuleId == nil ? activeYear : nil,
+            forModuleId: activeModuleId
+        )
         self.flaggedCorrectionQueue = flaggedRemaining
         
         if flaggedCardIdx < flaggedRemaining.count {
@@ -1325,7 +1714,12 @@ struct FlashcardsView: View {
                                 Text("Question (Front):").bold()
                                 if isGeneratingFrontLatex {
                                     Spacer()
-                                    TypingIndicatorBubble()
+                                    HStack(spacing: 5) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Generating LaTeX...")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                             }
                             
@@ -1351,7 +1745,12 @@ struct FlashcardsView: View {
                                 Text("Answer (Back):").bold()
                                 if isGeneratingBackLatex {
                                     Spacer()
-                                    TypingIndicatorBubble()
+                                    HStack(spacing: 5) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Generating LaTeX...")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                             }
                             
@@ -1488,7 +1887,12 @@ struct FlashcardsView: View {
                                     Text("Front Content:").bold()
                                     if isGeneratingFrontLatex {
                                         Spacer()
-                                        TypingIndicatorBubble()
+                                        HStack(spacing: 5) {
+                                            ProgressView().controlSize(.small)
+                                            Text("Generating LaTeX...")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
                                     }
                                 }
                                 
@@ -1514,7 +1918,12 @@ struct FlashcardsView: View {
                                     Text("Back Content:").bold()
                                     if isGeneratingBackLatex {
                                         Spacer()
-                                        TypingIndicatorBubble()
+                                        HStack(spacing: 5) {
+                                            ProgressView().controlSize(.small)
+                                            Text("Generating LaTeX...")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
                                     }
                                 }
                                 
@@ -1716,9 +2125,10 @@ struct FlashcardsView: View {
                             .bold()
                         
                         if isTranslatingLaTeX {
-                            HStack {
-                                TypingIndicatorBubble()
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
                                 Text("Translating equation via AI model...")
+                                    .font(.subheadline)
                                     .foregroundColor(.secondary)
                             }
                         } else {
@@ -1877,9 +2287,9 @@ struct FlashcardsView: View {
         self.isTranslatingLaTeX = false
         if let latex = res, !latex.isEmpty {
             if latex == "MODEL_NOT_FOUND" {
-                self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
+                self.latexResult = "No vision model found on AI server. Please configure or pull a vision model in Settings."
                 cleanUpPendingPlaceholders()
-                sendAppNotification(title: "Vision Model Missing", body: "Please pull qwen2.5vl on your AI server.")
+                sendAppNotification(title: "Vision Model Missing", body: "Please configure or pull a vision model on your AI server.")
             } else {
                 let wrapped = self.wrapInLaTeXDelimiters(latex)
                 self.latexResult = wrapped
@@ -1952,6 +2362,21 @@ struct FlashcardsView: View {
                 ForEach(allCards) { card in
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 6) {
+                            if let mod = modulesDict[card.moduleId] {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "book.closed")
+                                        .font(.system(size: 9, weight: .semibold))
+                                    Text("\(mod.code) • \(mod.name)")
+                                        .font(.caption2)
+                                        .bold()
+                                }
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.08))
+                                .cornerRadius(4)
+                            }
+                            
                             HStack(alignment: .top, spacing: 6) {
                                 if card.isFlagged {
                                     Image(systemName: "flag.fill")
@@ -2111,7 +2536,12 @@ struct EditFlashcardSheetView: View {
                             .bold()
                         if isGeneratingFrontLatex {
                             Spacer()
-                            TypingIndicatorBubble()
+                            HStack(spacing: 5) {
+                                ProgressView().controlSize(.small)
+                                Text("Generating LaTeX...")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
                     TextEditor(text: $frontText)
@@ -2157,7 +2587,12 @@ struct EditFlashcardSheetView: View {
                             .bold()
                         if isGeneratingBackLatex {
                             Spacer()
-                            TypingIndicatorBubble()
+                            HStack(spacing: 5) {
+                                ProgressView().controlSize(.small)
+                                Text("Generating LaTeX...")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
                     TextEditor(text: $backText)
@@ -2280,9 +2715,11 @@ struct EditFlashcardSheetView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Result LaTeX Code:").bold()
                         if isTranslatingLaTeX {
-                            HStack {
-                                TypingIndicatorBubble()
-                                Text("Translating equation via AI model...").foregroundColor(.secondary)
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text("Translating equation via AI model...")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
                             }
                         } else {
                             TextEditor(text: $latexResult)
@@ -2430,9 +2867,9 @@ struct EditFlashcardSheetView: View {
         self.isTranslatingLaTeX = false
         if let latex = res, !latex.isEmpty {
             if latex == "MODEL_NOT_FOUND" {
-                self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
+                self.latexResult = "No vision model found on AI server. Please configure or pull a vision model in Settings."
                 cleanUpPendingPlaceholders()
-                sendAppNotification(title: "Vision Model Missing", body: "Please pull qwen2.5vl on your AI server.")
+                sendAppNotification(title: "Vision Model Missing", body: "Please configure or pull a vision model on your AI server.")
             } else {
                 let wrapped = self.wrapInLaTeXDelimiters(latex)
                 self.latexResult = wrapped
@@ -2581,15 +3018,16 @@ struct EditFlashcardSheetView: View {
             
             Divider()
             
+            let targetModId = isExamMode ? activeModuleId : nil
             switch popup {
             case .weeklyAvgTime:
-                WeeklyAvgTimeChartView(moduleId: nil)
+                WeeklyAvgTimeChartView(moduleId: targetModId)
             case .dueProjection:
-                DueProjectionChartView(moduleId: nil)
+                DueProjectionChartView(moduleId: targetModId)
             case .easeDistribution:
                 EaseDistributionChartView(allCards: allCards)
             case .cumulativeCreated:
-                CumulativeCreatedChartView(moduleId: nil, allCards: allCards)
+                CumulativeCreatedChartView(moduleId: targetModId, allCards: allCards)
             }
         }
         .padding(24)
@@ -2611,9 +3049,6 @@ struct WeeklyAvgTimeChartView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Card Completion Time Distribution")
                         .font(.headline)
-                    Text("Frequency of completion times over the past 7 days (Y: Frequency, X: Time Range)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
                 Spacer()
             }
@@ -2674,9 +3109,6 @@ struct DueProjectionChartView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("7-Day Review Workload Projection")
                         .font(.headline)
-                    Text("Forecasted due cards for today and the next 6 days")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
                 Spacer()
             }
@@ -2751,9 +3183,6 @@ struct EaseDistributionChartView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Ease Factor & Mastery Breakdown")
                         .font(.headline)
-                    Text("Distribution of recall ease factors (Y: Frequency, X: Ease Level)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
                 Spacer()
             }
@@ -2796,9 +3225,6 @@ struct CumulativeCreatedChartView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Cumulative Flashcard Growth")
                         .font(.headline)
-                    Text("Cumulative total flashcards created over time")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
                 Spacer()
             }

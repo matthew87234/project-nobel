@@ -1,20 +1,14 @@
 #!/bin/zsh
 set -e
 
-DESKTOP_BUILD_DIR="/Users/matthewt/Desktop/MacApp-Build"
+DESKTOP_BUILD_DIR="${HOME}/Desktop/MacApp-Build"
 APP_NAME="Project Nobel"
-DESKTOP_APP="/Users/matthewt/Desktop/${APP_NAME}.app"
+DESKTOP_APP="${HOME}/Desktop/${APP_NAME}.app"
 TARGET_APP="/Applications/${APP_NAME}.app"
 
-if [ -d "${DESKTOP_BUILD_DIR}/${APP_NAME}.app" ]; then
-    APP_BUNDLE="${DESKTOP_BUILD_DIR}/${APP_NAME}.app"
-elif [ -d "${DESKTOP_APP}" ]; then
-    APP_BUNDLE="${DESKTOP_APP}"
-else
-    echo "No existing app bundle found on Desktop. Running build_app.sh..."
-    "$(dirname "$0")/swiftui-version/build_app.sh"
-    APP_BUNDLE="${DESKTOP_APP}"
-fi
+echo "Building fresh release app bundle with build_app.sh..."
+"$(dirname "$0")/swiftui-version/build_app.sh"
+APP_BUNDLE="${DESKTOP_APP}"
 
 echo "Moving standalone app bundle to /Applications..."
 

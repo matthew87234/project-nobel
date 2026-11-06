@@ -1,10 +1,18 @@
+#if canImport(Testing)
 import Testing
+#endif
+#if canImport(XCTest)
+import XCTest
+#endif
 @testable import macOS_Native
 
+#if canImport(Testing)
+@Suite("macOS Native AI Tests")
 struct MacOSNativeTests {
     
-    @Test @MainActor
-    func isStepHeader() {
+    @Test("Step header detection")
+    @MainActor
+    func testIsStepHeader() {
         let helper = AIHelper.shared
         
         // Positive cases
@@ -25,8 +33,9 @@ struct MacOSNativeTests {
         #expect(!helper.isStepHeader("2026-07-14"))
     }
     
-    @Test @MainActor
-    func cleanStepText() {
+    @Test("Step text normalization")
+    @MainActor
+    func testCleanStepText() {
         let helper = AIHelper.shared
         
         #expect(helper.cleanStepText("Step 1: Calculate force") == "Calculate force")
@@ -37,8 +46,9 @@ struct MacOSNativeTests {
         #expect(helper.cleanStepText("- Compute the final value") == "Compute the final value")
     }
     
-    @Test @MainActor
-    func parseStepsFromLLMResponse() {
+    @Test("Parse steps from LLM response")
+    @MainActor
+    func testParseStepsFromLLMResponse() {
         let helper = AIHelper.shared
         
         // Test case 1: Standard structured response with intros/outros
@@ -85,7 +95,7 @@ struct MacOSNativeTests {
         #expect(steps3[0] == "Write the Schrodinger equation.")
         #expect(steps3[1] == "Set up boundary conditions.")
         
-        // Test case 4: Fallback paragraph splitting (no headers or bullet points)
+        // Test case 4: Fallback paragraph splitting
         let response4 = """
         First, we calculate the gradient. The potential function is given.
         
@@ -95,5 +105,56 @@ struct MacOSNativeTests {
         #expect(steps4.count == 2)
         #expect(steps4[0] == "First, we calculate the gradient. The potential function is given.")
         #expect(steps4[1] == "Then, we find the electric field as the negative gradient of potential.")
+        
+        // Test case 5: Explicit [STEP] ... [/STEP] blocks with pedagogical tiers
+        let response5 = """
+        [STEP]
+        Tier: Conceptual Setup
+        Subpart: (i)
+        Content: State Euler reciprocity relation:
+        $$
+        \\frac{\\partial M}{\\partial y} = \\frac{\\partial N}{\\partial x}
+        $$
+        [/STEP]
+        [STEP]
+        Tier: Governing Formulation
+        Subpart: (i)
+        Content: Apply to differential $dG = \\alpha dx + \\beta \\frac{x}{y} dy$.
+        [/STEP]
+        [STEP]
+        Tier: Algebraic Derivation
+        Subpart: (i)
+        Content: Conclude exactness test.
+        [/STEP]
+        """
+        let steps5 = helper.parseStepsFromLLMResponse(response5)
+        #expect(steps5.count == 3)
+        #expect(steps5[0].contains("[Conceptual Setup]"))
+        #expect(steps5[0].contains("(i)"))
+        #expect(steps5[1].contains("[Governing Formulation]"))
+        #expect(steps5[2].contains("[Algebraic Derivation]"))
+    }
+    
+    @Test("Split solution into subparts")
+    @MainActor
+    func testSplitSolutionIntoSubparts() {
+        let helper = AIHelper.shared
+        
+        let solution = """
+        (i) Noting that N = n_up + n_down, we find E = mu H (N - 2n_up).
+        (ii) There are N C n_up configurations, giving entropy S(n_up) via Stirling's approximation.
+        (iii) Microcanonical vs Canonical ensemble comparison.
+        (iv) Temperature reciprocal 1/T and negative temperature limit.
+        """
+        
+        let subparts = helper.splitSolutionIntoSubparts(solution)
+        #expect(subparts.count == 4)
+        #expect(subparts[0].subpart == "(i)")
+        #expect(subparts[0].content.contains("E = mu H"))
+        #expect(subparts[1].subpart == "(ii)")
+        #expect(subparts[1].content.contains("Stirling's approximation"))
+        #expect(subparts[2].subpart == "(iii)")
+        #expect(subparts[3].subpart == "(iv)")
     }
 }
+#endif

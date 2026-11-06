@@ -94,7 +94,7 @@ struct StudyView: View {
                                             Image(systemName: "wifi.slash")
                                                 .foregroundColor(.blue)
                                                 .font(.headline)
-                                            Text(AIHelper.shared.disconnectionMessage.isEmpty ? "Tailscale Disconnected" : AIHelper.shared.disconnectionMessage)
+                                            Text(AIHelper.shared.disconnectionMessage.isEmpty ? "\(AIHelper.shared.activeAIProvider.name) Disconnected" : AIHelper.shared.disconnectionMessage)
                                                 .font(.headline)
                                                 .foregroundColor(.blue)
                                         }

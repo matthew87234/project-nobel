@@ -10,7 +10,22 @@ struct PreExamRoutineView: View {
     @ObservedObject private var aiHelper = AIHelper.shared
     @State private var activePhase: Int = 1
     @State private var currentCardIndex: Int = 0
-    @State private var isFlipped: Bool = false
+    @State private var flippedCardKey: String? = nil
+    
+    private var isFlipped: Bool {
+        guard currentCardIndex < curatedCards.count else { return false }
+        return flippedCardKey == "\(curatedCards[currentCardIndex].id)_\(currentCardIndex)"
+    }
+    
+    private func toggleCurrentCardFlip() {
+        guard currentCardIndex < curatedCards.count else { return }
+        let key = "\(curatedCards[currentCardIndex].id)_\(currentCardIndex)"
+        if flippedCardKey == key {
+            flippedCardKey = nil
+        } else {
+            flippedCardKey = key
+        }
+    }
     @State private var phaseTimeRemainingSeconds: Int = 2400
     @State private var timer: Timer? = nil
     @State private var curatedCards: [Flashcard] = []
@@ -141,6 +156,10 @@ struct PreExamRoutineView: View {
             startTimer()
         }
         .onChange(of: activeModule?.id) { _, _ in
+            currentCardIndex = 0
+            currentProblemIndex = 0
+            flippedCardKey = nil
+            showSetupStrategy = false
             loadCuratedCards()
             loadPhase2WarmupProblems()
             loadPreparedNotes()
@@ -213,19 +232,25 @@ struct PreExamRoutineView: View {
                 
                 // Native 3D FlipCardView (Matching main Flashcard Review UI with LaTeX support)
                 let card = curatedCards[min(currentCardIndex, curatedCards.count - 1)]
+                let cardKey = "\(card.id)_\(currentCardIndex)"
+                let isCardFlipped = (flippedCardKey == cardKey)
                 
                 FlipCardView(
                     front: card.front,
                     back: card.back,
-                    isFlipped: $isFlipped,
-                    isFlagged: card.isFlagged
+                    isFlipped: isCardFlipped,
+                    isFlagged: card.isFlagged,
+                    moduleName: activeModule?.name,
+                    moduleCode: activeModule?.code
                 )
+                .id(cardKey)
+                .transition(.opacity)
                 .frame(maxWidth: 640, minHeight: 300)
                 .padding(.horizontal, 40)
                 .pointingHandCursor()
                 .onTapGesture {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-                        isFlipped.toggle()
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                        toggleCurrentCardFlip()
                     }
                 }
                 
@@ -233,9 +258,8 @@ struct PreExamRoutineView: View {
                 HStack(spacing: 16) {
                     Button(action: {
                         if currentCardIndex > 0 {
-                            withAnimation {
+                            withAnimation(.easeInOut(duration: 0.15)) {
                                 currentCardIndex -= 1
-                                isFlipped = false
                             }
                         }
                     }) {
@@ -251,8 +275,8 @@ struct PreExamRoutineView: View {
                     .disabled(currentCardIndex == 0)
                     
                     Button(action: {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-                            isFlipped.toggle()
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                            toggleCurrentCardFlip()
                         }
                     }) {
                         HStack(spacing: 4) {
@@ -265,24 +289,39 @@ struct PreExamRoutineView: View {
                     .controlSize(.large)
                     .pointingHandCursor()
                     
-                    Button(action: {
-                        if currentCardIndex < curatedCards.count - 1 {
-                            withAnimation {
+                    if currentCardIndex < curatedCards.count - 1 {
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.15)) {
                                 currentCardIndex += 1
-                                isFlipped = false
                             }
+                        }) {
+                            HStack(spacing: 4) {
+                                Text("Next Card")
+                                Image(systemName: "chevron.right")
+                            }
+                            .frame(minWidth: 120)
                         }
-                    }) {
-                        HStack(spacing: 4) {
-                            Text("Next Card")
-                            Image(systemName: "chevron.right")
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .pointingHandCursor()
+                    } else {
+                        Button(action: {
+                            withAnimation {
+                                activePhase = 2
+                                resetPhaseTimer()
+                            }
+                        }) {
+                            HStack(spacing: 4) {
+                                Text("Proceed to Phase 2 →")
+                                    .bold()
+                            }
+                            .frame(minWidth: 140)
                         }
-                        .frame(minWidth: 120)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                        .controlSize(.large)
+                        .pointingHandCursor()
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                    .pointingHandCursor()
-                    .disabled(currentCardIndex >= curatedCards.count - 1)
                 }
                 .padding(.bottom, 24)
             }
@@ -814,7 +853,8 @@ struct PreExamRoutineView: View {
     // MARK: - Sub-Tab 1: Pinned Problems Page (Phase 2 Review)
     @ViewBuilder
     private var pinnedProblemsTabView: some View {
-        let pinnedList = warmupProblems.filter { pinnedProblemIds.contains($0.id) }
+        let allModProblems = activeModule != nil ? DatabaseManager.shared.getProblems(forModuleId: activeModule!.id) : warmupProblems
+        let pinnedList = allModProblems.filter { pinnedProblemIds.contains($0.id) }
         
         if pinnedList.isEmpty {
             VStack(spacing: 16) {
@@ -1082,7 +1122,7 @@ struct PreExamRoutineView: View {
             // Even spread: pick 1-2 problems per topic across all weeks
             for topic in topics {
                 let topicProbs = allProblems.filter { $0.topicId == topic.id }
-                if let best = topicProbs.sorted(by: { $0.severityLevel > $1.severityLevel }).first {
+                if let best = topicProbs.sorted(by: { $0.severityLevel < $1.severityLevel }).first {
                     selected.append(best)
                 }
             }
@@ -1350,7 +1390,7 @@ struct PreExamRoutineView: View {
                 self.isTranslatingLaTeX = false
                 if let latex = res {
                     if latex == "MODEL_NOT_FOUND" {
-                        self.latexResult = "No vision model found on AI server. Please pull qwen2.5vl."
+                        self.latexResult = "No vision model found on AI server. Please configure or pull a vision model in Settings."
                     } else {
                         let wrapped = self.wrapInLaTeXDelimiters(latex)
                         self.latexResult = wrapped

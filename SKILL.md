@@ -21,7 +21,7 @@ The application is engineered around cognitive science principles for STEM learn
 
 ### A. Core Stack
 - **Language & Framework**: Swift 5.10+, SwiftUI, Swift Charts, macOS Native SPM target.
-- **Workspace Location**: `/Users/matthewt/Projects/PhysicsStudyApp/swiftui-version`
+- **Workspace Location**: `$HOME/Projects/PhysicsStudyApp/swiftui-version` (inspect `LOCAL_SETUP.md` for local developer configuration).
 - **Compiler Compatibility**: Must compile with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk` or `swift-tools-version: 5.9`.
 
 ### B. Dual Database & Execution Environments
@@ -29,11 +29,12 @@ The application is engineered around cognitive science principles for STEM learn
    - Official release environment.
    - Clean UI with zero test/sandbox indicators.
    - Primary Database: `~/.physics_study_app/physics_study.db`.
-2. **Desktop Sandbox App (`/Users/matthewt/Desktop/Project Nobel.app`)**:
+2. **Desktop Sandbox App (`$HOME/Desktop/Project Nobel.app`)**:
    - Active development & testing sandbox.
    - Displays amber top banner: `● TEST PROGRAM • Desktop Sandbox Environment`.
    - Sandbox Database: `~/.physics_study_app/physics_study_desktop.db`.
    - **One-Way Sync**: Running `./swiftui-version/build_app.sh` automatically copies `physics_study.db` $\to$ `physics_study_desktop.db` without altering production data.
+   - **Local Developer Configuration**: Inspect `LOCAL_SETUP.md` (gitignored) for personal paths, local developer overrides, and IP addresses.
 
 ---
 
@@ -78,13 +79,13 @@ Background jobs run sequentially with wake-lock assertions (`idleSystemSleepDisa
 2. **Pass 2 (Generic Titles)**: Renames default titles (`isDefaultTitle`) using `generateDescriptiveTitle` with regex stripping for `<think>.*?</think>` tags.
 3. **Pass 3 (Missing Primers)**: Synthesizes `generatePreLecturePrimer` linking preceding lectures into upcoming lectures.
 
-### C. Compute Topology: Remote Tailscale PC vs Local M4 Laptop
-- **Primary Compute Engine (Dedicated Tailscale PC)**:
-  - All heavy AI workloads (document vision parsing, mathematical derivations, step breakdowns, flashcard generation, Feynman chats) are offloaded to the dedicated PC over Tailscale (`100.x.y.z:11434`).
-  - Key remote models: `qwen2.5vl:7b` (Vision & Diagram OCR), `qwen2.5-coder:14b` (Math/Physics Coding), `deepseek-r1:14b` (Reasoning).
-- **Client Machine (M4 Laptop)**:
-  - Kept lightweight to preserve battery and RAM.
-  - Zero heavy background model execution unless explicitly designated for lightweight local tasks (e.g. fast local translation, instantaneous UI text formatting).
+### C. Compute Topology: Remote Node vs Local Device
+- **Primary Compute Engine (Dedicated Remote Node)**:
+   - Heavy AI workloads (document vision parsing, mathematical derivations, step breakdowns, flashcard generation, Feynman chats) can be offloaded to the dedicated remote machine over Tailscale or local network (`100.x.y.z:11434`).
+   - Models are dynamically queried from the remote host tags.
+- **Client Machine (Local Device)**:
+   - Kept lightweight to preserve battery and RAM.
+   - Dynamic local models queried from local Ollama (`localhost:11434`).
 - **High-Fidelity Extraction Pipeline (PDFs & Practice Sheets)**:
   - **No Lossy Text Scraping**: Raw linear PDFKit text extraction MUST NEVER be used as a bypass for mathematical documents (avoids destroying 2D fractions, partial derivatives, exponents, and integrals).
   - **Vision-First OCR**: Problem and solution PDFs are converted to high-resolution page images and transcribed via `qwen2.5vl:7b` over Tailscale.

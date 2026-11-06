@@ -2,12 +2,13 @@
 set -e
 
 # Define directories
-SRC_DIR="/Users/matthewt/Projects/PhysicsStudyApp/swiftui-version"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}"
 BUILD_DIR="${SRC_DIR}/.build/release"
-DESKTOP_BUILD_DIR="/Users/matthewt/Desktop/MacApp-Build"
+DESKTOP_BUILD_DIR="${HOME}/Desktop/MacApp-Build"
 APP_NAME="Project Nobel"
 APP_BUNDLE="${DESKTOP_BUILD_DIR}/${APP_NAME}.app"
-DESKTOP_APP="/Users/matthewt/Desktop/${APP_NAME}.app"
+DESKTOP_APP="${HOME}/Desktop/${APP_NAME}.app"
 
 if [ -z "$SDKROOT" ] && [ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]; then
     export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk"
@@ -37,7 +38,7 @@ cat <<EOF > "${APP_BUNDLE}/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.2</string>
+    <string>1.0.3</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleVersion</key>
@@ -76,12 +77,27 @@ codesign --force --deep --sign - "${DESKTOP_APP}"
 touch "${DESKTOP_APP}"
 rm -rf "${DESKTOP_BUILD_DIR}"
 
-# One-way sync: Sync production database to desktop testing database if production exists
+# Seed desktop testing database from production database only if desktop DB is missing, corrupt, or empty
 PROD_DB="$HOME/.physics_study_app/physics_study.db"
 DESKTOP_DB="$HOME/.physics_study_app/physics_study_desktop.db"
 if [ -f "${PROD_DB}" ]; then
-    echo "Performing one-way sync from production database to desktop database..."
-    cp "${PROD_DB}" "${DESKTOP_DB}"
+    NEED_SEED=0
+    if [ ! -f "${DESKTOP_DB}" ]; then
+        NEED_SEED=1
+    else
+        INTEGRITY=$(sqlite3 "${DESKTOP_DB}" "PRAGMA quick_check;" 2>/dev/null || echo "fail")
+        MOD_COUNT=$(sqlite3 "${DESKTOP_DB}" "SELECT COUNT(*) FROM modules;" 2>/dev/null || echo "0")
+        if [ "${INTEGRITY}" != "ok" ] || [ "${MOD_COUNT}" -eq 0 ] 2>/dev/null; then
+            NEED_SEED=1
+        fi
+    fi
+    if [ "${NEED_SEED}" -eq 1 ]; then
+        echo "Seeding desktop database from production database..."
+        rm -f "${DESKTOP_DB}" "${DESKTOP_DB}-wal" "${DESKTOP_DB}-shm"
+        sqlite3 "${PROD_DB}" ".backup '${DESKTOP_DB}'"
+    else
+        echo "Preserving existing valid desktop database (${DESKTOP_DB}) so desktop review progress is not overwritten."
+    fi
 fi
 
 echo "Build and bundle creation complete: ${DESKTOP_APP}"

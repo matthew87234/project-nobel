@@ -64,13 +64,322 @@ enum ProblemAddSubMode {
     case aiBatch
 }
 
-struct ExtractedProblem: Identifiable, Hashable {
-    let id = UUID()
+struct ExtractedProblem: Identifiable, Hashable, Codable {
+    var id: UUID = UUID()
     var content: String
     var solutionHint: String
     var solution: String = ""
     var steps: [String] = []
     var isSelected: Bool = true
+    
+    var missingSubparts: [String] {
+        extractMissingSubparts(question: content, solution: solution, steps: steps)
+    }
+}
+
+/// Analyzes question text against its solution/steps to identify any subparts asked in the question (e.g. (a), (b), (c)) that lack an answer
+func extractMissingSubparts(question: String, solution: String, steps: [String]) -> [String] {
+    let questionPattern = #"(?m)(?:^[ \t]*(?:\(([a-z])\)|([a-z])[\).])\s)|(?:\b(?:Part|Subpart|part|subpart)\b\s*\(?([a-z])\)?)"#
+    guard let qRegex = try? NSRegularExpression(pattern: questionPattern, options: []) else { return [] }
+    let ns = question as NSString
+    let matches = qRegex.matches(in: question, options: [], range: NSRange(location: 0, length: ns.length))
+    var asked = [String]()
+    for m in matches {
+        var letter: String? = nil
+        if m.range(at: 1).location != NSNotFound {
+            letter = ns.substring(with: m.range(at: 1)).lowercased()
+        } else if m.range(at: 2).location != NSNotFound {
+            letter = ns.substring(with: m.range(at: 2)).lowercased()
+        } else if m.range(at: 3).location != NSNotFound {
+            letter = ns.substring(with: m.range(at: 3)).lowercased()
+        }
+        if let l = letter, l.count == 1, l >= "a", l <= "j", !asked.contains(l) {
+            asked.append(l)
+        }
+    }
+    guard !asked.isEmpty else { return [] }
+    let combined = solution + "\n" + steps.joined(separator: "\n")
+    if combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return asked
+    }
+    var covered = Set<String>()
+    for sub in asked {
+        let p = #"(?i)(?:\([ \t]*"# + sub + #"[ \t]*\)|(?:^|\n|[ \t])"# + sub + #"[\).:][ \t\n]|(?:Part|Subpart|Question|Problem)\b\s*\d*\s*\(?"# + sub + #"(?:\)|[:.\s]|$))"#
+        if let reg = try? NSRegularExpression(pattern: p, options: []) {
+            let combNs = combined as NSString
+            if reg.firstMatch(in: combined, options: [], range: NSRange(location: 0, length: combNs.length)) != nil {
+                covered.insert(sub)
+            }
+        }
+    }
+    return asked.filter { !covered.contains($0) }
+}
+
+extension Problem {
+    var missingSubparts: [String] {
+        extractMissingSubparts(question: content, solution: solution, steps: [steps])
+    }
+}
+
+// MARK: - Pedagogical Diagnostic Categories & Step Parsing
+
+enum PedagogicalTier: String, CaseIterable {
+    case conceptualSetup = "Conceptual Setup"
+    case governingFormulation = "Governing Formulation"
+    case algebraicDerivation = "Algebraic Derivation"
+    case interpretation = "Interpretation & Analysis"
+    case verification = "Verification & Result"
+    
+    var icon: String {
+        switch self {
+        case .conceptualSetup: return "brain.head.profile"
+        case .governingFormulation: return "function"
+        case .algebraicDerivation: return "plusminus"
+        case .interpretation: return "chart.line.uptrend.xyaxis"
+        case .verification: return "checkmark.seal"
+        }
+    }
+    
+    var color: Color {
+        switch self {
+        case .conceptualSetup: return .blue
+        case .governingFormulation: return .purple
+        case .algebraicDerivation: return .teal
+        case .interpretation: return .orange
+        case .verification: return .green
+        }
+    }
+    
+    var diagnosticLevel: Int {
+        switch self {
+        case .conceptualSetup: return 1
+        case .governingFormulation: return 2
+        case .algebraicDerivation: return 3
+        case .interpretation: return 4
+        case .verification: return 4
+        }
+    }
+}
+
+struct StepComponents {
+    let tier: PedagogicalTier?
+    let customTierName: String?
+    let subpart: String?
+    let content: String
+}
+
+func parsePedagogicalStep(_ rawStep: String) -> StepComponents {
+    var trimmed = rawStep.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+        return StepComponents(tier: nil, customTierName: nil, subpart: nil, content: "")
+    }
+    
+    // Strip markdown bold **text** -> text and lingering asterisks
+    trimmed = trimmed.replacingOccurrences(of: #"\*\*([^\*]+)\*\*"#, with: "$1", options: .regularExpression)
+    trimmed = trimmed.replacingOccurrences(of: #"\*{2,}"#, with: "", options: .regularExpression)
+    
+    // Pattern 1: [Tier] (subpart)\n\nContent or [Tier]\n\nContent
+    let bracketPattern = #"^\[([^\]]+)\](?:\s*(?:\(([a-zA-Z0-9]+)\)|([a-fA-F]|i{1,4}|iv|v|vi{1,3}|[1-9])(?:\.|\:|\s+)))?\s*\n*(.*)"#
+    if let regex = try? NSRegularExpression(pattern: bracketPattern, options: [.dotMatchesLineSeparators]) {
+        let nsStr = trimmed as NSString
+        let matches = regex.matches(in: trimmed, options: [], range: NSRange(location: 0, length: nsStr.length))
+        if let match = matches.first, match.numberOfRanges > 1 {
+            let rawTier = nsStr.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            var rawSub = ""
+            if match.numberOfRanges > 2 && match.range(at: 2).location != NSNotFound {
+                rawSub = nsStr.substring(with: match.range(at: 2))
+            } else if match.numberOfRanges > 3 && match.range(at: 3).location != NSNotFound {
+                rawSub = nsStr.substring(with: match.range(at: 3))
+            }
+            var body = ""
+            if match.numberOfRanges > 4 && match.range(at: 4).location != NSNotFound {
+                body = nsStr.substring(with: match.range(at: 4)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            
+            let cleanTier = cleanTierString(rawTier)
+            let tierEnum = matchPedagogicalTier(cleanTier)
+            let customTier = tierEnum == nil && !cleanTier.isEmpty ? cleanTier : nil
+            let subpart = formatSubpart(rawSub)
+            
+            return StepComponents(tier: tierEnum, customTierName: customTier, subpart: subpart, content: body.isEmpty ? trimmed : body)
+        }
+    }
+    
+    // Pattern 2: Tier: ... \nSubpart: ... \nContent: ...
+    if trimmed.localizedCaseInsensitiveContains("Content:") {
+        var tierStr = ""
+        var subpartStr = ""
+        var contentStr = ""
+        let lines = trimmed.components(separatedBy: .newlines)
+        var readingContent = false
+        for line in lines {
+            let lTrimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = lTrimmed.lowercased()
+            if lower.starts(with: "tier:") {
+                tierStr = lTrimmed.replacingOccurrences(of: "(?i)^tier:\\s*", with: "", options: .regularExpression)
+            } else if lower.starts(with: "subpart:") {
+                subpartStr = lTrimmed.replacingOccurrences(of: "(?i)^subpart:\\s*", with: "", options: .regularExpression)
+            } else if lower.starts(with: "content:") {
+                readingContent = true
+                let c = lTrimmed.replacingOccurrences(of: "(?i)^content:\\s*", with: "", options: .regularExpression)
+                if !c.isEmpty { contentStr = c }
+            } else if readingContent {
+                contentStr += (contentStr.isEmpty ? "" : "\n") + line
+            }
+        }
+        if !contentStr.isEmpty {
+            let cleanTier = cleanTierString(tierStr)
+            let tierEnum = matchPedagogicalTier(cleanTier)
+            let customTier = tierEnum == nil && !cleanTier.isEmpty ? cleanTier : nil
+            let subpart = formatSubpart(subpartStr)
+            return StepComponents(tier: tierEnum, customTierName: customTier, subpart: subpart, content: contentStr.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+    
+    // Pattern 3: Heading line followed by content (e.g. Conceptual Setup & Physical Principles)
+    let lines = trimmed.components(separatedBy: .newlines)
+    if lines.count >= 2 {
+        let firstLine = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = firstLine.lowercased()
+        if lower.contains("conceptual") || lower.contains("governing") || lower.contains("algebraic") || lower.contains("identification") || lower.contains("data collection") || lower.contains("tier:") {
+            let cleanHeader = cleanTierString(firstLine.replacingOccurrences(of: "(?i)^tier:\\s*", with: "", options: .regularExpression))
+            let tierEnum = matchPedagogicalTier(cleanHeader)
+            let customTier = tierEnum == nil && !cleanHeader.isEmpty ? cleanHeader : nil
+            let remainingLines = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            return StepComponents(tier: tierEnum, customTierName: customTier, subpart: nil, content: remainingLines)
+        }
+    }
+    
+    return StepComponents(tier: nil, customTierName: nil, subpart: nil, content: trimmed)
+}
+
+func cleanTierString(_ raw: String) -> String {
+    var s = raw.replacingOccurrences(of: #"[\$\\][a-zA-Z0-9_\{\}\\]*"#, with: "", options: .regularExpression)
+    s = s.replacingOccurrences(of: #"[\[\]\(\)\*#]"#, with: "", options: .regularExpression)
+    return s.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func matchPedagogicalTier(_ name: String) -> PedagogicalTier? {
+    let lower = name.lowercased()
+    if lower.contains("concept") || lower.contains("principle") || lower.contains("setup") {
+        return .conceptualSetup
+    } else if lower.contains("govern") || lower.contains("formulat") || lower.contains("equation") {
+        return .governingFormulation
+    } else if lower.contains("algebra") || lower.contains("derivat") || lower.contains("calculat") || lower.contains("integrat") {
+        return .algebraicDerivation
+    } else if lower.contains("interpret") || lower.contains("analys") || lower.contains("meaning") {
+        return .interpretation
+    } else if lower.contains("verif") || lower.contains("evaluat") || lower.contains("result") {
+        return .verification
+    }
+    return nil
+}
+
+func formatSubpart(_ raw: String) -> String? {
+    let clean = raw.trimmingCharacters(in: CharacterSet(charactersIn: "() \t\n*#"))
+    let lower = clean.lowercased()
+    if lower.isEmpty || lower == "full" || lower == "none" || lower == "part" {
+        return nil
+    }
+    return "Part (\(clean))"
+}
+
+struct PedagogicalStepRowView: View {
+    let stepNumber: Int
+    let stepText: String
+    var isErrorStep: Bool = false
+    var onToggleError: (() -> Void)? = nil
+    
+    var body: some View {
+        let components = parsePedagogicalStep(stepText)
+        
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                // Step Number Badge
+                Text("Step \(stepNumber)")
+                    .font(.caption2.bold())
+                    .foregroundColor(isErrorStep ? .red : .secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(isErrorStep ? Color.red.opacity(0.15) : Color.secondary.opacity(0.1))
+                    .cornerRadius(5)
+                
+                // Diagnostic Category Badge
+                if let tier = components.tier {
+                    HStack(spacing: 4) {
+                        Image(systemName: tier.icon)
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(tier.rawValue)
+                            .font(.caption2.bold())
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(tier.color.opacity(0.12))
+                    .foregroundColor(tier.color)
+                    .clipShape(Capsule())
+                    .overlay(
+                        Capsule().stroke(tier.color.opacity(0.25), lineWidth: 0.8)
+                    )
+                } else if let custom = components.customTierName, !custom.isEmpty {
+                    Text(custom)
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.blue.opacity(0.12))
+                        .foregroundColor(.blue)
+                        .clipShape(Capsule())
+                }
+                
+                // Genuine Subpart Badge
+                if let sub = components.subpart {
+                    Text(sub)
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2.5)
+                        .background(Color.secondary.opacity(0.12))
+                        .foregroundColor(.primary)
+                        .cornerRadius(4)
+                }
+                
+                Spacer()
+                
+                if let onToggleError = onToggleError {
+                    Button(action: onToggleError) {
+                        Image(systemName: isErrorStep ? "exclamationmark.triangle.fill" : "exclamationmark.triangle")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(isErrorStep ? .red : .secondary)
+                            .padding(5)
+                            .background(isErrorStep ? Color.red.opacity(0.15) : Color.secondary.opacity(0.08))
+                            .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isErrorStep ? "Step marked as error point (Click to clear)" : "Signal that you got stuck or made a mistake at this step")
+                }
+            }
+            
+            // Content body: rendered with LaTeXView or Text
+            if isLaTeX(components.content) {
+                LaTeXView(latex: components.content)
+                    .frame(minHeight: calcLaTeXMinHeight(components.content))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text(LocalizedStringKey(components.content))
+                    .font(.body)
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isErrorStep ? Color.red.opacity(0.06) : Color(NSColor.controlBackgroundColor))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isErrorStep ? Color.red.opacity(0.4) : Color.blue.opacity(0.15), lineWidth: isErrorStep ? 1.5 : 1)
+        )
+        .padding(.vertical, 2)
+    }
 }
 
 @MainActor
@@ -106,6 +415,8 @@ struct ProblemsView: View {
     @State private var editingStepIndex: Int? = nil
     @State private var showEditStepModal: Bool = false
     @State private var isExtracting: Bool = false
+    @State private var isRegeneratingSteps: Bool = false
+    @State private var showCacheClearedAlert: Bool = false
     private var extractedProblems: [ExtractedProblem] {
         aiHelper.sessionExtractedProblems
     }
@@ -209,6 +520,7 @@ struct ProblemsView: View {
         .onAppear {
             if isActive {
                 loadInitialData()
+                aiHelper.sanitizeSessionExtractedProblems()
             }
         }
         .onChange(of: aiHelper.isClassifyingProblems) { oldValue, newValue in
@@ -250,12 +562,13 @@ struct ProblemsView: View {
             logActiveSeconds()
         }
         .onReceive(problemsTimer) { _ in
-            guard isActive && isTimerActive && mode == .review && currentProblem != nil else { return }
+            guard isActive && isTimerActive && mode == .review && reviewSubMode == .practice && currentProblem != nil else { return }
             prTimerSeconds += 1
             if prTimerSeconds % 10 == 0 {
                 // Log time to database every 10 seconds
                 DatabaseManager.shared.addStudyTime(flashcardsDelta: 0, problemsDelta: 10)
-                if let modId = activeModuleId {
+                let modId = (currentProblem != nil ? DatabaseManager.shared.getModuleId(forTopicId: currentProblem!.topicId) : nil) ?? activeModuleId
+                if let modId = modId {
                     DatabaseManager.shared.addModuleStudyTime(moduleId: modId, flashcardsDelta: 0, problemsDelta: 10)
                 }
             }
@@ -280,6 +593,11 @@ struct ProblemsView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("Would you like to let AI assign weeks for all imported problems, or just the currently selected one?")
+        }
+        .alert("Transcription Cache Cleared", isPresented: $showCacheClearedAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("All cached OCR and transcription files have been wiped. Your next batch import will perform a completely fresh visual extraction.")
         }
         .sheet(item: $activeProblemChartPopup) { popup in
             problemChartPopupSheet(for: popup)
@@ -330,6 +648,20 @@ struct ProblemsView: View {
                                 HStack {
                                     Text("Multi-step Solution Steps:").bold()
                                     Spacer()
+                                    if isRegeneratingSteps {
+                                        ProgressView()
+                                            .scaleEffect(0.7)
+                                            .frame(width: 16, height: 16)
+                                    } else {
+                                        Button(action: {
+                                            regenerateStepsForCurrentExtraction()
+                                        }) {
+                                            Label("AI Step Breakdown", systemImage: "wand.and.stars")
+                                                .font(.caption)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .disabled(currentExtractionIndex >= extractedProblems.count || extractedProblems[currentExtractionIndex].solution.isEmpty)
+                                    }
                                     Button(action: {
                                         aiHelper.sessionExtractedProblems[currentExtractionIndex].steps.append("")
                                     }) {
@@ -442,9 +774,11 @@ struct ProblemsView: View {
     
     private func loadInitialData() {
         if mode == .review {
-            loadRandomProblem()
-            prTimerSeconds = 0
-            isTimerActive = true
+            if reviewSubMode == .practice && currentProblem != nil {
+                isTimerActive = true
+            } else {
+                isTimerActive = false
+            }
         } else if mode == .add {
             loadTopics()
         } else if mode == .manage {
@@ -457,9 +791,11 @@ struct ProblemsView: View {
         let remainder = prTimerSeconds % 10
         if remainder > 0 {
             DatabaseManager.shared.addStudyTime(flashcardsDelta: 0, problemsDelta: remainder)
-            if let modId = activeModuleId {
+            let modId = (currentProblem != nil ? DatabaseManager.shared.getModuleId(forTopicId: currentProblem!.topicId) : nil) ?? activeModuleId
+            if let modId = modId {
                 DatabaseManager.shared.addModuleStudyTime(moduleId: modId, flashcardsDelta: 0, problemsDelta: remainder)
             }
+            prTimerSeconds = 0
         }
     }
     
@@ -474,6 +810,7 @@ struct ProblemsView: View {
                 let targetYear = isExamMode ? nil : activeYear
                 let modProblems = DatabaseManager.shared.getProblems(forYear: targetYear, forModuleId: targetModId)
                 let dueList = modProblems.filter { p in
+                    guard !p.isFlagged else { return false }
                     if p.nextReviewDate.isEmpty { return true }
                     let formatter = DateFormatter()
                     formatter.dateFormat = "yyyy-MM-dd"
@@ -700,6 +1037,8 @@ struct ProblemsView: View {
             self.showHint = false
             self.showSolution = false
             self.revealedStepCount = 0
+            self.prTimerSeconds = 0
+            self.isTimerActive = true
             self.reviewSubMode = .practice
         }
     }
@@ -712,6 +1051,8 @@ struct ProblemsView: View {
             
             HStack {
                 Button(action: {
+                    isTimerActive = false
+                    logActiveSeconds()
                     reviewSubMode = .centre
                 }) {
                     HStack(spacing: 4) {
@@ -744,10 +1085,11 @@ struct ProblemsView: View {
                         Button(action: {
                             let newFlag = !problem.isFlagged
                             _ = DatabaseManager.shared.setProblemFlagged(id: problem.id, isFlagged: newFlag)
-                            let modId = isExamMode ? activeModuleId : nil
-                            let probs = DatabaseManager.shared.getProblems(forModuleId: modId)
-                            if let updated = probs.first(where: { $0.id == problem.id }) {
+                            if let updated = DatabaseManager.shared.getProblem(id: problem.id) {
                                 self.currentProblem = updated
+                                if currentDueProblemIdx < dueProblems.count && dueProblems[currentDueProblemIdx].id == problem.id {
+                                    dueProblems[currentDueProblemIdx] = updated
+                                }
                             }
                         }) {
                             HStack(spacing: 4) {
@@ -798,10 +1140,28 @@ struct ProblemsView: View {
                                     VStack(alignment: .leading, spacing: 12) {
                                         if !steps.isEmpty {
                                             VStack(alignment: .leading, spacing: 10) {
-                                                Text("SOLUTION STEPS (\(min(revealedStepCount, totalSteps)) OF \(totalSteps)):")
-                                                    .font(.caption)
-                                                    .bold()
-                                                    .foregroundColor(.blue)
+                                                HStack(spacing: 8) {
+                                                    Text("SOLUTION STEPS (\(min(revealedStepCount, totalSteps)) OF \(totalSteps)):")
+                                                        .font(.caption)
+                                                        .bold()
+                                                        .foregroundColor(.blue)
+                                                    
+                                                    let missing = problem.missingSubparts
+                                                    if !missing.isEmpty {
+                                                        HStack(spacing: 4) {
+                                                            Image(systemName: "exclamationmark.triangle.fill")
+                                                                .foregroundColor(.orange)
+                                                                .font(.system(size: 10))
+                                                            Text("Missing: \(missing.map { "Part (\($0))" }.joined(separator: ", "))")
+                                                                .font(.caption2.bold())
+                                                                .foregroundColor(.orange)
+                                                        }
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 2)
+                                                        .background(Color.orange.opacity(0.12))
+                                                        .cornerRadius(4)
+                                                    }
+                                                }
                                                 
                                                 ForEach(0..<min(revealedStepCount, totalSteps), id: \.self) { idx in
                                                     let stepNum = idx + 1
@@ -895,6 +1255,8 @@ struct ProblemsView: View {
                         Button("Completed") {
                             let steps = parseSteps(problem.steps)
                             _ = DatabaseManager.shared.recordProblemPracticeResult(id: problem.id, failedStep: markedFailedStep, totalSteps: steps.count)
+                            let probModId = DatabaseManager.shared.getModuleId(forTopicId: problem.topicId) ?? activeModuleId
+                            DatabaseManager.shared.logActivity("interleaving", moduleId: probModId)
                             
                             problemsSolvedInSession += 1
                             markedFailedStep = 0
@@ -906,6 +1268,8 @@ struct ProblemsView: View {
                                 showSolution = false
                                 revealedStepCount = 0
                             } else {
+                                isTimerActive = false
+                                logActiveSeconds()
                                 reviewSubMode = .centre
                             }
                         }
@@ -954,9 +1318,11 @@ struct ProblemsView: View {
     }
     
     private func markProblemSolved(_ problem: Problem) {
+        let steps = parseSteps(problem.steps)
+        _ = DatabaseManager.shared.recordProblemPracticeResult(id: problem.id, failedStep: markedFailedStep, totalSteps: steps.count)
         _ = DatabaseManager.shared.incrementProblemSolvedCount(id: problem.id)
         DatabaseManager.shared.logActivity("interleaving", moduleId: activeModuleId)
-        
+        markedFailedStep = 0
         loadRandomProblem()
     }
     
@@ -970,8 +1336,7 @@ struct ProblemsView: View {
             self.problemContent = p.content
             self.solutionHint = p.solutionHint
             self.problemSolution = p.solution
-            let rawSteps = p.steps.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            self.problemSteps = rawSteps
+            self.problemSteps = parseSteps(p.steps)
             if let t = topics.first(where: { $0.id == p.topicId }) {
                 self.selectedTopic = t
             }
@@ -981,7 +1346,7 @@ struct ProblemsView: View {
     
     private func saveAndAdvanceFlaggedProblem(unflag: Bool, problemId: Int) {
         guard let topic = selectedTopic else { return }
-        let stepStr = problemSteps.joined(separator: "\n\n")
+        let stepStr = encodeSteps(problemSteps)
         _ = DatabaseManager.shared.updateProblem(id: problemId, topicId: topic.id, content: problemContent, hint: solutionHint, solution: problemSolution, steps: stepStr)
         if unflag {
             _ = DatabaseManager.shared.setProblemFlagged(id: problemId, isFlagged: false)
@@ -996,7 +1361,7 @@ struct ProblemsView: View {
             self.problemContent = p.content
             self.solutionHint = p.solutionHint
             self.problemSolution = p.solution
-            self.problemSteps = p.steps.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            self.problemSteps = parseSteps(p.steps)
             if let t = topics.first(where: { $0.id == p.topicId }) {
                 self.selectedTopic = t
             }
@@ -1006,7 +1371,7 @@ struct ProblemsView: View {
             self.problemContent = p.content
             self.solutionHint = p.solutionHint
             self.problemSolution = p.solution
-            self.problemSteps = p.steps.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            self.problemSteps = parseSteps(p.steps)
             if let t = topics.first(where: { $0.id == p.topicId }) {
                 self.selectedTopic = t
             }
@@ -1030,6 +1395,19 @@ struct ProblemsView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 250)
+                
+                if addSubMode == .aiBatch {
+                    Button(action: {
+                        aiHelper.clearTranscriptionCache()
+                        showCacheClearedAlert = true
+                    }) {
+                        Label("Clear Cache", systemImage: "trash")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Clear cached OCR and transcription files to force a completely fresh extraction")
+                }
                 
                 let flaggedRemaining = DatabaseManager.shared.getProblems(forModuleId: activeModuleId).filter { $0.isFlagged }
                 if !flaggedRemaining.isEmpty && !isCorrectingFlaggedProblems {
@@ -1340,15 +1718,14 @@ struct ProblemsView: View {
                         )
                     }
                     
-                    if isExtracting || aiHelper.isClassifyingProblems {
-                        VStack(spacing: 12) {
-                            ProgressView()
-                            Text("\(aiHelper.activeAIProvider.name) is analyzing and transcribing practice problems...")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 20)
+                    if isExtracting || aiHelper.isBatchImportActive || aiHelper.isClassifyingProblems {
+                        BatchImportProgressCardView(
+                            aiHelper: aiHelper,
+                            onCancel: {
+                                aiHelper.cancelExtractionQueue()
+                                isExtracting = false
+                            }
+                        )
                     }
                     
                     if !extractedProblems.isEmpty {
@@ -1437,9 +1814,61 @@ struct ProblemsView: View {
                                      Divider().padding(.vertical, 4)
                                      
                                      VStack(alignment: .leading, spacing: 8) {
-                                         HStack {
+                                         HStack(spacing: 8) {
                                              Text("Solution & Steps:").font(.caption).bold().foregroundColor(.blue)
+                                             
+                                             let curProb = extractedProblems[currentExtractionIndex]
+                                             let missing = curProb.missingSubparts
+                                             if !missing.isEmpty {
+                                                 HStack(spacing: 4) {
+                                                     Image(systemName: "exclamationmark.triangle.fill")
+                                                         .foregroundColor(.orange)
+                                                         .font(.system(size: 10))
+                                                     Text("Missing: \(missing.map { "Part (\($0))" }.joined(separator: ", "))")
+                                                         .font(.caption2.bold())
+                                                         .foregroundColor(.orange)
+                                                 }
+                                                 .padding(.horizontal, 7)
+                                                 .padding(.vertical, 2.5)
+                                                 .background(Color.orange.opacity(0.12))
+                                                 .cornerRadius(5)
+                                                 .help("These subparts were detected in the question statement but do not have an answer in the solution.")
+                                             } else if curProb.solution.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && curProb.steps.isEmpty {
+                                                 HStack(spacing: 4) {
+                                                     Image(systemName: "questionmark.circle.fill")
+                                                         .foregroundColor(.red)
+                                                         .font(.system(size: 10))
+                                                     Text("No Solution in Answer Key")
+                                                         .font(.caption2.bold())
+                                                         .foregroundColor(.red)
+                                                 }
+                                                 .padding(.horizontal, 7)
+                                                 .padding(.vertical, 2.5)
+                                                 .background(Color.red.opacity(0.12))
+                                                 .cornerRadius(5)
+                                             }
+                                             
                                              Spacer()
+                                             
+                                             if isRegeneratingSteps {
+                                                 ProgressView()
+                                                     .scaleEffect(0.7)
+                                                     .frame(width: 16, height: 16)
+                                                 Text("Generating Steps...")
+                                                     .font(.caption)
+                                                     .foregroundColor(.secondary)
+                                             } else {
+                                                 Button(action: {
+                                                     regenerateStepsForCurrentExtraction()
+                                                 }) {
+                                                     Label("Auto-Generate Steps", systemImage: "wand.and.stars")
+                                                         .font(.caption)
+                                                 }
+                                                 .buttonStyle(.bordered)
+                                                 .disabled(extractedProblems.isEmpty || currentExtractionIndex >= extractedProblems.count || extractedProblems[currentExtractionIndex].solution.isEmpty)
+                                                 .help("Break down the solution into pedagogical steps using \(aiHelper.activeAIProvider.name)")
+                                             }
+                                             
                                              Button(action: {
                                                  showEditQuestionModal = true
                                              }) {
@@ -1453,30 +1882,9 @@ struct ProblemsView: View {
                                          if !currentProb.steps.isEmpty {
                                              VStack(alignment: .leading, spacing: 8) {
                                                  ForEach(0..<currentProb.steps.count, id: \.self) { idx in
-                                                     HStack(alignment: .top, spacing: 6) {
-                                                         Text("\(idx + 1).")
-                                                             .bold()
-                                                             .foregroundColor(.blue)
-                                                             .padding(.top, 2)
-                                                         
-                                                         if isLaTeX(currentProb.steps[idx]) {
-                                                             LaTeXView(latex: currentProb.steps[idx])
-                                                                 .frame(minHeight: calcLaTeXMinHeight(currentProb.steps[idx]))
-                                                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                                         } else {
-                                                             Text(currentProb.steps[idx])
-                                                                 .font(.body)
-                                                                 .lineSpacing(2)
-                                                                 .textSelection(.enabled)
-                                                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                                         }
-                                                     }
-                                                     .padding(8)
-                                                     .background(Color(NSColor.controlBackgroundColor))
-                                                     .cornerRadius(6)
-                                                     .overlay(
-                                                         RoundedRectangle(cornerRadius: 6)
-                                                             .stroke(Color.blue.opacity(0.15), lineWidth: 1)
+                                                     PedagogicalStepRowView(
+                                                         stepNumber: idx + 1,
+                                                         stepText: currentProb.steps[idx]
                                                      )
                                                  }
                                              }
@@ -2095,9 +2503,45 @@ struct ProblemsView: View {
         }
     }
     
+    private func regenerateStepsForCurrentExtraction() {
+        guard currentExtractionIndex < extractedProblems.count else { return }
+        let q = extractedProblems[currentExtractionIndex].content
+        let sol = extractedProblems[currentExtractionIndex].solution
+        
+        isRegeneratingSteps = true
+        Task {
+            let newSteps: [String]
+            if !sol.isEmpty {
+                newSteps = await aiHelper.generateStepsFromAnswer(question: q, answer: sol)
+            } else {
+                let (derivedSol, derivedSteps) = await aiHelper.deriveSolutionAndSteps(question: q)
+                if !derivedSol.isEmpty {
+                    await MainActor.run {
+                        if currentExtractionIndex < aiHelper.sessionExtractedProblems.count {
+                            aiHelper.sessionExtractedProblems[currentExtractionIndex].solution = derivedSol
+                        }
+                    }
+                }
+                newSteps = derivedSteps
+            }
+            await MainActor.run {
+                if currentExtractionIndex < aiHelper.sessionExtractedProblems.count && !newSteps.isEmpty {
+                    aiHelper.sessionExtractedProblems[currentExtractionIndex].steps = newSteps
+                    aiHelper.sanitizeSessionExtractedProblems()
+                }
+                isRegeneratingSteps = false
+            }
+        }
+    }
+    
     private func parseSteps(_ jsonStr: String) -> [String] {
-        guard let data = jsonStr.data(using: .utf8) else { return [] }
-        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+        let trimmed = jsonStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "[]" else { return [] }
+        if let data = trimmed.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return decoded
+        }
+        return trimmed.components(separatedBy: "\n\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     }
     
     private func encodeSteps(_ steps: [String]) -> String {
@@ -2367,6 +2811,238 @@ struct BatchImporterQueueView: View {
     }
 }
 
+@MainActor
+struct BatchImportProgressCardView: View {
+    @ObservedObject var aiHelper: AIHelper
+    let onCancel: () -> Void
+    
+    @State private var timeString: String = "00:00"
+    let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Header: Title, Active Phase, Active Engine, Stop button
+            HStack(spacing: 10) {
+                if aiHelper.isBatchImportActive || aiHelper.isProcessingExtractionQueue {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 14))
+                }
+                
+                Text("Batch Import Progress Breakdown")
+                    .font(.system(size: 13, weight: .bold))
+                
+                // Phase Pill
+                Text(aiHelper.pipelineCurrentPhase)
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.blue.opacity(0.12))
+                    .foregroundColor(.blue)
+                    .cornerRadius(5)
+                
+                // Active Engine / Cooldown Badge
+                if aiHelper.isTailscaleInCooldown {
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.orange).frame(width: 6, height: 6)
+                        Text("Tailscale Cooldown (Fallback Local: \(aiHelper.tailscaleCooldownRemainingSeconds)s)")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.orange)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.12))
+                    .cornerRadius(5)
+                } else if aiHelper.isRemoteActive {
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.green).frame(width: 6, height: 6)
+                        Text("Remote Engine Active")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.green)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.green.opacity(0.12))
+                    .cornerRadius(5)
+                } else if aiHelper.isLocalActive {
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.blue).frame(width: 6, height: 6)
+                        Text("Local Apple Silicon Active")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.blue)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.blue.opacity(0.12))
+                    .cornerRadius(5)
+                } else {
+                    HStack(spacing: 4) {
+                        Circle().fill(Color.secondary).frame(width: 6, height: 6)
+                        Text("Engine Idle")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.secondary.opacity(0.12))
+                    .cornerRadius(5)
+                }
+                
+                Spacer()
+                
+                if aiHelper.isBatchImportActive || aiHelper.isProcessingExtractionQueue {
+                    Button(action: onCancel) {
+                        Text("Cancel Extraction")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.red)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            
+            Divider()
+            
+            // Dual Progress Columns
+            HStack(alignment: .top, spacing: 20) {
+                // Left Column: Phase 1 (Local OCR)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Phase 1: Visual OCR", systemImage: "doc.text.viewfinder")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                        Text("\(aiHelper.localPagesCompleted)/\(max(1, aiHelper.localPagesTotal)) pages")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    ProgressView(value: Double(aiHelper.localPagesCompleted), total: Double(max(1, aiHelper.localPagesTotal)))
+                        .tint(.blue)
+                    
+                    Text(aiHelper.localTaskStatus)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(10)
+                .background(Color.secondary.opacity(0.04))
+                .cornerRadius(8)
+                
+                // Right Column: Phase 2 (Derivations & Matching)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Phase 2: Derivations", systemImage: "function")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                        Text("\(aiHelper.remoteProblemsCompleted)/\(max(1, aiHelper.remoteProblemsTotal)) problems")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    ProgressView(value: Double(aiHelper.remoteProblemsCompleted), total: Double(max(1, aiHelper.remoteProblemsTotal)))
+                        .tint(.indigo)
+                    
+                    Text(aiHelper.remoteTaskStatus)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(10)
+                .background(Color.secondary.opacity(0.04))
+                .cornerRadius(8)
+            }
+            
+            // Telemetry Status Bar: Tokens generated, streaming heartbeat, elapsed time
+            HStack(spacing: 16) {
+                HStack(spacing: 5) {
+                    Image(systemName: "bolt.fill")
+                        .foregroundColor(.yellow)
+                        .font(.system(size: 10))
+                    Text("\(aiHelper.batchTokensGenerated) tokens generated")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                }
+                
+                HStack(spacing: 5) {
+                    let isStreamingRecent: Bool = {
+                        guard let date = aiHelper.lastStreamingActivityDate else { return false }
+                        return Date().timeIntervalSince(date) < 5.0
+                    }()
+                    Circle()
+                        .fill(isStreamingRecent ? Color.green : (aiHelper.isBatchImportActive ? Color.orange : Color.secondary))
+                        .frame(width: 6, height: 6)
+                    Text(isStreamingRecent ? "Streaming actively" : (aiHelper.isBatchImportActive ? "Awaiting model response" : "Idle"))
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+                
+                HStack(spacing: 4) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    Text("Elapsed: \(timeString)")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.horizontal, 4)
+            
+            // Live Events Feed
+            if !aiHelper.batchLiveEvents.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Recent Activity Log")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.secondary)
+                        .textCase(.uppercase)
+                    
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(Array(aiHelper.batchLiveEvents.suffix(12).enumerated()), id: \.offset) { idx, event in
+                                    Text(event)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.primary.opacity(0.85))
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .id(idx)
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .frame(height: 80)
+                        .background(Color(NSColor.textBackgroundColor).opacity(0.5))
+                        .cornerRadius(6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+                        )
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(Color(NSColor.controlBackgroundColor))
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+        .onReceive(timer) { _ in
+            if let start = aiHelper.batchStartTime {
+                let elapsed = Int(Date().timeIntervalSince(start))
+                let mins = elapsed / 60
+                let secs = elapsed % 60
+                timeString = String(format: "%02d:%02d", mins, secs)
+            }
+        }
+    }
+}
+
 struct ProblemStepRowView: View {
     let index: Int
     let stepText: String
@@ -2430,47 +3106,12 @@ struct StepRowPracticeView: View {
     let onToggleError: () -> Void
     
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text("\(stepNum).")
-                .font(.body)
-                .bold()
-                .foregroundColor(isErrorStep ? .red : .blue)
-                .padding(.top, 4)
-            
-            VStack(alignment: .leading, spacing: 4) {
-                if isLaTeX(stepText) {
-                    LaTeXView(latex: stepText)
-                        .frame(minHeight: calcLaTeXMinHeight(stepText))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Text(stepText)
-                        .font(.body)
-                        .lineSpacing(4)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            
-            Button(action: onToggleError) {
-                Image(systemName: isErrorStep ? "exclamationmark.triangle.fill" : "exclamationmark.triangle")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundColor(isErrorStep ? .red : .secondary)
-                    .padding(6)
-                    .background(isErrorStep ? Color.red.opacity(0.15) : Color.secondary.opacity(0.08))
-                    .cornerRadius(6)
-            }
-            .buttonStyle(.plain)
-            .help(isErrorStep ? "Step marked as error/stopped point (Click to clear)" : "Signal that you got stuck or made a mistake at this step")
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isErrorStep ? Color.red.opacity(0.08) : Color(NSColor.controlBackgroundColor))
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isErrorStep ? Color.red.opacity(0.4) : Color.blue.opacity(0.2), lineWidth: isErrorStep ? 2 : 1)
+        PedagogicalStepRowView(
+            stepNumber: stepNum,
+            stepText: stepText,
+            isErrorStep: isErrorStep,
+            onToggleError: onToggleError
         )
-        .padding(.vertical, 2)
     }
 }
 
@@ -2510,7 +3151,7 @@ struct ProblemDueProjectionChartView: View {
     }
     
     private func loadProjections() {
-        let modProbs = DatabaseManager.shared.getProblems(forYear: year, forModuleId: moduleId)
+        let modProbs = DatabaseManager.shared.getProblems(forYear: year, forModuleId: moduleId).filter { !$0.isFlagged }
         let calendar = Calendar.current
         let today = Date()
         let formatter = DateFormatter()

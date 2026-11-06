@@ -152,6 +152,8 @@ public class AnkiSyncEngine: ObservableObject {
             if let notesInfoRes = await sendAnkiAction(action: "notesInfo", params: ["notes": noteIds]),
                let notesList = notesInfoRes["result"] as? [[String: Any]] {
                 
+                // Map ankiCardId -> local cardId
+                var cardMapping: [Int64: Int] = [:]
                 for noteInfo in notesList {
                     guard let tags = noteInfo["tags"] as? [String] else { continue }
                     guard let idTag = tags.first(where: { $0.hasPrefix("nobel_id_") }) else { continue }
@@ -159,28 +161,48 @@ public class AnkiSyncEngine: ObservableObject {
                     guard let cardId = Int(cardIdStr) else { continue }
                     
                     if let cardsArr = noteInfo["cards"] as? [Int64], let firstAnkiCardId = cardsArr.first {
-                        if let cardInfoRes = await sendAnkiAction(action: "cardsInfo", params: ["cards": [firstAnkiCardId]]),
-                           let cardsInfo = cardInfoRes["result"] as? [[String: Any]],
-                           let cInfo = cardsInfo.first {
-                            
-                            let interval = cInfo["interval"] as? Int ?? 1
-                            let factor = cInfo["factor"] as? Int ?? 2500
-                            let reps = cInfo["reps"] as? Int ?? 0
-                            let easeFactor = Double(factor) / 1000.0
-                            
-                            let calendar = Calendar.current
-                            let nextReviewDate = calendar.date(byAdding: .day, value: max(1, interval), to: Date()) ?? Date()
-                            let formatter = DateFormatter()
-                            formatter.dateFormat = "yyyy-MM-dd"
-                            let nextReviewStr = formatter.string(from: nextReviewDate)
-                            
-                            _ = DatabaseManager.shared.updateFlashcardReview(
-                                id: cardId,
-                                interval: max(1, interval),
-                                easeFactor: max(1.3, easeFactor),
-                                repetitions: reps,
-                                nextReviewDate: nextReviewStr
-                            )
+                        cardMapping[firstAnkiCardId] = cardId
+                    }
+                }
+                
+                // Batch query all cardsInfo in chunks of 500
+                let localCardsById = Dictionary(uniqueKeysWithValues: allCards.map { ($0.id, $0) })
+                let allAnkiCardIds = Array(cardMapping.keys)
+                if !allAnkiCardIds.isEmpty {
+                    let chunkSize = 500
+                    for chunkStart in stride(from: 0, to: allAnkiCardIds.count, by: chunkSize) {
+                        let chunk = Array(allAnkiCardIds[chunkStart..<min(chunkStart + chunkSize, allAnkiCardIds.count)])
+                        if let cardInfoRes = await sendAnkiAction(action: "cardsInfo", params: ["cards": chunk]),
+                           let cardsInfo = cardInfoRes["result"] as? [[String: Any]] {
+                            for cInfo in cardsInfo {
+                                let cardAnkiId = (cInfo["cardId"] as? Int64) ?? (cInfo["id"] as? Int64)
+                                guard let ankiId = cardAnkiId,
+                                      let cardId = cardMapping[ankiId],
+                                      let localCard = localCardsById[cardId] else { continue }
+                                
+                                let reps = cInfo["reps"] as? Int ?? 0
+                                // Only pull Anki's scheduling state if the card has actually been reviewed more times in Anki than locally
+                                guard reps > 0 && reps > localCard.repetitions else { continue }
+                                
+                                let rawInterval = (cInfo["interval"] as? Double) ?? Double(cInfo["interval"] as? Int ?? 0)
+                                let interval = rawInterval > 0 ? rawInterval : localCard.interval
+                                let factor = cInfo["factor"] as? Int ?? 0
+                                let easeFactor = factor > 0 ? (Double(factor) / 1000.0) : localCard.easeFactor
+                                
+                                let calendar = Calendar.current
+                                let nextReviewDate = calendar.date(byAdding: .day, value: max(1, Int(round(interval))), to: Date()) ?? Date()
+                                let formatter = DateFormatter()
+                                formatter.dateFormat = "yyyy-MM-dd"
+                                let nextReviewStr = formatter.string(from: nextReviewDate)
+                                
+                                _ = DatabaseManager.shared.updateFlashcardReview(
+                                    id: cardId,
+                                    interval: max(1.0, interval),
+                                    easeFactor: max(1.3, easeFactor),
+                                    repetitions: reps,
+                                    nextReviewDate: nextReviewStr
+                                )
+                            }
                         }
                     }
                 }

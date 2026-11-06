@@ -94,7 +94,7 @@ struct PreLectureView: View {
                                 Image(systemName: AIHelper.shared.isAIDisconnected ? "wifi.slash" : "lightbulb")
                                     .font(.system(size: 32))
                                     .foregroundColor(.secondary)
-                                Text(AIHelper.shared.isAIDisconnected ? (AIHelper.shared.disconnectionMessage.isEmpty ? "Tailscale Disconnected" : AIHelper.shared.disconnectionMessage) : "No primer generated yet.")
+                                Text(AIHelper.shared.isAIDisconnected ? (AIHelper.shared.disconnectionMessage.isEmpty ? "\(AIHelper.shared.activeAIProvider.name) Disconnected" : AIHelper.shared.disconnectionMessage) : "No primer generated yet.")
                                     .font(.headline)
                                     .foregroundColor(.secondary)
                                 Text(AIHelper.shared.isAIDisconnected ? "Unable to reach AI server to generate primer." : "Ensure note has summary and try generating again.")

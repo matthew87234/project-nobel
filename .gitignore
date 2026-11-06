@@ -55,5 +55,11 @@ venv.bak/
 .physics_study_app/
 
 # Local logs and test dirs
+*.log
 batch_importer_run.log
 Test/
+sandbox/
+
+# Machine-specific developer configurations and private setup instructions
+LOCAL_SETUP.md
+.local_env*

@@ -55,8 +55,8 @@ struct PhysicsStudyApp: App {
         }
         process.executableURL = URL(fileURLWithPath: execPath)
         process.arguments = ["serve"]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         
         do {
             try process.run()
@@ -76,25 +76,11 @@ struct PhysicsStudyApp: App {
     }
     
     init() {
-        // One-time migration: fix stale UserDefaults from older app versions
-        let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
-        if provider == "hermes" {
-            let baseUrl = UserDefaults.standard.string(forKey: "cloud_api_base_url") ?? ""
-            let modelName = UserDefaults.standard.string(forKey: "cloud_model_name") ?? ""
-            if baseUrl == "http://localhost:1234/v1" || baseUrl.isEmpty {
-                UserDefaults.standard.set("http://ollama1:11434/v1", forKey: "cloud_api_base_url")
-            }
-            if modelName == "glm" || modelName.isEmpty {
-                UserDefaults.standard.set("glm-5.2:cloud", forKey: "cloud_model_name")
-            }
+        if CommandLine.arguments.contains("--test") || CommandLine.arguments.contains("--run-tests") {
+            TestRunner.runTests()
+            exit(0)
         }
         
-        if UserDefaults.standard.string(forKey: "local_model_vision") == nil {
-            UserDefaults.standard.set("qwen2.5vl:7b", forKey: "local_model_vision")
-        }
-        if UserDefaults.standard.string(forKey: "local_model_general") == nil {
-            UserDefaults.standard.set("qwen2.5-coder:7b", forKey: "local_model_general")
-        }
         if UserDefaults.standard.object(forKey: "background_ai_enabled") == nil {
             UserDefaults.standard.set(true, forKey: "background_ai_enabled")
         }
@@ -108,161 +94,7 @@ struct PhysicsStudyApp: App {
     
     var body: some Scene {
         WindowGroup {
-            VStack(spacing: 0) {
-                if DatabaseManager.isDesktopApp {
-                    testProgramBanner
-                }
-                
-                NavigationSplitView {
-                    // Sidebar
-                    VStack(alignment: .leading, spacing: 10) {
-                        Button(action: {
-                            sidebarSelection = "Dashboard"
-                        }) {
-                            Text("Project Nobel")
-                                .font(.system(size: 20, weight: .bold))
-                                .foregroundColor(.primary)
-                        }
-                        .buttonStyle(.plain)
-                        .focusable(false)
-                        .pointingHandCursor()
-                        .padding(.horizontal)
-                        .padding(.top, 20)
-                        
-                        // Sidebar Navigation Links
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 14) {
-                                sidebarListContent
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.top, 4)
-                        }
-                        .id(isExamMode)
-                        
-                        preExamSidebarControls
-                        
-                        aiStatusView
-                    }
-                    .frame(minWidth: 220)
-                    .background(.ultraThinMaterial)
-                } detail: {
-                    // Detail Pane
-                    detailView
-                }
-                .navigationSplitViewStyle(.balanced)
-            }
-            .toolbarBackground(.visible, for: .windowToolbar)
-            .toolbar {
-                ToolbarItem(placement: .navigation) {
-                    if let activeMod = modules.first(where: { $0.id == activeModuleId }), !activeMod.testDate.isEmpty {
-                        HStack(spacing: 6) {
-                            Image(systemName: "calendar")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundColor(.secondary)
-                            Text(activeMod.testDateFormattedDateOnly)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundColor(.primary)
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 2)
-                        .help(activeMod.daysRemainingFormatted.isEmpty ? "Exam Date for \(activeMod.code): \(activeMod.testDateFormattedDateOnly)" : "Exam Date for \(activeMod.code): \(activeMod.daysRemainingFormatted) (\(activeMod.testDateFormattedDateOnly))")
-                    }
-                }
-                
-                ToolbarItemGroup(placement: .primaryAction) {
-                    if !modules.isEmpty {
-                        Picker("Module", selection: $activeModuleId) {
-                            ForEach(modules) { mod in
-                                Text("\(mod.code): \(mod.name)").tag(mod.id as Int?)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: 200)
-                    }
-                }
-            }
-            .frame(minWidth: 450, minHeight: 450)
-            .navigationTitle("")
-            .sheet(isPresented: $showModuleManager) {
-                ModuleManagerView(isPresented: $showModuleManager, onRefresh: {
-                    refreshSidebarModules()
-                })
-            }
-            .sheet(isPresented: $showFlashcardManager) {
-                FlashcardsView(activeModuleId: activeModuleId, activeYear: activeYear, mode: .manage, isExamMode: isExamMode)
-                    .frame(width: 780, height: 520)
-                    .overlay(
-                        VStack {
-                            HStack {
-                                Spacer()
-                                Button("Close") {
-                                    showFlashcardManager = false
-                                }
-                                .buttonStyle(.bordered)
-                                .pointingHandCursor()
-                                .padding()
-                            }
-                            Spacer()
-                        }
-                    )
-            }
-            .sheet(isPresented: $showProblemManager) {
-                ProblemsView(activeModuleId: activeModuleId, activeYear: activeYear, mode: .manage, isExamMode: isExamMode)
-                    .frame(width: 600, height: 450)
-                    .overlay(
-                        VStack {
-                            HStack {
-                                Spacer()
-                                Button("Close") {
-                                    showProblemManager = false
-                                }
-                                .buttonStyle(.bordered)
-                                .pointingHandCursor()
-                                .padding()
-                            }
-                            Spacer()
-                        }
-                    )
-            }
-            .sheet(isPresented: $aiHelper.showTailscaleSetupModal) {
-                AIDevicePickerView()
-            }
-            .onAppear {
-                restoreSettings()
-                let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
-                let tailHost = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
-                if provider == "tailscale" && tailHost.isEmpty {
-                    aiHelper.showTailscaleSetupModal = true
-                }
-            }
-            .onChange(of: activeYear) { oldValue, newValue in
-                Task {
-                    DatabaseManager.shared.setSetting(key: "active_year", value: String(newValue))
-                }
-                refreshSidebarModules()
-            }
-            .onChange(of: activeModuleId) { oldValue, newValue in
-                Task {
-                    if let val = newValue {
-                        DatabaseManager.shared.setSetting(key: "active_module_id", value: String(val))
-                    } else {
-                        DatabaseManager.shared.setSetting(key: "active_module_id", value: "")
-                    }
-                }
-            }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                // Auto-sync with Anki before app terminates
-                AnkiSyncEngine.shared.syncWithAnkiSynchronously()
-                
-                PhysicsStudyApp.ollamaProcess?.terminate()
-                
-                if PhysicsStudyApp.ollamaProcess != nil {
-                    let killProcess = Process()
-                    killProcess.launchPath = "/usr/bin/killall"
-                    killProcess.arguments = ["ollama"]
-                    try? killProcess.run()
-                }
-            }
+            mainView
         }
         .commands {
             CommandGroup(after: .importExport) {
@@ -679,86 +511,483 @@ struct PhysicsStudyApp: App {
             .padding(.horizontal, 10)
             .padding(.bottom, 15)
             .transition(.move(edge: .bottom).combined(with: .opacity))
-        } else if (aiHelper.isAIBusy && !aiHelper.currentAITaskDescription.isEmpty) || aiHelper.isClassifyingProblems || (aiHelper.isProcessing && aiHelper.activeJobDescription != "Idle" && aiHelper.activeJobDescription != "Background AI Disabled" && aiHelper.activeJobDescription != "Power Saving Mode" && aiHelper.activeJobDescription != "AI Server Offline") || !aiHelper.activeProcessingNoteIds.isEmpty {
-            let (isLocal, providerName) = (aiHelper.isAIBusy || aiHelper.isClassifyingProblems) ? (aiHelper.isCurrentAILocal, aiHelper.currentAIProviderName) : aiHelper.activeAIProvider
-            let taskText: String = {
-                if !aiHelper.currentAITaskDescription.isEmpty {
-                    return aiHelper.currentAITaskDescription
-                } else if !aiHelper.activeProcessingNoteIds.isEmpty {
-                    return "Generating AI Summary..."
-                } else if aiHelper.isClassifyingProblems {
-                    return aiHelper.queueStatusText
-                } else {
-                    return aiHelper.activeJobDescription
-                }
-            }()
-            let total = aiHelper.activeProgressTotal > 0 ? aiHelper.activeProgressTotal : (aiHelper.isClassifyingProblems ? aiHelper.classificationQueueCount : 0)
-            let current = aiHelper.activeProgressCurrent > 0 ? aiHelper.activeProgressCurrent : (aiHelper.isClassifyingProblems ? aiHelper.classificationCompletedCount : 0)
-            
-            VStack(alignment: .leading, spacing: 8) {
-                // Top Row: Local vs Tailscale/Remote AI Badge
-                HStack(spacing: 6) {
-                    Image(systemName: isLocal ? "laptopcomputer" : "network")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(isLocal ? .green : .blue)
+        } else if aiHelper.isPipelineActive || (aiHelper.isAIBusy && !aiHelper.currentAITaskDescription.isEmpty) || aiHelper.isClassifyingProblems || (aiHelper.isProcessing && aiHelper.activeJobDescription != "Idle" && aiHelper.activeJobDescription != "Background AI Disabled" && aiHelper.activeJobDescription != "Power Saving Mode" && aiHelper.activeJobDescription != "AI Server Offline") || !aiHelper.activeProcessingNoteIds.isEmpty {
+            // Active Sequential Pipeline Status Card
+            VStack(alignment: .leading, spacing: 7) {
+                // Header: Phase badge & overall remaining count
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(aiHelper.isLocalActive ? Color.green : (aiHelper.isRemoteActive ? Color.blue : Color.secondary))
+                        .frame(width: 7, height: 7)
                     
-                    Text(providerName.uppercased())
-                        .font(.system(size: 10, weight: .black, design: .rounded))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background((isLocal ? Color.green : Color.blue).opacity(0.18))
-                        .foregroundColor(isLocal ? .green : .blue)
-                        .cornerRadius(4)
-                    
-                    Spacer()
-                }
-                
-                // Middle Row: Task description
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    
-                    Text(taskText)
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    Text(aiHelper.pipelineCurrentPhase.isEmpty || aiHelper.pipelineCurrentPhase == "Idle" ? "AI PIPELINE" : aiHelper.pipelineCurrentPhase.uppercased())
+                        .font(.system(size: 9, weight: .black, design: .rounded))
                         .foregroundColor(.primary)
                         .lineLimit(1)
-                }
-                
-                // Bottom Row: Progress bar & percentage
-                VStack(alignment: .leading, spacing: 4) {
-                    if total > 0 {
-                        let pct = Int((Double(current) / Double(max(total, 1))) * 100)
-                        ProgressView(value: Double(current), total: Double(max(total, 1)))
-                            .progressViewStyle(.linear)
-                            .tint(isLocal ? Color.green : Color.blue)
-                        
-                        HStack {
-                            Text("\(current) of \(total) completed")
-                                .font(.system(size: 10, weight: .medium, design: .rounded))
+                    
+                    Spacer()
+                    
+                    // High-level summary of remaining items required before completion
+                    if aiHelper.localPagesTotal > 0 || aiHelper.remoteProblemsTotal > 0 {
+                        let localRem = aiHelper.localPagesRemaining
+                        let remoteRem = aiHelper.remoteProblemsRemaining
+                        if localRem > 0 && remoteRem > 0 {
+                            Text("\(localRem) pgs + \(remoteRem) probs left")
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
                                 .foregroundColor(.secondary)
-                            Spacer()
-                            Text("\(pct)%")
-                                .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundColor(isLocal ? .green : .blue)
+                        } else if localRem > 0 {
+                            Text("\(localRem) pgs left")
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                                .foregroundColor(.green)
+                        } else if remoteRem > 0 {
+                            Text("\(remoteRem) probs left")
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                                .foregroundColor(.blue)
+                        } else {
+                            Text("Finishing")
+                                .font(.system(size: 9, weight: .bold, design: .rounded))
+                                .foregroundColor(.secondary)
                         }
-                    } else {
-                        ProgressView()
-                            .progressViewStyle(.linear)
-                            .tint(isLocal ? Color.green : Color.blue)
                     }
                 }
+                
+                Divider()
+                    .opacity(0.35)
+                
+                // Machine 1: Local Engine
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "laptopcomputer")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(aiHelper.isLocalActive ? .green : .secondary)
+                        
+                        Text("Local Engine")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .foregroundColor(aiHelper.isLocalActive ? .primary : .secondary)
+                        
+                        if aiHelper.isLocalActive {
+                            ProgressView()
+                                .controlSize(.mini)
+                        }
+                        
+                        Spacer()
+                        
+                        // Local Active Status Badge
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(aiHelper.isLocalActive ? Color.green : Color.secondary.opacity(0.6))
+                                .frame(width: 6, height: 6)
+                            Text(aiHelper.isLocalActive ? "Active" : "Ready")
+                                .font(.system(size: 8, weight: .bold, design: .rounded))
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background((aiHelper.isLocalActive ? Color.green : Color.secondary).opacity(0.14))
+                        .foregroundColor(aiHelper.isLocalActive ? .green : .secondary)
+                        .cornerRadius(4)
+                    }
+                    
+                    // Local Progress info
+                    HStack(spacing: 4) {
+                        if aiHelper.localPagesTotal > 0 {
+                            if aiHelper.localPagesRemaining > 0 {
+                                Text("\(aiHelper.localPagesCompleted) of \(aiHelper.localPagesTotal) pages")
+                                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                                    .foregroundColor(.primary)
+                                Spacer()
+                                Text("\(aiHelper.localPagesRemaining) left")
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.green)
+                                Text("Done (\(aiHelper.localPagesTotal) pages OCR'd)")
+                                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                            }
+                        } else {
+                            Text(aiHelper.isLocalActive ? aiHelper.localTaskStatus : "Standby")
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .foregroundColor(aiHelper.isLocalActive ? .primary : .secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(5)
+                .background((aiHelper.isLocalActive ? Color.green.opacity(0.08) : Color.clear))
+                .cornerRadius(6)
+                
+                Divider()
+                    .opacity(0.35)
+                
+                // Machine 2: Remote Engine
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "server.rack")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(aiHelper.isRemoteOnline ? (aiHelper.isRemoteActive ? .blue : .secondary) : .orange)
+                        
+                        Text("Remote Engine")
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .foregroundColor(aiHelper.isRemoteOnline ? (aiHelper.isRemoteActive ? .primary : .secondary) : .secondary)
+                        
+                        if aiHelper.isRemoteActive && aiHelper.isRemoteOnline {
+                            ProgressView()
+                                .controlSize(.mini)
+                        }
+                        
+                        Spacer()
+                        
+                        // Remote Active Status or Offline Badge
+                        if !aiHelper.isRemoteOnline {
+                            HStack(spacing: 3) {
+                                Image(systemName: "wifi.slash")
+                                    .font(.system(size: 8, weight: .bold))
+                                Text("Offline")
+                                    .font(.system(size: 8, weight: .bold, design: .rounded))
+                            }
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.18))
+                            .foregroundColor(.orange)
+                            .cornerRadius(4)
+                        } else {
+                            HStack(spacing: 3) {
+                                Circle()
+                                    .fill(aiHelper.isRemoteActive ? Color.blue : Color.secondary.opacity(0.6))
+                                    .frame(width: 6, height: 6)
+                                Text(aiHelper.isRemoteActive ? "Active" : "Ready")
+                                    .font(.system(size: 8, weight: .bold, design: .rounded))
+                            }
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background((aiHelper.isRemoteActive ? Color.blue : Color.secondary).opacity(0.14))
+                            .foregroundColor(aiHelper.isRemoteActive ? .blue : .secondary)
+                            .cornerRadius(4)
+                        }
+                    }
+                    
+                    // Remote Progress info
+                    HStack(spacing: 4) {
+                        if !aiHelper.isRemoteOnline {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 8))
+                                .foregroundColor(.orange)
+                            Text("Not Connected (\(aiHelper.activeAIProvider.name) unreachable)")
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .foregroundColor(.orange)
+                                .lineLimit(1)
+                            Spacer()
+                        } else if aiHelper.remoteProblemsTotal > 0 {
+                            if aiHelper.remoteProblemsRemaining > 0 {
+                                Text("\(aiHelper.remoteProblemsCompleted) of \(aiHelper.remoteProblemsTotal) problems")
+                                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                                    .foregroundColor(.primary)
+                                Spacer()
+                                Text("\(aiHelper.remoteProblemsRemaining) left")
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.blue)
+                                Text("Done (\(aiHelper.remoteProblemsTotal) problems)")
+                                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                            }
+                        } else if aiHelper.localPagesRemaining > 0 {
+                            Text("Queued (waiting for OCR)")
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        } else {
+                            Text(aiHelper.isRemoteActive ? aiHelper.remoteTaskStatus : "Standby")
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .foregroundColor(aiHelper.isRemoteActive ? .primary : .secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(5)
+                .background((aiHelper.isRemoteActive ? Color.blue.opacity(0.08) : (!aiHelper.isRemoteOnline ? Color.orange.opacity(0.06) : Color.clear)))
+                .cornerRadius(6)
             }
-            .padding(12)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.85))
-            .cornerRadius(10)
+            .padding(9)
+            .background(Color(NSColor.controlBackgroundColor).opacity(0.92))
+            .cornerRadius(9)
             .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(isLocal ? Color.green.opacity(0.3) : Color.blue.opacity(0.3), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(aiHelper.isLocalActive ? Color.green.opacity(0.4) : (aiHelper.isRemoteActive ? Color.blue.opacity(0.4) : Color.secondary.opacity(0.2)), lineWidth: 1)
             )
             .padding(.horizontal, 10)
-            .padding(.bottom, 15)
+            .padding(.bottom, 12)
             .transition(.move(edge: .bottom).combined(with: .opacity))
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: (aiHelper.isAIBusy && !aiHelper.currentAITaskDescription.isEmpty) || !aiHelper.activeProcessingNoteIds.isEmpty || (aiHelper.isProcessing && aiHelper.activeJobDescription != "Idle"))
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: aiHelper.isLocalActive || aiHelper.isRemoteActive || aiHelper.isPipelineActive)
+        } else {
+            // Idle Standby Status Strip (compact, unobtrusive)
+            HStack(spacing: 8) {
+                // Local Engine Status
+                HStack(spacing: 4) {
+                    Image(systemName: "laptopcomputer")
+                        .font(.system(size: 9))
+                        .foregroundColor(aiHelper.isLocalActive ? .green : .secondary)
+                    Circle()
+                        .fill(aiHelper.isLocalActive ? Color.green : Color.secondary.opacity(0.5))
+                        .frame(width: 5, height: 5)
+                    Text(aiHelper.isLocalActive ? "Local Active" : "Local Ready")
+                        .font(.system(size: 9, weight: .medium, design: .rounded))
+                        .foregroundColor(aiHelper.isLocalActive ? .green : .secondary)
+                }
+                .help("Local Engine status: \(aiHelper.isLocalActive ? "Active" : "Ready")")
+                
+                Text("•")
+                    .font(.system(size: 8))
+                    .foregroundColor(.secondary.opacity(0.4))
+                
+                // Remote Engine Status
+                HStack(spacing: 4) {
+                    if aiHelper.isRemoteOnline {
+                        Image(systemName: "server.rack")
+                            .font(.system(size: 9))
+                            .foregroundColor(aiHelper.isRemoteActive ? .blue : .secondary)
+                        Circle()
+                            .fill(aiHelper.isRemoteActive ? Color.blue : Color.secondary.opacity(0.5))
+                            .frame(width: 5, height: 5)
+                        Text(aiHelper.isRemoteActive ? "Remote Active" : "Remote Ready")
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .foregroundColor(aiHelper.isRemoteActive ? .blue : .secondary)
+                    } else {
+                        Image(systemName: "server.rack")
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                        Text("Remote Offline")
+                            .font(.system(size: 9, weight: .semibold, design: .rounded))
+                            .foregroundColor(.orange)
+                    }
+                }
+                .help(aiHelper.isRemoteOnline ? "Remote Engine is connected (\(aiHelper.activeAIProvider.name))" : "Remote Engine is not connected")
+                
+                Spacer()
+                
+                if !aiHelper.isRemoteOnline {
+                    HStack(spacing: 3) {
+                        Image(systemName: "wifi.slash")
+                            .font(.system(size: 8))
+                        Text("Remote Offline")
+                            .font(.system(size: 8, weight: .bold, design: .rounded))
+                    }
+                    .foregroundColor(.orange)
+                    .help("Remote Engine is not reachable")
+                } else if aiHelper.isLocalActive || aiHelper.isRemoteActive {
+                    HStack(spacing: 3) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("Active")
+                            .font(.system(size: 8, weight: .bold, design: .rounded))
+                            .foregroundColor(.accentColor)
+                    }
+                } else {
+                    Text("Idle")
+                        .font(.system(size: 8, weight: .bold, design: .rounded))
+                        .foregroundColor(.secondary.opacity(0.6))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(aiHelper.isRemoteOnline ? Color.clear : Color.orange.opacity(0.25), lineWidth: 1)
+            )
+            .padding(.horizontal, 10)
+            .padding(.bottom, 10)
+        }
+    }
+    
+    @ViewBuilder
+    private var modulePicker: some View {
+        if !modules.isEmpty {
+            Picker("Module", selection: $activeModuleId) {
+                ForEach(modules) { mod in
+                    let label = "\(mod.code): \(mod.name)"
+                    Text(label).tag(Optional(mod.id))
+                }
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: 200)
+        }
+    }
+
+    @ViewBuilder
+    private var flashcardManagerSheet: some View {
+        FlashcardsView(activeModuleId: activeModuleId, activeYear: activeYear, mode: .manage, isExamMode: isExamMode)
+            .frame(width: 780, height: 520)
+            .overlay(
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button("Close") {
+                            showFlashcardManager = false
+                        }
+                        .buttonStyle(.bordered)
+                        .pointingHandCursor()
+                        .padding()
+                    }
+                    Spacer()
+                }
+            )
+    }
+    
+    @ViewBuilder
+    private var problemManagerSheet: some View {
+        ProblemsView(activeModuleId: activeModuleId, activeYear: activeYear, mode: .manage, isExamMode: isExamMode)
+            .frame(width: 600, height: 450)
+            .overlay(
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button("Close") {
+                            showProblemManager = false
+                        }
+                        .buttonStyle(.bordered)
+                        .pointingHandCursor()
+                        .padding()
+                    }
+                    Spacer()
+                }
+            )
+    }
+
+    @ViewBuilder
+    private var mainView: some View {
+        VStack(spacing: 0) {
+            if DatabaseManager.isDesktopApp {
+                testProgramBanner
+            }
+            
+            NavigationSplitView {
+                sidebarView
+            } detail: {
+                detailView
+            }
+            .navigationSplitViewStyle(.balanced)
+        }
+        .toolbarBackground(.visible, for: .windowToolbar)
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                examDateBadge
+            }
+            
+            ToolbarItemGroup(placement: .primaryAction) {
+                modulePicker
+            }
+        }
+        .frame(minWidth: 450, minHeight: 450)
+        .navigationTitle("")
+        .sheet(isPresented: $showModuleManager) {
+            ModuleManagerView(isPresented: $showModuleManager, onRefresh: {
+                refreshSidebarModules()
+            })
+        }
+        .sheet(isPresented: $showFlashcardManager) {
+            flashcardManagerSheet
+        }
+        .sheet(isPresented: $showProblemManager) {
+            problemManagerSheet
+        }
+        .sheet(isPresented: $aiHelper.showTailscaleSetupModal) {
+            AIDevicePickerView()
+        }
+        .onAppear {
+            restoreSettings()
+            let provider = UserDefaults.standard.string(forKey: "ai_provider") ?? "local"
+            let tailHost = UserDefaults.standard.string(forKey: "tailscale_host") ?? ""
+            if provider == "tailscale" && tailHost.isEmpty {
+                aiHelper.showTailscaleSetupModal = true
+            }
+        }
+        .onChange(of: activeYear) { _, newValue in
+            handleActiveYearChanged(to: newValue)
+        }
+        .onChange(of: activeModuleId) { _, newValue in
+            handleActiveModuleChanged(to: newValue)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            AnkiSyncEngine.shared.syncWithAnkiSynchronously()
+            PhysicsStudyApp.stopOllamaServer()
+        }
+    }
+    
+    private func handleActiveYearChanged(to year: Int) {
+        Task {
+            DatabaseManager.shared.setSetting(key: "active_year", value: String(year))
+        }
+        refreshSidebarModules()
+    }
+    
+    private func handleActiveModuleChanged(to moduleId: Int?) {
+        Task {
+            let valStr = moduleId.map { String($0) } ?? ""
+            DatabaseManager.shared.setSetting(key: "active_module_id", value: valStr)
+        }
+    }
+
+    @ViewBuilder
+    private var sidebarView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: {
+                sidebarSelection = "Dashboard"
+            }) {
+                Text("Project Nobel")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(.primary)
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .pointingHandCursor()
+            .padding(.horizontal)
+            .padding(.top, 20)
+            
+            // Sidebar Navigation Links
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    sidebarListContent
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
+            }
+            .id(isExamMode)
+            
+            preExamSidebarControls
+            
+            aiStatusView
+        }
+        .frame(minWidth: 220)
+        .background(.ultraThinMaterial)
+    }
+    
+    @ViewBuilder
+    private var examDateBadge: some View {
+        if let activeMod = modules.first(where: { $0.id == activeModuleId }), !activeMod.testDate.isEmpty {
+            let helpText = activeMod.daysRemainingFormatted.isEmpty ? "Exam Date for \(activeMod.code): \(activeMod.testDateFormattedDateOnly)" : "Exam Date for \(activeMod.code): \(activeMod.daysRemainingFormatted) (\(activeMod.testDateFormattedDateOnly))"
+            HStack(spacing: 6) {
+                Image(systemName: "calendar")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.secondary)
+                Text(activeMod.testDateFormattedDateOnly)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.primary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 2)
+            .help(helpText)
         }
     }
     
