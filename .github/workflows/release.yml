@@ -26,10 +26,15 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install dmgbuild
 
+      - name: Run Unit Tests
+        run: |
+          chmod +x ./scripts/run_tests.sh
+          ./scripts/run_tests.sh
+
       - name: Build Application and Generate .dmg
         run: |
-          chmod +x ./create_dmg.sh
-          ./create_dmg.sh
+          chmod +x ./scripts/create_dmg.sh
+          ./scripts/create_dmg.sh
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

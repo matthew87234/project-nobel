@@ -1,6 +1,6 @@
 # Project Nobel - Physics Study App
 
-Project Nobel is an advanced physics study workstation built natively for macOS (SwiftUI) with a companion Flutter desktop architecture. Designed specifically for university physics students, it combines cognitive science learning workflows (SuperMemo-2 Spaced Repetition, Interleaving Practice, Feynman Dialogue, and 3-Phase Pre-Exam Priming) with local/cloud AI assistance and offline SQLite persistence.
+Project Nobel is an advanced physics study workstation built natively for macOS (SwiftUI). Designed specifically for university physics students, it combines cognitive science learning workflows (SuperMemo-2 Spaced Repetition, Interleaving Practice, Feynman Dialogue, and 3-Phase Pre-Exam Priming) with local/cloud AI assistance and offline SQLite persistence.
 
 ---
 
@@ -27,7 +27,7 @@ Download the latest pre-compiled disk image from the GitHub Releases page:
 - **True SM-2 Scheduling**: Exponential interval growth, dynamic ease factor calibration, and repetition counters.
 - **Academic Year Scoping & Exam Mode**: Practice cards across all modules in your selected academic year, or focus strictly on an individual module in Exam Mode.
 - **Strict Due-Date Filtering**: Only serves cards due today, with a dedicated Study Ahead mode for extra practice.
-- **Bi-directional Anki Sync**: Seamlessly synchronize flashcards with your local Anki collection via AnkiConnect.
+- **CSV Export**: Export selected flashcards directly to CSV.
 
 ### 2. Problem Interleaving Engine
 - **Cognitive Diagnostic Feedback**: Tracks failure tiers (Setup errors, Equation formulation slips, Calculation slips, or Flawless mastery) and schedules next review dates adaptively using SM-2.
@@ -51,8 +51,6 @@ Download the latest pre-compiled disk image from the GitHub Releases page:
 
 ## Building from Source
 
-### macOS Native (SwiftUI)
-
 **Prerequisites:**
 - macOS 14.0 or higher
 - Xcode 15+ or Command Line Tools (`xcode-select --install`)
@@ -64,34 +62,19 @@ git clone https://github.com/matthew87234/project-nobel.git
 cd project-nobel
 
 # Build the release binary and create a standalone .dmg installer
-chmod +x create_dmg.sh
-./create_dmg.sh
+./scripts/create_dmg.sh
 ```
 
 The resulting disk image will be placed in the project root: `Project-Nobel-Installer.dmg`.
 
 To build directly to your Desktop for development:
 ```bash
-./swiftui-version/build_app.sh
+./scripts/build_app.sh
 ```
 
----
-
-### Cross-Platform Desktop (Flutter)
-
-**Prerequisites:**
-- Flutter SDK 3.x+
-- Dart SDK
-
+To run the built-in unit test suite:
 ```bash
-cd project-nobel/flutter-version
-flutter pub get
-
-# Run on macOS
-flutter run -d macos
-
-# Run on Windows
-flutter run -d windows
+./scripts/run_tests.sh
 ```
 
 ---
@@ -100,12 +83,15 @@ flutter run -d windows
 
 ```
 project-nobel/
-├── swiftui-version/             # Primary native macOS application
-│   ├── Sources/macOS-Native/   # SwiftUI views, managers, AI helper, SM-2 engine
-│   ├── Resources/              # Application icons and asset catalogs
-│   └── Package.swift           # Swift Package Manager configuration
-├── flutter-version/             # Cross-platform desktop companion
-├── create_dmg.sh                # Local macOS DMG packaging pipeline
+├── Package.swift                # Swift Package Manager configuration
+├── Sources/                     # Native macOS application source code
+│   ├── App/                     # App lifecycle, navigation shell, and settings
+│   ├── Components/              # Reusable UI components & KaTeX LaTeX renderer
+│   ├── Services/                # Modular AI engine, SQLite database manager, Keychain helper
+│   ├── Testing/                 # Built-in unit test suite runner
+│   └── Views/                   # Feature views (Dashboard, Study, Flashcards, Problems, etc.)
+├── Resources/                   # Application icons, menu bar assets, and bundled offline KaTeX
+├── scripts/                     # Build, test, deployment, and DMG packaging scripts
 └── .github/workflows/
     └── release.yml              # Automated GitHub Actions release pipeline
 ```

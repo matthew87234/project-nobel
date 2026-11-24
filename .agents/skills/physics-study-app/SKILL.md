@@ -6,7 +6,7 @@ description: Master technical architecture, learning pedagogy, database schemas,
 # Project Nobel (Physics Study App) — Comprehensive AI Engineering & Pedagogy Guide
 
 ## 1. Project Overview & Vision
-**Project Nobel** is a native macOS physics study & interleaving application built with SwiftUI, SQLite3, local and Tailscale remote AI models (Ollama Qwen2.5-Coder / Qwen2.5-VL / DeepSeek), and Anki bidirectional synchronization.
+**Project Nobel** is a native macOS physics study & interleaving application built with SwiftUI, SQLite3, bundled offline KaTeX math rendering, and local/Tailscale/cloud AI models (Ollama Qwen / DeepSeek, plus optional Anthropic/OpenAI/Gemini/Groq endpoints).
 
 The application is engineered around cognitive science principles for STEM learning:
 - **Interleaving**: Mixing different physics topics/modules during study to improve neural discrimination.
@@ -21,7 +21,7 @@ The application is engineered around cognitive science principles for STEM learn
 
 ### A. Core Stack
 - **Language & Framework**: Swift 5.10+, SwiftUI, Swift Charts, macOS Native SPM target.
-- **Workspace Location**: `$HOME/Projects/PhysicsStudyApp/swiftui-version` (inspect `LOCAL_SETUP.md` for local developer configuration).
+- **Workspace Location**: `$HOME/Projects/PhysicsStudyApp` (inspect `LOCAL_SETUP.md` for local developer configuration).
 - **Compiler Compatibility**: Must compile with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk` or `swift-tools-version: 5.9`.
 
 ### B. Dual Database & Execution Environments
@@ -33,39 +33,40 @@ The application is engineered around cognitive science principles for STEM learn
    - Active development & testing sandbox.
    - Displays amber top banner: `● TEST PROGRAM • Desktop Sandbox Environment`.
    - Sandbox Database: `~/.physics_study_app/physics_study_desktop.db`.
-   - **One-Way Sync**: Running `./swiftui-version/build_app.sh` automatically copies `physics_study.db` $\to$ `physics_study_desktop.db` without altering production data.
+   - **One-Way Sync**: Running `./scripts/build_app.sh` automatically copies `physics_study.db` $\to$ `physics_study_desktop.db` without altering production data.
    - **Local Developer Configuration**: Inspect `LOCAL_SETUP.md` (gitignored) for personal paths, local developer overrides, and IP addresses.
 
 ---
 
-## 3. Core Source Files (`swiftui-version/Sources/macOS-Native/`)
+## 3. Core Source Files (`Sources/`)
 
-- `App.swift`: Main app lifecycle, navigation split view, top test banner, host migrations, background processor trigger.
-- `AIDevicePickerView.swift`: Interactive Tailscale node discovery, live latency probing, installed model selection modal.
-- `AIHelper.swift`: Background AI processing engine, Tailscale dynamic network discovery, thinking tag cleanup, multi-pass queue manager.
-- `AnkiSyncEngine.swift`: Bidirectional sync engine connecting flashcards to Anki Desktop API.
-- `DashboardView.swift`: Main dashboard, 53-week study activity heatmap, donut study distribution chart, metric cards.
-- `DatabaseManager.swift`: Database connection, schema migrations, models (`Module`, `Topic`, `Note`, `Flashcard`, `Problem`), CRUD queries.
-- `FeynmanManagerView.swift`: AI Feynman Technique interactive tutor.
-- `FlashcardsView.swift`: Spaced repetition flashcard centre, SM-2 engine, interactive chart popups (`MetricCardView`), flag queue (`is_flagged`).
-- `LaTeXView.swift`: Native WebKit / MathJax rendering engine for crisp mathematical equations.
-- `ModuleManagerView.swift`: Manage Modules modal (CRUD, semester, year, Exam Date & Time inputting).
-- `ModulesView.swift`: Module syllabus, lecture note viewer, OCR batch importer, PDF note manager.
-- `PostLectureView.swift`: Post-lecture formula summaries and key equations.
-- `PreExamRoutineView.swift`: 3-phase 2-hour pre-exam warmup timeline (Definition priming, Setup strategy, Cheat sheet & mental reset).
-- `PreLectureView.swift`: Pre-lecture primers connecting preceding topics into upcoming lectures.
-- `ProblemsView.swift`: Physics problem practice centre, interactive diagnostic error charts, step error marking (`StepRowPracticeView`), flag queue (`is_flagged`), step-severity tracking (`last_failed_step`, `severity_level`).
-- `RatioTrackerBar.swift`: Visual study time balance indicator showing Flashcards vs Problems study ratio.
-- `SettingsView.swift`: Settings modal, AI provider configuration, Tailscale scan trigger, database maintenance.
-- `StudyView.swift`: Interleaved study guide and active practice session manager.
-- `ViewExtensions.swift`: Shared styling helpers, visual modifiers, and color extensions.
+- `Sources/App/App.swift`: Main app lifecycle, navigation split view, top test banner, host migrations, background processor trigger.
+- `Sources/App/SettingsView.swift`: Settings modal, AI provider configuration, Tailscale scan trigger, database maintenance.
+- `Sources/Components/AIDevicePickerView.swift`: Interactive Tailscale node discovery, live latency probing, installed model selection modal.
+- `Sources/Components/LaTeXHelperSheet.swift`: Shared interactive LaTeX OCR/snippet helper sheet used across Study, Pre-Lecture, and Post-Lecture views.
+- `Sources/Components/LaTeXView.swift`: Native WebKit + bundled offline KaTeX rendering engine for crisp mathematical equations.
+- `Sources/Components/RatioTrackerBar.swift`: Visual study time balance indicator showing Flashcards vs Problems study ratio.
+- `Sources/Components/ViewExtensions.swift`: Shared styling helpers, visual modifiers, and color extensions.
+- `Sources/Services/AI/`: Modular AI engine split across `AIHelper.swift`, `AIHelper+Extraction.swift`, `AIHelper+Discovery.swift`, `AIHelper+Networking.swift`, `AIHelper+StudyFeatures.swift`, and `AIHelper+Background.swift`.
+- `Sources/Services/DatabaseManager.swift`: Database connection, schema migrations, models (`Module`, `Topic`, `Note`, `Flashcard`, `Problem`), CRUD queries.
+- `Sources/Services/KeychainHelper.swift`: Secure macOS Keychain wrapper for storing cloud/vision API keys.
+- `Sources/Testing/TestRunner.swift`: Built-in unit test suite runner invoked via `--run-tests`.
+- `Sources/Views/DashboardView.swift`: Main dashboard, 53-week study activity heatmap, donut study distribution chart, metric cards.
+- `Sources/Views/FlashcardsView.swift`: Spaced repetition flashcard centre, SM-2 engine, interactive chart popups (`MetricCardView`), flag queue (`is_flagged`).
+- `Sources/Views/ModuleManagerView.swift`: Manage Modules modal (CRUD, semester, year, Exam Date & Time inputting).
+- `Sources/Views/ModulesView.swift`: Module syllabus, lecture note viewer, OCR batch importer, PDF note manager.
+- `Sources/Views/PostLectureView.swift`: Post-lecture Summary Sandbox and Feynman Dialogue Partner.
+- `Sources/Views/PreExamRoutineView.swift`: 3-phase 2-hour pre-exam warmup timeline (Definition priming, Setup strategy, Cheat sheet & mental reset).
+- `Sources/Views/PreLectureView.swift`: Pre-lecture primers connecting preceding topics into upcoming lectures.
+- `Sources/Views/ProblemsView.swift`: Physics problem practice centre, interactive diagnostic error charts, step error marking (`StepRowPracticeView`), flag queue (`is_flagged`), step-severity tracking (`last_failed_step`, `severity_level`).
+- `Sources/Views/StudyView.swift`: Interleaved study guide and active practice session manager.
 
 ---
 
 ## 4. AI Engine & Tailscale Architecture (`AIHelper.swift`)
 
 ### A. Dynamic Tailscale Network Discovery (Zero Hardcoded IPs)
-- **Automatic Peer Discovery**: Queries Tailscale status/CLI (`tailscale status --json`) across standard binary locations (`/usr/local/bin/tailscale`, `/opt/homebrew/bin/tailscale`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale`) to discover online Tailscale peers (`100.x.y.z`) and hostnames dynamically without hardcoding IP addresses.
+- **Automatic Peer Discovery**: Queries Tailscale status/CLI (`tailscale status --json`) across standard CLI binary locations (`/usr/local/bin/tailscale`, `/opt/homebrew/bin/tailscale`, `/usr/bin/tailscale`) only when Tailscale is already running (`pgrep`), never auto-launching Tailscale. Automatic reconnects cap at 3 retries until manual Retry, and Two-Tier Hybrid supports **Wait for Connection** vs **Fallback to Local AI**.
 - **Concurrent Node Probing**: Probes candidate peers concurrently on port 11434 (`/api/tags`) with a 2-second timeout to detect active Ollama instances, measure response latency, and fetch live installed models.
 - **Device Selection Modal (`AIDevicePickerView.swift`)**:
   - Automatically prompts the user on first launch (or when selecting Tailscale without a configured host) with an interactive discovery sheet.
@@ -115,7 +116,7 @@ Background jobs run sequentially with wake-lock assertions (`idleSystemSleepDisa
   - **Level 4 (Flawless)**: 0 Errors (Clean Solve). Review due in 7 days.
 - **Interactive Metric Cards**: `MetricCardView` components triggering modal Swift Charts (`ProblemDueProjectionChartView`, `ProblemSeverityChartView`, `ProblemTopicChartView`, `ProblemFlaggedChartView`).
 
-### C. Flashcards Centre & Anki Sync (`FlashcardsView.swift`)
+### C. Flashcards Centre (`FlashcardsView.swift`)
 - **SM-2 Spaced Repetition**: Updates `next_review_date`, `interval`, `ease_factor`, `repetitions`.
 - **Flag Queue (`is_flagged`)**: Dedicated **strictly for marking cards that need correction, verification, or editing** (e.g. typos, LaTeX fixes). Flag status does NOT indicate topic importance or exam priority.
 - **Preset Counts**: Selector for practice queue size (5, 10, 15, Custom) strictly enforces review batch limits.
@@ -170,16 +171,16 @@ Always run build commands from the repository root:
 
 ```bash
 # 1. Build Desktop Testing App (Sandbox DB with test banner)
-./swiftui-version/build_app.sh
+./scripts/build_app.sh
 
 # 2. Build Release Binary & Professional DMG Installer (Clean Production)
-./create_dmg.sh
+./scripts/create_dmg.sh
 
 # 3. Deploy to Applications (Optional manual deployment)
-./deploy_to_applications.sh
+./scripts/deploy_to_applications.sh
 ```
 
-### DMG Packaging Workflow Details (`create_dmg.sh` & `dmgbuild_settings.py`)
+### DMG Packaging Workflow Details (`scripts/create_dmg.sh` & `scripts/dmgbuild_settings.py`)
 - Compiles release binary via SPM.
 - Stages `.app` bundle with Info.plist, icon assets, and ATS exception config.
 - Codesigns with ad-hoc identity (`codesign --force --deep --sign -`) and strips quarantine xattrs.
